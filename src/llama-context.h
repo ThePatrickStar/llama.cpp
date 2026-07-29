@@ -7,11 +7,13 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-uma.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
 #include <map>
+#include <memory>
 #include <vector>
 
 struct llama_model;
@@ -377,6 +379,9 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // env: LLAMA_UMA_POLICY (uma-moe fork)
+    std::unique_ptr<llama_uma_router> uma_router;
 
     // perf
     mutable int64_t t_start_us  = 0;

@@ -280,6 +280,18 @@ llama_context::llama_context(
         }
     }
 
+    {
+        const char * LLAMA_UMA_POLICY = getenv("LLAMA_UMA_POLICY");
+        if (LLAMA_UMA_POLICY && strcmp(LLAMA_UMA_POLICY, "gpu-only") == 0) {
+            const auto & hparams = model.hparams;
+            if (hparams.n_expert > 0) {
+                uma_router = std::make_unique<llama_uma_router>(LLAMA_UMA_POLICY_GPU_ONLY, hparams.n_layer(), hparams.n_expert, hparams.n_expert_used);
+            } else {
+                LLAMA_LOG_WARN("%s: LLAMA_UMA_POLICY set but model has no experts, router inactive\n", __func__);
+            }
+        }
+    }
+
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
@@ -474,6 +486,11 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (uma_router && uma_router->n_decide > 0) {
+        LLAMA_LOG_INFO("%s: uma router: %" PRId64 " decisions, %.3f us avg, %" PRId64 " graphs reused\n",
+                __func__, uma_router->n_decide, (double) uma_router->t_decide_us/uma_router->n_decide, (int64_t) n_reused);
+    }
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -1328,7 +1345,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    // uma-moe: per-token placement decision; only a placement CHANGE
+    // invalidates the cached schedule (gpu-only never changes)
+    bool uma_replan = false;
+    if (uma_router) {
+        uma_replan = uma_router->decide(ubatch.n_tokens);
+    }
+
+    if (!graph_reuse_disable && !uma_replan && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
