@@ -29,9 +29,9 @@ struct llama_uma_router {
 
     // per-layer expert placement bitmap, 1 bit per expert (0 = GPU, 1 = CPU)
     std::vector<uint64_t> placement;
-
-    uint64_t fp_prev = 0;
+    std::vector<uint64_t> placement_prev;
 
     int64_t n_decide    = 0;
+    int64_t n_replan    = 0;
     int64_t t_decide_us = 0;
 };

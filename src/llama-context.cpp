@@ -282,12 +282,18 @@ llama_context::llama_context(
 
     {
         const char * LLAMA_UMA_POLICY = getenv("LLAMA_UMA_POLICY");
-        if (LLAMA_UMA_POLICY && strcmp(LLAMA_UMA_POLICY, "gpu-only") == 0) {
+        if (LLAMA_UMA_POLICY && LLAMA_UMA_POLICY[0] != '\0') {
+            if (strcmp(LLAMA_UMA_POLICY, "gpu-only") != 0) {
+                // abort, not warn: llama-bench swallows llama logs by default,
+                // and a typoed policy silently measuring stock is the one
+                // failure a record run cannot be allowed to hide
+                throw std::runtime_error(format("unrecognized LLAMA_UMA_POLICY value '%s' (known: gpu-only)", LLAMA_UMA_POLICY));
+            }
             const auto & hparams = model.hparams;
             if (hparams.n_expert > 0) {
                 uma_router = std::make_unique<llama_uma_router>(LLAMA_UMA_POLICY_GPU_ONLY, hparams.n_layer(), hparams.n_expert, hparams.n_expert_used);
             } else {
-                LLAMA_LOG_WARN("%s: LLAMA_UMA_POLICY set but model has no experts, router inactive\n", __func__);
+                fprintf(stderr, "uma: LLAMA_UMA_POLICY set but model has no experts, router inactive\n");
             }
         }
     }
@@ -487,8 +493,9 @@ llama_context::llama_context(
 
 llama_context::~llama_context() {
     if (uma_router && uma_router->n_decide > 0) {
-        LLAMA_LOG_INFO("%s: uma router: %" PRId64 " decisions, %.3f us avg, %" PRId64 " graphs reused\n",
-                __func__, uma_router->n_decide, (double) uma_router->t_decide_us/uma_router->n_decide, (int64_t) n_reused);
+        // stderr on purpose, see the activation line in llama-uma.cpp
+        fprintf(stderr, "uma: %" PRId64 " decisions, %" PRId64 " replans, %.3f us avg, %d graphs reused\n",
+                uma_router->n_decide, uma_router->n_replan, (double) uma_router->t_decide_us/uma_router->n_decide, n_reused);
     }
 
     if (!model.hparams.no_alloc) {
