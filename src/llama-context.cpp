@@ -2510,7 +2510,8 @@ ggml_status llama_context::graph_compute(
 // host-dereferenceable weights may be registered - anything else (Metal
 // private, CUDA device VRAM, future backends) must abort rather than fail
 // open. Metal shared = "MTL<i>", Metal mapped = "MTL<i>_Mapped" (mmap).
-// A CUDA/Spark port must extend this deliberately (hostmapped bufts).
+// The CUDA route does not come through here: its weights sit in the device's
+// pinned host buft (is_host=true), placed at load by the injected overrides.
 static bool uma_buft_host_visible(const char * name) {
     if (strncmp(name, "MTL", 3) != 0) {
         return false;
@@ -2541,6 +2542,32 @@ void llama_context::uma_allow_weights_bufts() {
             }
             ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
             if (ggml_backend_buft_is_host(buft)) {
+                // CUDA route: the load-time injection put these weights in the
+                // device's pinned host buft. The CPU reads them natively; the
+                // owning GPU backend is registered for in-place reads and pins
+                // n_tokens > 1 batches (see graph_get_cb). A plain CPU buft
+                // here means the load-time placement did NOT stick (pinned
+                // alloc fell back, or no CUDA device) - refuse rather than
+                // silently measure a different mechanism.
+                ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
+                if (buft_dev == nullptr || ggml_backend_dev_type(buft_dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    throw std::runtime_error(format("uma: cpu-static expert weights for %s landed in %s - load-time placement did not stick", t->name, ggml_backend_buft_name(buft)));
+                }
+                ggml_backend_t dev_backend = nullptr;
+                for (ggml_backend_t b : backend_ptrs) {
+                    if (ggml_backend_get_device(b) == buft_dev) {
+                        dev_backend = b;
+                        break;
+                    }
+                }
+                if (dev_backend == nullptr) {
+                    throw std::runtime_error(format("uma: no backend for device %s owning weights buft %s", ggml_backend_dev_name(buft_dev), ggml_backend_buft_name(buft)));
+                }
+                ggml_backend_sched_allow_weights_buft(sched.get(), dev_backend, buft);
+                uma_router->gpu_pin_backend = dev_backend;
+                if (uma_bufts_logged.insert(buft).second) {
+                    fprintf(stderr, "uma: weights buft %s registered for %s in-place reads\n", ggml_backend_buft_name(buft), ggml_backend_name(dev_backend));
+                }
                 continue;
             }
             const char * buft_name = ggml_backend_buft_name(buft);
@@ -2580,20 +2607,30 @@ llm_graph_cb llama_context::graph_get_cb() const {
             }
         }
 
-        // uma-moe: route the designated layers' expert matmuls to the CPU
-        // backend; the weights stay in the Metal shared/mapped buffers and
-        // are read in place (registered at reserve time), so placement is
-        // per-pass: prefill batches stay all-GPU.
+        // uma-moe: route the designated layers' expert matmuls per pass. The
+        // weights are read in place by both engines (registered at reserve
+        // time): single-token decode pins them to the CPU backend, and on the
+        // CUDA route batches are pinned to the GPU backend - with
+        // host-resident weights the default assignment is a batch-size
+        // heuristic (CPU below 32 tokens, op_offload above), and placement
+        // must stay policy-owned at every batch size. On Metal the weights
+        // are device-resident, so batches need no pin (default is all-GPU).
         // note: for models with per-expert scales/biases the cb'd tensor is
         // the trailing mul/add_id, not the mul_mat_id itself; cpu-static
         // targets plain-MoE graphs (Qwen3-MoE class) for now
-        if (uma_router && il >= 0 && uma_router->layer_on_cpu(il, ubatch.n_tokens)) {
+        if (uma_router && il >= 0 && uma_router->policy == LLAMA_UMA_POLICY_CPU_STATIC && (uint32_t) il < uma_router->n_cpu_layers) {
             if (strcmp(name, "ffn_moe_gate")    == 0 ||
                 strcmp(name, "ffn_moe_up")      == 0 ||
                 strcmp(name, "ffn_moe_gate_up") == 0 ||
                 strcmp(name, "ffn_moe_down")    == 0) {
-                if (ggml_backend_supports_op(backend_cpu, cur)) {
-                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
+                if (uma_router->layer_on_cpu(il, ubatch.n_tokens)) {
+                    if (ggml_backend_supports_op(backend_cpu, cur)) {
+                        ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
+                    }
+                } else if (uma_router->gpu_pin_backend != nullptr) {
+                    if (ggml_backend_supports_op(uma_router->gpu_pin_backend, cur)) {
+                        ggml_backend_sched_set_tensor_backend(sched.get(), cur, uma_router->gpu_pin_backend);
+                    }
                 }
             }
         }

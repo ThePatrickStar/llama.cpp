@@ -6,10 +6,16 @@
 // placement CHANGE invalidates the cached graph schedule, so graph reuse is
 // preserved and the overhead budget is the decision bookkeeping alone.
 // Milestone 2 adds cpu-static:N - the expert tensors of layers [0, N) run on
-// the CPU backend during single-token decode, read in place from the Metal
-// shared/mapped weight buffers (zero-copy); batches (prefill) stay all-GPU.
+// the CPU backend during single-token decode; batches (prefill) stay all-GPU.
+// The zero-copy route is per platform: on Metal the weights stay in the GPU
+// shared/mapped buffers and the CPU reads them in place; on CUDA the loader
+// places them in the device's pinned host buffer type (injected at model
+// load, see llama_uma_inject_load_overrides) and the GPU reads them in place.
+
+#include "llama.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 enum llama_uma_policy {
@@ -42,6 +48,14 @@ struct llama_uma_router {
     uint32_t n_expert;
     uint32_t n_expert_used;
 
+    // CUDA route only (set at weights-buft registration): expert matmuls of
+    // layers [0, n_cpu_layers) are pinned HERE for n_tokens > 1. With
+    // host-resident weights the default assignment is a batch-size heuristic
+    // (CPU at n_tokens < 32, op_offload above); the pin keeps placement
+    // policy-owned and per-pass at every batch size. nullptr on Metal, where
+    // the weights are device-resident and the default is already all-GPU.
+    ggml_backend_t gpu_pin_backend = nullptr;
+
     // per-layer expert placement bitmap, 1 bit per expert (0 = GPU, 1 = CPU)
     std::vector<uint64_t> placement;
     std::vector<uint64_t> placement_prev;
@@ -50,3 +64,15 @@ struct llama_uma_router {
     int64_t n_replan    = 0;
     int64_t t_decide_us = 0;
 };
+
+// cpu-static:N on a CUDA device needs load-time placement: expert weights of
+// layers [0, N) go to the device's pinned host buffer type so both engines
+// address the same host-resident bytes (measured on GB10: hostmapped == device
+// read speed for the GPU; managed is -25% and never used). Injects
+// tensor_buft_overrides into params before llama_model_load; patterns and
+// overrides are caller-owned storage that must outlive the load. Disables
+// mmap for the load (the loader downgrades host-buft overrides to plain CPU
+// under mmap). Returns false on a fatal condition (unparseable policy, user
+// tensor overrides alongside the policy, no host buffer type) - the caller
+// must fail the load; a typoed policy must never silently measure stock.
+bool llama_uma_inject_load_overrides(llama_model_params & params, std::vector<std::string> & patterns, std::vector<llama_model_tensor_buft_override> & overrides);

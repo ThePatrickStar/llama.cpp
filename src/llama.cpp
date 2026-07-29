@@ -411,6 +411,18 @@ static struct llama_model * llama_model_load_from_file_impl(
         };
     }
 
+    // uma-moe fork: cpu-static:N on a CUDA device places the designated
+    // expert weights in the device's pinned host buffer type (llama-uma.h);
+    // the storage vectors must outlive the load, nothing retains the
+    // override pointer past it (llama_model captures has_tensor_overrides
+    // as a bool at creation)
+    std::vector<std::string> uma_patterns;
+    std::vector<llama_model_tensor_buft_override> uma_overrides;
+    if (!llama_uma_inject_load_overrides(params, uma_patterns, uma_overrides)) {
+        LLAMA_LOG_ERROR("%s: LLAMA_UMA_POLICY rejected, failing the load\n", __func__);
+        return nullptr;
+    }
+
     const auto [status, model] = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, file, params);
     GGML_ASSERT(status <= 0);
     if (status < 0) {

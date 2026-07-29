@@ -45,6 +45,80 @@ bool llama_uma_router::parse_policy(const char * s, llama_uma_policy & policy, u
     return false;
 }
 
+bool llama_uma_inject_load_overrides(llama_model_params & params, std::vector<std::string> & patterns, std::vector<llama_model_tensor_buft_override> & overrides) {
+    const char * env = getenv("LLAMA_UMA_POLICY");
+    if (env == nullptr || env[0] == '\0') {
+        return true;
+    }
+    llama_uma_policy policy       = LLAMA_UMA_POLICY_NONE;
+    uint32_t         n_cpu_layers = 0;
+    if (!llama_uma_router::parse_policy(env, policy, n_cpu_layers)) {
+        fprintf(stderr, "uma: unrecognized LLAMA_UMA_POLICY value '%s' (known: gpu-only, cpu-static:N)\n", env);
+        return false;
+    }
+    if (policy != LLAMA_UMA_POLICY_CPU_STATIC || params.vocab_only) {
+        return true;
+    }
+
+    // CUDA route only. On Metal the weights are already host-visible in their
+    // device buffers and the context-side allowlist handles them; any other
+    // backend fails closed there too. Explicit name check, not a property
+    // heuristic: a denylist here failed open for CUDA VRAM once already.
+    ggml_backend_dev_t dev = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(d);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d);
+        if (reg != nullptr && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+            dev = d;
+            break;
+        }
+    }
+    if (dev == nullptr) {
+        return true;
+    }
+
+    if (params.tensor_buft_overrides != nullptr && params.tensor_buft_overrides[0].pattern != nullptr) {
+        fprintf(stderr, "uma: refusing to mix -ot/--n-cpu-moe tensor overrides with LLAMA_UMA_POLICY=cpu-static\n");
+        return false;
+    }
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+    if (host_buft == nullptr) {
+        fprintf(stderr, "uma: cpu-static needs a pinned host buffer type, none on %s\n", ggml_backend_dev_name(dev));
+        return false;
+    }
+    if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        fprintf(stderr, "uma: WARNING: %s is not an integrated device - host-resident expert weights are functional-validation-only, wrong physics for placement numbers\n",
+                ggml_backend_dev_name(dev));
+    }
+
+    // same per-layer pattern --n-cpu-moe uses; reserve first, the c_str()s
+    // must stay valid while the loader iterates the override array
+    patterns.reserve(n_cpu_layers);
+    overrides.reserve(n_cpu_layers + 1);
+    for (uint32_t il = 0; il < n_cpu_layers; il++) {
+        char pat[64];
+        snprintf(pat, sizeof(pat), "blk\\.%u\\.ffn_(up|down|gate|gate_up)_(ch|)exps", il);
+        patterns.push_back(pat);
+        overrides.push_back({ patterns.back().c_str(), host_buft });
+    }
+    overrides.push_back({ nullptr, nullptr });
+    params.tensor_buft_overrides = overrides.data();
+
+    // the loader downgrades host-buft overrides to plain CPU when mmap is on
+    // (pinned host memory cannot be mmap zero-copy)
+    if (params.load_mode == LLAMA_LOAD_MODE_MMAP || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
+        params.load_mode = params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ? LLAMA_LOAD_MODE_MLOCK : LLAMA_LOAD_MODE_NONE;
+        fprintf(stderr, "uma: mmap disabled for this load (host-resident expert weights)\n");
+    }
+    fprintf(stderr, "uma: cpu-static:%u load-time placement: expert weights of layers [0,%u) -> %s\n",
+            n_cpu_layers, n_cpu_layers, ggml_backend_buft_name(host_buft));
+    return true;
+}
+
 bool llama_uma_router::layer_on_cpu(int il, uint32_t n_tokens) const {
     // single-token decode only: batches (prefill) stay all-GPU, which is the
     // per-pass freedom a load-time split cannot express
