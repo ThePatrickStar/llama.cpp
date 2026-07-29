@@ -2,7 +2,6 @@
 
 #include "llama-impl.h"
 
-#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,7 +34,7 @@ bool llama_uma_router::parse_policy(const char * s, llama_uma_policy & policy, u
     if (strncmp(s, prefix, strlen(prefix)) == 0) {
         const char * num = s + strlen(prefix);
         char * end = nullptr;
-        const unsigned long v = strtoul(num, &end, 10);
+        const unsigned long long v = strtoull(num, &end, 10);
         if (end == num || *end != '\0' || v == 0 || v > UINT32_MAX) {
             return false;
         }

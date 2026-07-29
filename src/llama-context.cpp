@@ -2506,14 +2506,29 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
+// allowlist, not denylist: only buffer types positively known to hold
+// host-dereferenceable weights may be registered - anything else (Metal
+// private, CUDA device VRAM, future backends) must abort rather than fail
+// open. Metal shared = "MTL<i>", Metal mapped = "MTL<i>_Mapped" (mmap).
+// A CUDA/Spark port must extend this deliberately (hostmapped bufts).
+static bool uma_buft_host_visible(const char * name) {
+    if (strncmp(name, "MTL", 3) != 0) {
+        return false;
+    }
+    const char * p = name + 3;
+    if (*p < '0' || *p > '9') {
+        return false;
+    }
+    while (*p >= '0' && *p <= '9') {
+        p++;
+    }
+    return *p == '\0' || strcmp(p, "_Mapped") == 0;
+}
+
 void llama_context::uma_allow_weights_bufts() {
     if (!uma_router || uma_router->policy != LLAMA_UMA_POLICY_CPU_STATIC) {
         return;
     }
-    // the CPU backend reads the designated expert weights in place; register
-    // their (Metal shared/mapped) buffer types with the scheduler. Private
-    // Metal buffers are refused: their tensor->data is a virtual placeholder,
-    // not a host pointer.
     for (uint32_t il = 0; il < uma_router->n_cpu_layers; il++) {
         const auto & layer = model.layers[il];
         for (ggml_tensor * t : { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps }) {
@@ -2529,8 +2544,8 @@ void llama_context::uma_allow_weights_bufts() {
                 continue;
             }
             const char * buft_name = ggml_backend_buft_name(buft);
-            if (strstr(buft_name, "_Private") != nullptr) {
-                throw std::runtime_error(format("uma: cpu-static needs host-visible expert weights, got buffer type %s for %s", buft_name, t->name));
+            if (!uma_buft_host_visible(buft_name)) {
+                throw std::runtime_error(format("uma: cpu-static needs host-visible expert weights, refusing buffer type %s for %s", buft_name, t->name));
             }
             ggml_backend_sched_allow_weights_buft(sched.get(), backend_cpu, buft);
             if (uma_bufts_logged.insert(buft).second) {
