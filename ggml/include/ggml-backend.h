@@ -334,6 +334,11 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
+    // uma-moe fork: allow backend to use WEIGHTS-usage tensors allocated in buft in place (no split-input copy).
+    // Weights-only on purpose: weights have no producer in the graph, so in-place cross-backend reads are
+    // race-free; activations must keep the copy path, whose input-copy loop synchronizes the producing backend.
+    GGML_API void                 ggml_backend_sched_allow_weights_buft(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_backend_buffer_type_t buft);
+
     // Split graph without allocating it
     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 

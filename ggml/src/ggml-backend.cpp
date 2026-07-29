@@ -818,6 +818,11 @@ struct ggml_backend_sched {
 
     bool op_offload;
 
+    // uma-moe fork: (backend, buft) pairs whose WEIGHTS-usage tensors the backend may use in place
+    int n_weights_bufts;
+    int weights_buft_backend_ids[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_buffer_type_t weights_bufts[GGML_SCHED_MAX_BACKENDS];
+
     int debug;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
@@ -998,6 +1003,15 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
     if (buf) {
         // the tensor is already allocated
         buft = buf->buft;
+
+        // uma-moe fork: registered weights bufts are readable in place by the paired backend
+        if (buf->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            for (int i = 0; i < sched->n_weights_bufts; i++) {
+                if (sched->weights_bufts[i] == buft && sched->weights_buft_backend_ids[i] == backend_id) {
+                    return true;
+                }
+            }
+        }
     } else {
         // see if the tensor already has a backend assigned, and use the buffer type of that backend
         int tensor_backend_id = tensor_backend_id(t);
@@ -1973,6 +1987,22 @@ void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct gg
     tensor_backend_id(node) = backend_index;
     SET_CAUSE(node, "usr");
     sched->is_reset = false;
+}
+
+void ggml_backend_sched_allow_weights_buft(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(buft);
+    const int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+    for (int i = 0; i < sched->n_weights_bufts; i++) {
+        if (sched->weights_bufts[i] == buft && sched->weights_buft_backend_ids[i] == backend_index) {
+            return;
+        }
+    }
+    GGML_ASSERT(sched->n_weights_bufts < GGML_SCHED_MAX_BACKENDS);
+    sched->weights_bufts[sched->n_weights_bufts] = buft;
+    sched->weights_buft_backend_ids[sched->n_weights_bufts] = backend_index;
+    sched->n_weights_bufts++;
 }
 
 ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node) {

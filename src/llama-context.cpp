@@ -283,15 +283,20 @@ llama_context::llama_context(
     {
         const char * LLAMA_UMA_POLICY = getenv("LLAMA_UMA_POLICY");
         if (LLAMA_UMA_POLICY && LLAMA_UMA_POLICY[0] != '\0') {
-            if (strcmp(LLAMA_UMA_POLICY, "gpu-only") != 0) {
+            llama_uma_policy uma_policy   = LLAMA_UMA_POLICY_NONE;
+            uint32_t         n_cpu_layers = 0;
+            if (!llama_uma_router::parse_policy(LLAMA_UMA_POLICY, uma_policy, n_cpu_layers)) {
                 // abort, not warn: llama-bench swallows llama logs by default,
                 // and a typoed policy silently measuring stock is the one
                 // failure a record run cannot be allowed to hide
-                throw std::runtime_error(format("unrecognized LLAMA_UMA_POLICY value '%s' (known: gpu-only)", LLAMA_UMA_POLICY));
+                throw std::runtime_error(format("unrecognized LLAMA_UMA_POLICY value '%s' (known: gpu-only, cpu-static:N)", LLAMA_UMA_POLICY));
             }
             const auto & hparams = model.hparams;
+            if (uma_policy == LLAMA_UMA_POLICY_CPU_STATIC && n_cpu_layers > hparams.n_layer()) {
+                throw std::runtime_error(format("LLAMA_UMA_POLICY cpu-static:%u exceeds n_layer=%u", n_cpu_layers, hparams.n_layer()));
+            }
             if (hparams.n_expert > 0) {
-                uma_router = std::make_unique<llama_uma_router>(LLAMA_UMA_POLICY_GPU_ONLY, hparams.n_layer(), hparams.n_expert, hparams.n_expert_used);
+                uma_router = std::make_unique<llama_uma_router>(uma_policy, n_cpu_layers, hparams.n_layer(), hparams.n_expert, hparams.n_expert_used);
             } else {
                 fprintf(stderr, "uma: LLAMA_UMA_POLICY set but model has no experts, router inactive\n");
             }
@@ -494,8 +499,9 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     if (uma_router && uma_router->n_decide > 0) {
         // stderr on purpose, see the activation line in llama-uma.cpp
-        fprintf(stderr, "uma: %" PRId64 " decisions, %" PRId64 " replans, %.3f us avg, %d graphs reused\n",
-                uma_router->n_decide, uma_router->n_replan, (double) uma_router->t_decide_us/uma_router->n_decide, n_reused);
+        fprintf(stderr, "uma: %" PRId64 " decisions, %" PRId64 " replans, %.3f us avg, %d graphs reused, %d splits last graph\n",
+                uma_router->n_decide, uma_router->n_replan, (double) uma_router->t_decide_us/uma_router->n_decide, n_reused,
+                sched ? ggml_backend_sched_get_n_splits(sched.get()) : -1);
     }
 
     if (!model.hparams.no_alloc) {
@@ -619,6 +625,8 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
+    uma_allow_weights_bufts();
+
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
@@ -653,6 +661,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                uma_allow_weights_bufts();
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -2497,6 +2506,40 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
+void llama_context::uma_allow_weights_bufts() {
+    if (!uma_router || uma_router->policy != LLAMA_UMA_POLICY_CPU_STATIC) {
+        return;
+    }
+    // the CPU backend reads the designated expert weights in place; register
+    // their (Metal shared/mapped) buffer types with the scheduler. Private
+    // Metal buffers are refused: their tensor->data is a virtual placeholder,
+    // not a host pointer.
+    for (uint32_t il = 0; il < uma_router->n_cpu_layers; il++) {
+        const auto & layer = model.layers[il];
+        for (ggml_tensor * t : { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps }) {
+            if (t == nullptr) {
+                continue;
+            }
+            ggml_backend_buffer_t buf = t->buffer;
+            if (buf == nullptr) {
+                throw std::runtime_error(format("uma: expert tensor %s has no buffer", t->name));
+            }
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+            if (ggml_backend_buft_is_host(buft)) {
+                continue;
+            }
+            const char * buft_name = ggml_backend_buft_name(buft);
+            if (strstr(buft_name, "_Private") != nullptr) {
+                throw std::runtime_error(format("uma: cpu-static needs host-visible expert weights, got buffer type %s for %s", buft_name, t->name));
+            }
+            ggml_backend_sched_allow_weights_buft(sched.get(), backend_cpu, buft);
+            if (uma_bufts_logged.insert(buft).second) {
+                fprintf(stderr, "uma: weights buft %s registered for CPU in-place reads\n", buft_name);
+            }
+        }
+    }
+}
+
 llm_graph_cb llama_context::graph_get_cb() const {
     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
@@ -2518,6 +2561,24 @@ llm_graph_cb llama_context::graph_get_cb() const {
                             ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
                         }
                     }
+                }
+            }
+        }
+
+        // uma-moe: route the designated layers' expert matmuls to the CPU
+        // backend; the weights stay in the Metal shared/mapped buffers and
+        // are read in place (registered at reserve time), so placement is
+        // per-pass: prefill batches stay all-GPU.
+        // note: for models with per-expert scales/biases the cb'd tensor is
+        // the trailing mul/add_id, not the mul_mat_id itself; cpu-static
+        // targets plain-MoE graphs (Qwen3-MoE class) for now
+        if (uma_router && il >= 0 && uma_router->layer_on_cpu(il, ubatch.n_tokens)) {
+            if (strcmp(name, "ffn_moe_gate")    == 0 ||
+                strcmp(name, "ffn_moe_up")      == 0 ||
+                strcmp(name, "ffn_moe_gate_up") == 0 ||
+                strcmp(name, "ffn_moe_down")    == 0) {
+                if (ggml_backend_supports_op(backend_cpu, cur)) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
                 }
             }
         }

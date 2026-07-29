@@ -14,6 +14,7 @@
 
 #include <map>
 #include <memory>
+#include <set>
 #include <vector>
 
 struct llama_model;
@@ -382,6 +383,12 @@ private:
 
     // env: LLAMA_UMA_POLICY (uma-moe fork)
     std::unique_ptr<llama_uma_router> uma_router;
+
+    // uma-moe fork: register the designated expert weight bufts for CPU
+    // in-place reads; must run after every sched (re)creation
+    void uma_allow_weights_bufts();
+
+    std::set<ggml_backend_buffer_type_t> uma_bufts_logged;
 
     // perf
     mutable int64_t t_start_us  = 0;
