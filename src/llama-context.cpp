@@ -2561,7 +2561,7 @@ void llama_context::uma_allow_weights_bufts() {
                     }
                 }
                 if (dev_backend == nullptr) {
-                    throw std::runtime_error(format("uma: no backend for device %s owning weights buft %s", ggml_backend_dev_name(buft_dev), ggml_backend_buft_name(buft)));
+                    throw std::runtime_error(format("uma: no backend for device %s owning weights buft %s (device excluded from this context, e.g. via --device?)", ggml_backend_dev_name(buft_dev), ggml_backend_buft_name(buft)));
                 }
                 ggml_backend_sched_allow_weights_buft(sched.get(), dev_backend, buft);
                 uma_router->gpu_pin_backend = dev_backend;

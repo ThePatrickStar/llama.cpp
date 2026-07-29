@@ -82,7 +82,13 @@ bool llama_uma_inject_load_overrides(llama_model_params & params, std::vector<st
     }
 
     if (params.tensor_buft_overrides != nullptr && params.tensor_buft_overrides[0].pattern != nullptr) {
-        fprintf(stderr, "uma: refusing to mix -ot/--n-cpu-moe tensor overrides with LLAMA_UMA_POLICY=cpu-static\n");
+        fprintf(stderr, "uma: refusing to mix tensor overrides with LLAMA_UMA_POLICY=cpu-static (from -ot/--n-cpu-moe, or from automatic -fit overflow placement - pass -fit off)\n");
+        return false;
+    }
+    // sanity bound only - the context ctor enforces the strict n_layer check;
+    // this stops an absurd N from turning into a bad_alloc during reserve
+    if (n_cpu_layers > 4096) {
+        fprintf(stderr, "uma: cpu-static:%u is not a plausible layer count\n", n_cpu_layers);
         return false;
     }
     ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
