@@ -24,11 +24,27 @@ enum llama_uma_policy {
     LLAMA_UMA_POLICY_CPU_STATIC,
 };
 
+// layout of the policy-designated expert layers, LLAMA_UMA_LAYOUT env (M3:
+// layout is a priced action of the cost model, uniform over the designated
+// set). default: Metal keeps weights GPU-resident (M2 route), CUDA pins them
+// in host memory (Task C route). std: CPU-resident standard layout - decode
+// runs the generic vec_dot tier, batches stay staging-eligible (plain CPU
+// buft is_host). repack: CPU-resident repacked - the fast CPU decode tier,
+// CPU-only readable, prefill collapses to the gemv tier (the priced cost).
+enum llama_uma_layout {
+    LLAMA_UMA_LAYOUT_DEFAULT = 0,
+    LLAMA_UMA_LAYOUT_STD,
+    LLAMA_UMA_LAYOUT_REPACK,
+};
+
 struct llama_uma_router {
     llama_uma_router(llama_uma_policy policy, uint32_t n_cpu_layers, uint32_t n_layer, uint32_t n_expert, uint32_t n_expert_used);
 
     // parses "gpu-only" or "cpu-static:N"; returns false on anything else
     static bool parse_policy(const char * s, llama_uma_policy & policy, uint32_t & n_cpu_layers);
+
+    // parses "std" or "repack"; returns false on anything else
+    static bool parse_layout(const char * s, llama_uma_layout & layout);
 
     // per-token placement decision; returns true when the placement changed
     // vs the previous token (caller must then rebuild/re-split the graph)
@@ -54,6 +70,7 @@ struct llama_uma_router {
     bool layer_on_cpu(int il, uint32_t n_tokens) const;
 
     llama_uma_policy policy;
+    llama_uma_layout layout = LLAMA_UMA_LAYOUT_DEFAULT;
 
     uint32_t n_cpu_layers;
 
@@ -61,12 +78,14 @@ struct llama_uma_router {
     uint32_t n_expert;
     uint32_t n_expert_used;
 
-    // CUDA route only (set at weights-buft registration): expert matmuls of
-    // layers [0, n_cpu_layers) are pinned HERE for n_tokens > 1. With
-    // host-resident weights the default assignment is a batch-size heuristic
-    // (CPU at n_tokens < 32, op_offload above); the pin keeps placement
-    // policy-owned and per-pass at every batch size. nullptr on Metal, where
-    // the weights are device-resident and the default is already all-GPU.
+    // CUDA and std-layout routes (set at weights-buft registration): expert
+    // matmuls of layers [0, n_cpu_layers) are pinned HERE for n_tokens > 1.
+    // With host/CPU-resident weights the default assignment is a heuristic
+    // (batch-size gated op_offload, and on Metal defeated entirely by the
+    // BLAS backend claiming plain-CPU weight buffers); the pin keeps
+    // placement policy-owned and per-pass at every batch size. nullptr on
+    // the Metal default route (weights device-resident, default already
+    // all-GPU) and for repack layout (CPU-only readable by design).
     ggml_backend_t gpu_pin_backend = nullptr;
 
     // per-layer expert placement bitmap, 1 bit per expert (0 = GPU, 1 = CPU)

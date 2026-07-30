@@ -52,6 +52,18 @@ bool llama_uma_router::parse_policy(const char * s, llama_uma_policy & policy, u
     return false;
 }
 
+bool llama_uma_router::parse_layout(const char * s, llama_uma_layout & layout) {
+    if (strcmp(s, "std") == 0) {
+        layout = LLAMA_UMA_LAYOUT_STD;
+        return true;
+    }
+    if (strcmp(s, "repack") == 0) {
+        layout = LLAMA_UMA_LAYOUT_REPACK;
+        return true;
+    }
+    return false;
+}
+
 bool llama_uma_inject_load_overrides(llama_model_params & params, std::vector<std::string> & patterns, std::vector<llama_model_tensor_buft_override> & overrides) {
     const char * env = getenv("LLAMA_UMA_POLICY");
     if (env == nullptr || env[0] == '\0') {
@@ -63,12 +75,24 @@ bool llama_uma_inject_load_overrides(llama_model_params & params, std::vector<st
         fprintf(stderr, "uma: unrecognized LLAMA_UMA_POLICY value '%s' (known: gpu-only, cpu-static:N)\n", env);
         return false;
     }
+    llama_uma_layout layout = LLAMA_UMA_LAYOUT_DEFAULT;
+    const char * env_layout = getenv("LLAMA_UMA_LAYOUT");
+    if (env_layout != nullptr && env_layout[0] != '\0') {
+        if (!llama_uma_router::parse_layout(env_layout, layout)) {
+            fprintf(stderr, "uma: unrecognized LLAMA_UMA_LAYOUT value '%s' (known: std, repack)\n", env_layout);
+            return false;
+        }
+        if (policy != LLAMA_UMA_POLICY_CPU_STATIC) {
+            fprintf(stderr, "uma: LLAMA_UMA_LAYOUT requires LLAMA_UMA_POLICY=cpu-static:N (layout applies to the designated layers)\n");
+            return false;
+        }
+    }
     if (policy != LLAMA_UMA_POLICY_CPU_STATIC || params.vocab_only) {
         return true;
     }
 
-    // CUDA route only. On Metal the weights are already host-visible in their
-    // device buffers and the context-side allowlist handles them; any other
+    // CUDA device discovery. On Metal the default route keeps the weights in
+    // their device buffers (host-visible, context-side allowlist); any other
     // backend fails closed there too. Explicit name check, not a property
     // heuristic: a denylist here failed open for CUDA VRAM once already.
     ggml_backend_dev_t dev = nullptr;
@@ -84,7 +108,18 @@ bool llama_uma_inject_load_overrides(llama_model_params & params, std::vector<st
             break;
         }
     }
-    if (dev == nullptr) {
+
+    // route per (layout, platform):
+    //   default: CUDA -> pinned host; Metal -> no injection (M2 route)
+    //   std:     CUDA -> pinned host (same bytes, host-resident either way);
+    //            Metal -> plain CPU + extra bufts off (standard layout,
+    //            mmap-friendly, staging-eligible)
+    //   repack:  plain CPU + no_host on any platform (re-resolution then
+    //            lands on the CPU repack tier; verified: the loader honors
+    //            non-CPU override bufts verbatim and re-resolves only the
+    //            plain CPU buft through the buft list)
+    const bool cpu_route = layout == LLAMA_UMA_LAYOUT_REPACK || (layout == LLAMA_UMA_LAYOUT_STD && dev == nullptr);
+    if (dev == nullptr && !cpu_route) {
         return true;
     }
 
@@ -98,14 +133,25 @@ bool llama_uma_inject_load_overrides(llama_model_params & params, std::vector<st
         fprintf(stderr, "uma: cpu-static:%u is not a plausible layer count\n", n_cpu_layers);
         return false;
     }
-    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
-    if (host_buft == nullptr) {
-        fprintf(stderr, "uma: cpu-static needs a pinned host buffer type, none on %s\n", ggml_backend_dev_name(dev));
-        return false;
-    }
-    if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_IGPU) {
-        fprintf(stderr, "uma: WARNING: %s is not an integrated device - host-resident expert weights are functional-validation-only, wrong physics for placement numbers\n",
-                ggml_backend_dev_name(dev));
+
+    ggml_backend_buffer_type_t inject_buft = nullptr;
+    if (cpu_route) {
+        inject_buft = ggml_backend_cpu_buffer_type();
+        if (layout == LLAMA_UMA_LAYOUT_REPACK) {
+            params.no_host = true;
+        } else {
+            params.use_extra_bufts = false;
+        }
+    } else {
+        inject_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (inject_buft == nullptr) {
+            fprintf(stderr, "uma: cpu-static needs a pinned host buffer type, none on %s\n", ggml_backend_dev_name(dev));
+            return false;
+        }
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            fprintf(stderr, "uma: WARNING: %s is not an integrated device - host-resident expert weights are functional-validation-only, wrong physics for placement numbers\n",
+                    ggml_backend_dev_name(dev));
+        }
     }
 
     // same per-layer pattern --n-cpu-moe uses; reserve first, the c_str()s
@@ -116,19 +162,29 @@ bool llama_uma_inject_load_overrides(llama_model_params & params, std::vector<st
         char pat[64];
         snprintf(pat, sizeof(pat), "blk\\.%u\\.ffn_(up|down|gate|gate_up)_(ch|)exps", il);
         patterns.push_back(pat);
-        overrides.push_back({ patterns.back().c_str(), host_buft });
+        overrides.push_back({ patterns.back().c_str(), inject_buft });
     }
     overrides.push_back({ nullptr, nullptr });
     params.tensor_buft_overrides = overrides.data();
 
-    // the loader downgrades host-buft overrides to plain CPU when mmap is on
-    // (pinned host memory cannot be mmap zero-copy)
-    if (params.load_mode == LLAMA_LOAD_MODE_MMAP || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
-        params.load_mode = params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ? LLAMA_LOAD_MODE_MLOCK : LLAMA_LOAD_MODE_NONE;
-        fprintf(stderr, "uma: mmap disabled for this load (host-resident expert weights)\n");
+    if (cpu_route) {
+        // mmap stays on: plain CPU tensors map zero-copy; the repack tier
+        // copies out of the mapping at load like stock --n-cpu-moe does
+        if (layout == LLAMA_UMA_LAYOUT_REPACK) {
+            fprintf(stderr, "uma: layout repack: expert weights of layers [0,%u) -> CPU repack tier (no_host)\n", n_cpu_layers);
+        } else {
+            fprintf(stderr, "uma: layout std: expert weights of layers [0,%u) -> CPU standard layout (extra bufts off)\n", n_cpu_layers);
+        }
+    } else {
+        // the loader downgrades host-buft overrides to plain CPU when mmap is
+        // on (pinned host memory cannot be mmap zero-copy)
+        if (params.load_mode == LLAMA_LOAD_MODE_MMAP || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
+            params.load_mode = params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ? LLAMA_LOAD_MODE_MLOCK : LLAMA_LOAD_MODE_NONE;
+            fprintf(stderr, "uma: mmap disabled for this load (host-resident expert weights)\n");
+        }
+        fprintf(stderr, "uma: cpu-static:%u load-time placement: expert weights of layers [0,%u) -> %s\n",
+                n_cpu_layers, n_cpu_layers, ggml_backend_buft_name(inject_buft));
     }
-    fprintf(stderr, "uma: cpu-static:%u load-time placement: expert weights of layers [0,%u) -> %s\n",
-            n_cpu_layers, n_cpu_layers, ggml_backend_buft_name(host_buft));
     return true;
 }
 

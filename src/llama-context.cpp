@@ -312,6 +312,17 @@ llama_context::llama_context(
             uma_router->observe_experts = true;
             fprintf(stderr, "uma: observe experts channel on\n");
         }
+        const char * LLAMA_UMA_LAYOUT = getenv("LLAMA_UMA_LAYOUT");
+        if (LLAMA_UMA_LAYOUT && LLAMA_UMA_LAYOUT[0] != '\0') {
+            llama_uma_layout uma_layout = LLAMA_UMA_LAYOUT_DEFAULT;
+            if (!llama_uma_router::parse_layout(LLAMA_UMA_LAYOUT, uma_layout)) {
+                throw std::runtime_error(format("unrecognized LLAMA_UMA_LAYOUT value '%s' (known: std, repack)", LLAMA_UMA_LAYOUT));
+            }
+            if (!uma_router || uma_router->policy != LLAMA_UMA_POLICY_CPU_STATIC) {
+                throw std::runtime_error("LLAMA_UMA_LAYOUT requires LLAMA_UMA_POLICY=cpu-static:N");
+            }
+            uma_router->layout = uma_layout;
+        }
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -2586,6 +2597,49 @@ void llama_context::uma_allow_weights_bufts() {
                 throw std::runtime_error(format("uma: expert tensor %s has no buffer", t->name));
             }
             ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+            {
+                // std/repack layouts: the designated weights are CPU-resident
+                // by design. std = plain CPU (is_host, staging-eligible),
+                // repack = CPU extra buft (is_host false, CPU-only readable).
+                // No registration and no gpu pin: the CPU backend owns them,
+                // batches take the default sched path (std: op_offload
+                // staging; repack: CPU gemv, the priced collapse tier).
+                ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
+                const bool cpu_resident = buft_dev == nullptr || ggml_backend_dev_type(buft_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+                if (uma_router->layout != LLAMA_UMA_LAYOUT_DEFAULT && cpu_resident) {
+                    const bool want_std = uma_router->layout == LLAMA_UMA_LAYOUT_STD;
+                    if (want_std != ggml_backend_buft_is_host(buft)) {
+                        throw std::runtime_error(format("uma: layout %s expert weights for %s landed in %s - load-time layout did not stick", want_std ? "std" : "repack", t->name, ggml_backend_buft_name(buft)));
+                    }
+                    // std batches must be PINNED to the GPU backend: the
+                    // op_offload heuristic never fires here because an ACCEL
+                    // backend (BLAS) claims plain-CPU weight buffers first,
+                    // so without the pin batches silently run the slowest CPU
+                    // tier. Same policy-owned principle as the CUDA route.
+                    // repack stays unpinned: CPU-only readable by design.
+                    if (want_std && uma_router->gpu_pin_backend == nullptr) {
+                        for (ggml_backend_t b : backend_ptrs) {
+                            ggml_backend_dev_t d = ggml_backend_get_device(b);
+                            if (d == nullptr) {
+                                continue;
+                            }
+                            const enum ggml_backend_dev_type dt = ggml_backend_dev_type(d);
+                            if (dt == GGML_BACKEND_DEVICE_TYPE_GPU || dt == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                                uma_router->gpu_pin_backend = b;
+                                fprintf(stderr, "uma: layout std: batches pinned to %s (staged in-split reads)\n", ggml_backend_name(b));
+                                break;
+                            }
+                        }
+                    }
+                    if (uma_bufts_logged.insert(buft).second) {
+                        fprintf(stderr, "uma: layout %s verified: expert weights in %s\n", want_std ? "std" : "repack", ggml_backend_buft_name(buft));
+                    }
+                    continue;
+                }
+                if (uma_router->layout == LLAMA_UMA_LAYOUT_REPACK) {
+                    throw std::runtime_error(format("uma: layout repack expert weights for %s landed in %s - load-time layout did not stick", t->name, ggml_backend_buft_name(buft)));
+                }
+            }
             if (ggml_backend_buft_is_host(buft)) {
                 // CUDA route: the load-time injection put these weights in the
                 // device's pinned host buft. The CPU reads them natively; the
