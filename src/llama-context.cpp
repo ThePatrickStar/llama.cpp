@@ -301,6 +301,17 @@ llama_context::llama_context(
                 fprintf(stderr, "uma: LLAMA_UMA_POLICY set but model has no experts, router inactive\n");
             }
         }
+        const char * LLAMA_UMA_OBSERVE = getenv("LLAMA_UMA_OBSERVE");
+        if (LLAMA_UMA_OBSERVE && LLAMA_UMA_OBSERVE[0] != '\0') {
+            if (strcmp(LLAMA_UMA_OBSERVE, "experts") != 0) {
+                throw std::runtime_error(format("unrecognized LLAMA_UMA_OBSERVE value '%s' (known: experts)", LLAMA_UMA_OBSERVE));
+            }
+            if (!uma_router) {
+                throw std::runtime_error("LLAMA_UMA_OBSERVE requires an active LLAMA_UMA_POLICY router");
+            }
+            uma_router->observe_experts = true;
+            fprintf(stderr, "uma: observe experts channel on\n");
+        }
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -502,6 +513,14 @@ llama_context::~llama_context() {
         fprintf(stderr, "uma: %" PRId64 " decisions, %" PRId64 " replans, %.3f us avg, %d graphs reused, %d splits last graph\n",
                 uma_router->n_decide, uma_router->n_replan, (double) uma_router->t_decide_us/uma_router->n_decide, n_reused,
                 sched ? ggml_backend_sched_get_n_splits(sched.get()) : -1);
+        fprintf(stderr, "uma: observe pp %" PRId64 " tokens / %" PRId64 " passes / %.1f ms, tg %" PRId64 " tokens / %.3f ms avg, %" PRId64 " rebuilds / %.3f ms avg\n",
+                uma_router->n_pp_tokens, uma_router->n_pp_passes, 1e-3 * uma_router->t_pp_us,
+                uma_router->n_tg_tokens, uma_router->n_tg_tokens > 0 ? 1e-3 * uma_router->t_tg_us/uma_router->n_tg_tokens : 0.0,
+                uma_router->n_rebuild, uma_router->n_rebuild > 0 ? 1e-3 * uma_router->t_rebuild_us/uma_router->n_rebuild : 0.0);
+        if (uma_router->observe_experts && uma_router->reuse_den > 0) {
+            fprintf(stderr, "uma: observe experts: reuse %.1f%% over %" PRId64 " decode tokens\n",
+                    100.0 * (double) uma_router->reuse_num/uma_router->reuse_den, uma_router->n_expert_obs);
+        }
     }
 
     if (!model.hparams.no_alloc) {
@@ -744,11 +763,25 @@ void llama_context::synchronize() {
             t_eval_us += ggml_time_us() - t_compute_start_us;
         }
         n_eval++;
+        // observe() reads the same clock as the perf stats but is gated on
+        // the router, not no_perf - llama-bench leaves no_perf on and the
+        // policy needs feedback during record runs. The t_compute guard
+        // skips mid-decode reserve/realloc syncs that would book a bogus
+        // elapsed (same hole the upstream perf stats have)
+        if (uma_router && t_compute_start_us != 0) {
+            uma_router->observe_pass(1, ggml_time_us() - t_compute_start_us);
+            if (uma_router->observe_experts) {
+                uma_router->observe_experts_read();
+            }
+        }
     } else if (n_queued_tokens > 1) {
         if (!cparams.no_perf) {
             t_p_eval_us += ggml_time_us() - t_compute_start_us;
         }
         n_p_eval += n_queued_tokens;
+        if (uma_router && t_compute_start_us != 0) {
+            uma_router->observe_pass(n_queued_tokens, ggml_time_us() - t_compute_start_us);
+        }
     }
 
     // get a more accurate load time, upon first eval
@@ -1380,6 +1413,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        const int64_t t_rebuild_start_us = uma_router ? ggml_time_us() : 0;
+
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -1401,6 +1436,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+
+        if (uma_router) {
+            uma_router->observe_rebuild(ggml_time_us() - t_rebuild_start_us);
         }
     }
 
@@ -2618,6 +2657,13 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // note: for models with per-expert scales/biases the cb'd tensor is
         // the trailing mul/add_id, not the mul_mat_id itself; cpu-static
         // targets plain-MoE graphs (Qwen3-MoE class) for now
+        // expert-id channel: keep the on-device topk readable and cache its
+        // pointer per layer; refreshed at every (re)build, read post-sync
+        if (uma_router && il >= 0 && uma_router->observe_experts && strcmp(name, "ffn_moe_topk") == 0) {
+            ggml_set_output(cur);
+            uma_router->observe_experts_cache(il, cur);
+        }
+
         if (uma_router && il >= 0 && uma_router->policy == LLAMA_UMA_POLICY_CPU_STATIC && (uint32_t) il < uma_router->n_cpu_layers) {
             if (strcmp(name, "ffn_moe_gate")    == 0 ||
                 strcmp(name, "ffn_moe_up")      == 0 ||

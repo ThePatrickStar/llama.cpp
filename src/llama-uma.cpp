@@ -2,6 +2,9 @@
 
 #include "llama-impl.h"
 
+#include "ggml-backend.h"
+
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -11,6 +14,10 @@ llama_uma_router::llama_uma_router(llama_uma_policy policy, uint32_t n_cpu_layer
     const uint32_t words = (n_expert + 63)/64;
     placement.assign((size_t) n_layer * words, 0);
     placement_prev = placement;
+    topk_tensors.assign(n_layer, nullptr);
+    expert_freq.assign((size_t) n_layer * n_expert, 0);
+    expert_cur.assign((size_t) n_layer * words, 0);
+    expert_prev = expert_cur;
     // measurement evidence, deliberately NOT via LLAMA_LOG: llama-bench
     // installs a null log callback by default and a record run must still
     // prove the router was engaged
@@ -123,6 +130,65 @@ bool llama_uma_inject_load_overrides(llama_model_params & params, std::vector<st
     fprintf(stderr, "uma: cpu-static:%u load-time placement: expert weights of layers [0,%u) -> %s\n",
             n_cpu_layers, n_cpu_layers, ggml_backend_buft_name(host_buft));
     return true;
+}
+
+void llama_uma_router::observe_pass(uint32_t n_tokens, int64_t t_us) {
+    if (n_tokens == 1) {
+        t_tg_us += t_us;
+        n_tg_tokens++;
+    } else {
+        t_pp_us += t_us;
+        n_pp_tokens += n_tokens;
+        n_pp_passes++;
+    }
+}
+
+void llama_uma_router::observe_rebuild(int64_t t_us) {
+    t_rebuild_us += t_us;
+    n_rebuild++;
+}
+
+void llama_uma_router::observe_experts_cache(int il, ggml_tensor * topk) {
+    if (il >= 0 && (uint32_t) il < n_layer) {
+        topk_tensors[il] = topk;
+    }
+}
+
+void llama_uma_router::observe_experts_read() {
+    const uint32_t words = (n_expert + 63)/64;
+    std::vector<int32_t> ids(n_expert_used);
+    for (uint32_t il = 0; il < n_layer; il++) {
+        ggml_tensor * t = topk_tensors[il];
+        if (t == nullptr) {
+            continue;
+        }
+        // garbage here corrupts every downstream locality stat - abort loud
+        if (t->type != GGML_TYPE_I32 || t->ne[0] < (int64_t) n_expert_used) {
+            GGML_ABORT("uma: observe experts: topk tensor %s has type %s ne0 %" PRId64 ", expected i32 x %u", t->name, ggml_type_name(t->type), t->ne[0], n_expert_used);
+        }
+        ggml_backend_tensor_get(t, ids.data(), 0, n_expert_used * sizeof(int32_t));
+        uint64_t * cur  = expert_cur.data()  + (size_t) il * words;
+        uint64_t * prev = expert_prev.data() + (size_t) il * words;
+        memset(cur, 0, words * sizeof(uint64_t));
+        for (uint32_t e = 0; e < n_expert_used; e++) {
+            const int32_t id = ids[e];
+            if (id < 0 || (uint32_t) id >= n_expert) {
+                GGML_ABORT("uma: observe experts: layer %u expert id %d out of range [0,%u)", il, id, n_expert);
+            }
+            cur[id / 64] |= 1ull << (id % 64);
+            expert_freq[(size_t) il * n_expert + id]++;
+        }
+        if (n_expert_obs > 0) {
+            for (uint32_t w = 0; w < words; w++) {
+                reuse_num += __builtin_popcountll(cur[w] & prev[w]);
+                reuse_den += __builtin_popcountll(cur[w]);
+            }
+        }
+        for (uint32_t w = 0; w < words; w++) {
+            prev[w] = cur[w];
+        }
+    }
+    n_expert_obs++;
 }
 
 bool llama_uma_router::layer_on_cpu(int il, uint32_t n_tokens) const {

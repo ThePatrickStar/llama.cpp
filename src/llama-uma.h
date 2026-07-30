@@ -34,6 +34,19 @@ struct llama_uma_router {
     // vs the previous token (caller must then rebuild/re-split the graph)
     bool decide(uint32_t n_tokens);
 
+    // observe() feedback (M3): fed only at existing sync points and on the
+    // existing graph-rebuild path - observation must never add a sync
+    void observe_pass(uint32_t n_tokens, int64_t t_us);
+    void observe_rebuild(int64_t t_us);
+
+    // expert-id channel, env-gated (LLAMA_UMA_OBSERVE=experts), default off.
+    // The topk tensors are read back AFTER the graph is synchronized (on UMA
+    // this is a small memcpy, on CUDA a small D2H) - decode passes only.
+    // The graph callback caches the per-layer topk tensor pointers at every
+    // (re)build, so reads never scan the graph by name.
+    void observe_experts_cache(int il, ggml_tensor * topk);
+    void observe_experts_read();
+
     // pure function of (policy, il, n_tokens): true when layer il's expert
     // matmuls run on the CPU backend for a batch of n_tokens. Also consulted
     // by the graph callback, including during the context reserve builds, so
@@ -63,6 +76,27 @@ struct llama_uma_router {
     int64_t n_decide    = 0;
     int64_t n_replan    = 0;
     int64_t t_decide_us = 0;
+
+    // observe() aggregates
+    int64_t t_pp_us      = 0;
+    int64_t n_pp_tokens  = 0;
+    int64_t n_pp_passes  = 0;
+    int64_t t_tg_us      = 0;
+    int64_t n_tg_tokens  = 0;
+    // times the whole rebuild path (build + alloc), not only placement-caused
+    // replans - this is the C-Q4 replan-cost quantity
+    int64_t t_rebuild_us = 0;
+    int64_t n_rebuild    = 0;
+
+    bool observe_experts = false;
+
+    std::vector<ggml_tensor *> topk_tensors;   // per layer, refreshed by the cb
+    std::vector<uint32_t>      expert_freq;    // n_layer x n_expert counts
+    std::vector<uint64_t>      expert_cur;     // active-set bitmaps, layer-major
+    std::vector<uint64_t>      expert_prev;
+    int64_t n_expert_obs = 0;                  // decode tokens observed
+    int64_t reuse_num    = 0;                  // sum of |cur & prev| per layer
+    int64_t reuse_den    = 0;                  // sum of |cur| per layer
 };
 
 // cpu-static:N on a CUDA device needs load-time placement: expert weights of
