@@ -295,8 +295,29 @@ llama_context::llama_context(
             if (uma_policy == LLAMA_UMA_POLICY_CPU_STATIC && n_cpu_layers > hparams.n_layer()) {
                 throw std::runtime_error(format("LLAMA_UMA_POLICY cpu-static:%u exceeds n_layer=%u", n_cpu_layers, hparams.n_layer()));
             }
+            llama_uma_layout uma_auto_layout = LLAMA_UMA_LAYOUT_DEFAULT;
+            if (uma_policy == LLAMA_UMA_POLICY_AUTO && !hparams.vocab_only) {
+                // re-plan deterministically (same profile, same probes as the
+                // load-time injection) and check the profile identity against
+                // the loaded hparams - the file-size check ran at injection
+                llama_uma_plan    plan;
+                llama_uma_profile prof;
+                std::string       err;
+                if (!llama_uma_auto_plan(nullptr, plan, err, &prof)) {
+                    throw std::runtime_error(format("uma auto plan failed: %s", err.c_str()));
+                }
+                const char * force = getenv("LLAMA_UMA_PROFILE_FORCE");
+                const bool forced = force != nullptr && strcmp(force, "1") == 0;
+                if (!forced && (prof.n_layer != hparams.n_layer() || prof.n_expert != hparams.n_expert || prof.n_expert_used != hparams.n_expert_used)) {
+                    throw std::runtime_error(format("uma profile identity mismatch: profile %u/%u/%u vs model %u/%u/%u (layers/experts/used)",
+                            prof.n_layer, prof.n_expert, prof.n_expert_used, hparams.n_layer(), hparams.n_expert, hparams.n_expert_used));
+                }
+                n_cpu_layers    = plan.k;
+                uma_auto_layout = plan.layout;
+            }
             if (hparams.n_expert > 0) {
                 uma_router = std::make_unique<llama_uma_router>(uma_policy, n_cpu_layers, hparams.n_layer(), hparams.n_expert, hparams.n_expert_used);
+                uma_router->layout = uma_auto_layout;
             } else {
                 fprintf(stderr, "uma: LLAMA_UMA_POLICY set but model has no experts, router inactive\n");
             }
@@ -2583,7 +2604,7 @@ static bool uma_buft_host_visible(const char * name) {
 }
 
 void llama_context::uma_allow_weights_bufts() {
-    if (!uma_router || uma_router->policy != LLAMA_UMA_POLICY_CPU_STATIC) {
+    if (!uma_router || !uma_router->placement_active()) {
         return;
     }
     for (uint32_t il = 0; il < uma_router->n_cpu_layers; il++) {
@@ -2724,7 +2745,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
             uma_router->observe_experts_cache(il, cur);
         }
 
-        if (uma_router && il >= 0 && uma_router->policy == LLAMA_UMA_POLICY_CPU_STATIC && (uint32_t) il < uma_router->n_cpu_layers) {
+        if (uma_router && il >= 0 && uma_router->placement_active() && (uint32_t) il < uma_router->n_cpu_layers) {
             if (strcmp(name, "ffn_moe_gate")    == 0 ||
                 strcmp(name, "ffn_moe_up")      == 0 ||
                 strcmp(name, "ffn_moe_gate_up") == 0 ||

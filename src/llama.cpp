@@ -418,7 +418,7 @@ static struct llama_model * llama_model_load_from_file_impl(
     // as a bool at creation)
     std::vector<std::string> uma_patterns;
     std::vector<llama_model_tensor_buft_override> uma_overrides;
-    if (!llama_uma_inject_load_overrides(params, uma_patterns, uma_overrides)) {
+    if (!llama_uma_inject_load_overrides(path_model.empty() ? nullptr : path_model.c_str(), params, uma_patterns, uma_overrides)) {
         LLAMA_LOG_ERROR("%s: LLAMA_UMA_POLICY rejected, failing the load\n", __func__);
         return nullptr;
     }

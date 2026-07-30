@@ -22,6 +22,7 @@ enum llama_uma_policy {
     LLAMA_UMA_POLICY_NONE = 0,
     LLAMA_UMA_POLICY_GPU_ONLY,
     LLAMA_UMA_POLICY_CPU_STATIC,
+    LLAMA_UMA_POLICY_AUTO,
 };
 
 // layout of the policy-designated expert layers, LLAMA_UMA_LAYOUT env (M3:
@@ -68,6 +69,11 @@ struct llama_uma_router {
     // by the graph callback, including during the context reserve builds, so
     // the tg reserve graph sizes the CPU compute buffer with the pins active.
     bool layer_on_cpu(int il, uint32_t n_tokens) const;
+
+    // policies that designate CPU layers (cpu-static, and auto once planned)
+    bool placement_active() const {
+        return policy == LLAMA_UMA_POLICY_CPU_STATIC || policy == LLAMA_UMA_POLICY_AUTO;
+    }
 
     llama_uma_policy policy;
     llama_uma_layout layout = LLAMA_UMA_LAYOUT_DEFAULT;
@@ -118,6 +124,64 @@ struct llama_uma_router {
     int64_t reuse_den    = 0;                  // sum of |cur| per layer
 };
 
+// device+model profile artifact (M3): flat ASCII "key value" lines, produced
+// only by the instruments (scripts/uma-profile.sh merging harness CSVs and
+// engine self-calibration). The auto policy reads THIS file plus runtime
+// probes and nothing else - no device-name branches anywhere (identity
+// fields are checked for provenance, never branched on for decisions).
+// dt_* keys are SYNC-AND-COPY-INCLUSIVE per-layer marginals vs the all-GPU
+// baseline; t_tok_*/t_pass_* are absolute baselines at the calib sizes.
+struct llama_uma_profile {
+    // identity (checked; mismatch aborts unless LLAMA_UMA_PROFILE_FORCE=1)
+    int64_t  model_file_bytes = 0;
+    uint32_t n_layer = 0;
+    uint32_t n_expert = 0;
+    uint32_t n_expert_used = 0;
+    std::vector<int64_t> expert_bytes_layers;
+    // engine calibration
+    double  t_tok_gpu_tg_us  = 0.0;
+    double  t_pass_gpu_pp_us = 0.0;
+    int64_t calib_pp_tokens  = 0;
+    int64_t calib_ubatch     = 0;
+    double  dt_layer_std_tg_us    = 0.0;
+    double  dt_layer_repack_tg_us = 0.0;
+    double  dt_layer_std_pp_us    = 0.0;
+    double  dt_layer_repack_pp_us = 0.0;
+    // carried for reporting/regime checks, not consumed by the v1 planner
+    double  tax_hostres_pp_frac_per_layer = 0.0;
+    double  replan_cost_ms = 0.0;
+    double  decide_cost_us = 0.0;
+    // capacity
+    double  wire_margin_frac      = 0.0;
+    int64_t gpu_working_set_bytes = 0;
+    int64_t wired_transient_ok    = 0;
+    // workload mix defaults
+    int64_t lambda_pp_tokens = 512;
+    int64_t lambda_tg_tokens = 128;
+
+    static bool load(const char * path, llama_uma_profile & out, std::string & err);
+};
+
+struct llama_uma_plan {
+    uint32_t         k = 0;
+    llama_uma_layout layout = LLAMA_UMA_LAYOUT_DEFAULT;
+    int64_t          wire_budget_bytes = 0;
+    double           pred_pp_tps = 0.0;
+    double           pred_tg_tps = 0.0;
+};
+
+// the v1 planner: enumerate k x {std, repack} under the wired-budget
+// constraint, argmin J = passes x T_pp_pass + lambda_tg x T_tg_token.
+// Pure function of (profile, wire budget) - deterministic, us-scale.
+llama_uma_plan llama_uma_plan_compute(const llama_uma_profile & prof, int64_t wire_budget_bytes);
+
+// policy=auto entry: loads LLAMA_UMA_PROFILE, checks identity vs the model
+// file (skipped when path_model is null - the context ctor re-plans and
+// checks hparams instead), probes the GPU device wire budget (on Metal this
+// is recommendedMaxWorkingSetSize, which tracks iogpu.wired_limit_mb - the
+// E5 knob), computes the plan and prints the plan evidence line. Fail-closed.
+bool llama_uma_auto_plan(const char * path_model, llama_uma_plan & plan, std::string & err, llama_uma_profile * out_prof = nullptr);
+
 // cpu-static:N on a CUDA device needs load-time placement: expert weights of
 // layers [0, N) go to the device's pinned host buffer type so both engines
 // address the same host-resident bytes (measured on GB10: hostmapped == device
@@ -128,4 +192,6 @@ struct llama_uma_router {
 // under mmap). Returns false on a fatal condition (unparseable policy, user
 // tensor overrides alongside the policy, no host buffer type) - the caller
 // must fail the load; a typoed policy must never silently measure stock.
-bool llama_uma_inject_load_overrides(llama_model_params & params, std::vector<std::string> & patterns, std::vector<llama_model_tensor_buft_override> & overrides);
+// policy=auto plans first (llama_uma_auto_plan) and then injects as if
+// cpu-static:k with the planned layout.
+bool llama_uma_inject_load_overrides(const char * path_model, llama_model_params & params, std::vector<std::string> & patterns, std::vector<llama_model_tensor_buft_override> & overrides);

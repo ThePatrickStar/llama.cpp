@@ -4,10 +4,13 @@
 
 #include "ggml-backend.h"
 
+#include <sys/stat.h>
+
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 
 llama_uma_router::llama_uma_router(llama_uma_policy policy, uint32_t n_cpu_layers, uint32_t n_layer, uint32_t n_expert, uint32_t n_expert_used) :
         policy(policy), n_cpu_layers(n_cpu_layers), n_layer(n_layer), n_expert(n_expert), n_expert_used(n_expert_used) {
@@ -24,6 +27,8 @@ llama_uma_router::llama_uma_router(llama_uma_policy policy, uint32_t n_cpu_layer
     char policy_str[64];
     if (policy == LLAMA_UMA_POLICY_CPU_STATIC) {
         snprintf(policy_str, sizeof(policy_str), "cpu-static:%u", n_cpu_layers);
+    } else if (policy == LLAMA_UMA_POLICY_AUTO) {
+        snprintf(policy_str, sizeof(policy_str), "auto(k=%u)", n_cpu_layers);
     } else {
         snprintf(policy_str, sizeof(policy_str), "gpu-only");
     }
@@ -34,6 +39,11 @@ llama_uma_router::llama_uma_router(llama_uma_policy policy, uint32_t n_cpu_layer
 bool llama_uma_router::parse_policy(const char * s, llama_uma_policy & policy, uint32_t & n_cpu_layers) {
     if (strcmp(s, "gpu-only") == 0) {
         policy       = LLAMA_UMA_POLICY_GPU_ONLY;
+        n_cpu_layers = 0;
+        return true;
+    }
+    if (strcmp(s, "auto") == 0) {
+        policy       = LLAMA_UMA_POLICY_AUTO;
         n_cpu_layers = 0;
         return true;
     }
@@ -64,7 +74,243 @@ bool llama_uma_router::parse_layout(const char * s, llama_uma_layout & layout) {
     return false;
 }
 
-bool llama_uma_inject_load_overrides(llama_model_params & params, std::vector<std::string> & patterns, std::vector<llama_model_tensor_buft_override> & overrides) {
+// strict flat "key value" parser: '#' comments and blank lines only; every
+// other line must be a known key; every required key must appear exactly
+// once. A typo in a profile must never silently plan something else.
+bool llama_uma_profile::load(const char * path, llama_uma_profile & out, std::string & err) {
+    FILE * f = fopen(path, "r");
+    if (f == nullptr) {
+        err = std::string("cannot open profile '") + path + "'";
+        return false;
+    }
+    std::map<std::string, std::string> kv;
+    char line[4096];
+    int lineno = 0;
+    while (fgets(line, sizeof(line), f)) {
+        lineno++;
+        char * s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s == '#' || *s == '\n' || *s == '\0') {
+            continue;
+        }
+        char * nl = strchr(s, '\n');
+        if (nl) *nl = '\0';
+        char * sp = strchr(s, ' ');
+        if (sp == nullptr) {
+            err = "line " + std::to_string(lineno) + ": expected 'key value'";
+            fclose(f);
+            return false;
+        }
+        *sp = '\0';
+        if (!kv.emplace(s, sp + 1).second) {
+            err = "line " + std::to_string(lineno) + ": duplicate key '" + s + "'";
+            fclose(f);
+            return false;
+        }
+    }
+    fclose(f);
+
+    static const char * informational[] = { "produced_by", "date", "device_name", "backend_kind", "model_file_name" };
+    auto take = [&](const char * key, std::string & val) -> bool {
+        auto it = kv.find(key);
+        if (it == kv.end()) {
+            err = std::string("missing required key '") + key + "'";
+            return false;
+        }
+        val = it->second;
+        kv.erase(it);
+        return true;
+    };
+    std::string v;
+    auto take_i64 = [&](const char * key, int64_t & dst) -> bool {
+        if (!take(key, v)) return false;
+        char * end = nullptr;
+        dst = strtoll(v.c_str(), &end, 10);
+        if (end == v.c_str() || *end != '\0') {
+            err = std::string("key '") + key + "': not an integer: '" + v + "'";
+            return false;
+        }
+        return true;
+    };
+    auto take_f64 = [&](const char * key, double & dst) -> bool {
+        if (!take(key, v)) return false;
+        char * end = nullptr;
+        dst = strtod(v.c_str(), &end);
+        if (end == v.c_str() || *end != '\0') {
+            err = std::string("key '") + key + "': not a number: '" + v + "'";
+            return false;
+        }
+        return true;
+    };
+
+    int64_t version = 0;
+    if (!take_i64("uma_profile_version", version)) return false;
+    if (version != 1) {
+        err = "unsupported uma_profile_version " + std::to_string(version);
+        return false;
+    }
+    for (const char * key : informational) {
+        kv.erase(key);
+    }
+    int64_t n_layer = 0, n_expert = 0, n_expert_used = 0;
+    if (!take_i64("model_file_bytes", out.model_file_bytes)) return false;
+    if (!take_i64("n_layer", n_layer) || !take_i64("n_expert", n_expert) || !take_i64("n_expert_used", n_expert_used)) return false;
+    out.n_layer       = (uint32_t) n_layer;
+    out.n_expert      = (uint32_t) n_expert;
+    out.n_expert_used = (uint32_t) n_expert_used;
+    if (!take("expert_bytes_layers", v)) return false;
+    {
+        const char * p = v.c_str();
+        while (*p) {
+            char * end = nullptr;
+            const int64_t b = strtoll(p, &end, 10);
+            if (end == p) {
+                err = "expert_bytes_layers: malformed list";
+                return false;
+            }
+            out.expert_bytes_layers.push_back(b);
+            p = end;
+            if (*p == ',') p++;
+        }
+        if (out.expert_bytes_layers.size() != out.n_layer) {
+            err = "expert_bytes_layers: " + std::to_string(out.expert_bytes_layers.size()) + " entries for n_layer " + std::to_string(out.n_layer);
+            return false;
+        }
+    }
+    if (!take_f64("t_tok_gpu_tg_us",       out.t_tok_gpu_tg_us))       return false;
+    if (!take_f64("t_pass_gpu_pp_us",      out.t_pass_gpu_pp_us))      return false;
+    if (!take_i64("calib_pp_tokens",       out.calib_pp_tokens))       return false;
+    if (!take_i64("calib_ubatch",          out.calib_ubatch))          return false;
+    if (!take_f64("dt_layer_std_tg_us",    out.dt_layer_std_tg_us))    return false;
+    if (!take_f64("dt_layer_repack_tg_us", out.dt_layer_repack_tg_us)) return false;
+    if (!take_f64("dt_layer_std_pp_us",    out.dt_layer_std_pp_us))    return false;
+    if (!take_f64("dt_layer_repack_pp_us", out.dt_layer_repack_pp_us)) return false;
+    if (!take_f64("tax_hostres_pp_frac_per_layer", out.tax_hostres_pp_frac_per_layer)) return false;
+    if (!take_f64("replan_cost_ms",        out.replan_cost_ms))        return false;
+    if (!take_f64("decide_cost_us",        out.decide_cost_us))        return false;
+    if (!take_f64("wire_margin_frac",      out.wire_margin_frac))      return false;
+    if (!take_i64("gpu_working_set_bytes", out.gpu_working_set_bytes)) return false;
+    if (!take_i64("wired_transient_ok",    out.wired_transient_ok))    return false;
+    if (!take_i64("lambda_pp_tokens",      out.lambda_pp_tokens))      return false;
+    if (!take_i64("lambda_tg_tokens",      out.lambda_tg_tokens))      return false;
+    if (!kv.empty()) {
+        err = "unknown key '" + kv.begin()->first + "' (schema v1 is strict)";
+        return false;
+    }
+    if (out.t_tok_gpu_tg_us <= 0 || out.t_pass_gpu_pp_us <= 0 || out.calib_ubatch <= 0 || out.calib_pp_tokens <= 0 || out.gpu_working_set_bytes <= 0) {
+        err = "non-positive calibration baseline";
+        return false;
+    }
+    return true;
+}
+
+llama_uma_plan llama_uma_plan_compute(const llama_uma_profile & prof, int64_t wire_budget_bytes) {
+    llama_uma_plan best;
+    best.wire_budget_bytes = wire_budget_bytes;
+    const double budget = (double) wire_budget_bytes * (1.0 - prof.wire_margin_frac);
+    const double passes = (double) ((prof.lambda_pp_tokens + prof.calib_ubatch - 1) / prof.calib_ubatch);
+
+    double best_j = -1.0;
+    int64_t excluded_bytes = 0;
+    for (uint32_t k = 0; k <= prof.n_layer; k++) {
+        if ((double) prof.gpu_working_set_bytes - (double) excluded_bytes <= budget) {
+            if (k == 0) {
+                const double t_pp = prof.t_pass_gpu_pp_us;
+                const double t_tg = prof.t_tok_gpu_tg_us;
+                best_j = passes * t_pp + (double) prof.lambda_tg_tokens * t_tg;
+                best.k = 0;
+                best.layout = LLAMA_UMA_LAYOUT_DEFAULT;
+                best.pred_pp_tps = 1e6 * (double) prof.calib_pp_tokens / t_pp;
+                best.pred_tg_tps = 1e6 / t_tg;
+            } else {
+                const struct { llama_uma_layout layout; double dt_pp, dt_tg; } cands[] = {
+                    { LLAMA_UMA_LAYOUT_STD,    prof.dt_layer_std_pp_us,    prof.dt_layer_std_tg_us    },
+                    { LLAMA_UMA_LAYOUT_REPACK, prof.dt_layer_repack_pp_us, prof.dt_layer_repack_tg_us },
+                };
+                for (const auto & c : cands) {
+                    const double t_pp = prof.t_pass_gpu_pp_us + k * c.dt_pp;
+                    const double t_tg = prof.t_tok_gpu_tg_us  + k * c.dt_tg;
+                    const double j    = passes * t_pp + (double) prof.lambda_tg_tokens * t_tg;
+                    if (best_j < 0.0 || j < best_j) {
+                        best_j = j;
+                        best.k = k;
+                        best.layout = c.layout;
+                        best.pred_pp_tps = 1e6 * (double) prof.calib_pp_tokens / t_pp;
+                        best.pred_tg_tps = 1e6 / t_tg;
+                    }
+                }
+            }
+            // marginals are non-negative in every measured regime, so J is
+            // non-decreasing in k past the first feasible point
+            break;
+        }
+        excluded_bytes += prof.expert_bytes_layers[k];
+    }
+    if (best_j < 0.0) {
+        best.k = prof.n_layer + 1;   // sentinel: infeasible even fully excluded
+    }
+    return best;
+}
+
+bool llama_uma_auto_plan(const char * path_model, llama_uma_plan & plan, std::string & err, llama_uma_profile * out_prof) {
+    const char * prof_path = getenv("LLAMA_UMA_PROFILE");
+    if (prof_path == nullptr || prof_path[0] == '\0') {
+        err = "LLAMA_UMA_POLICY=auto requires LLAMA_UMA_PROFILE=<file>";
+        return false;
+    }
+    llama_uma_profile prof;
+    if (!llama_uma_profile::load(prof_path, prof, err)) {
+        return false;
+    }
+    const char * force = getenv("LLAMA_UMA_PROFILE_FORCE");
+    const bool forced = force != nullptr && strcmp(force, "1") == 0;
+    if (path_model != nullptr) {
+        struct stat st;
+        if (stat(path_model, &st) == 0 && (int64_t) st.st_size != prof.model_file_bytes) {
+            if (!forced) {
+                err = "profile is for a model of " + std::to_string(prof.model_file_bytes) + " bytes, this file is " + std::to_string((int64_t) st.st_size) + " (set LLAMA_UMA_PROFILE_FORCE=1 only for the wrong-profile ablation)";
+                return false;
+            }
+            fprintf(stderr, "uma: WARNING: profile/model identity mismatch FORCED - ablation mode, numbers are not placement results\n");
+        }
+    }
+    // wire budget = the first GPU device's reported total. On Metal this is
+    // recommendedMaxWorkingSetSize (tracks iogpu.wired_limit_mb, the E5
+    // knob); on CUDA/GB10 it is the device memory total.
+    ggml_backend_dev_t gpu = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(d);
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            gpu = d;
+            break;
+        }
+    }
+    if (gpu == nullptr) {
+        err = "policy=auto needs a GPU device to plan against";
+        return false;
+    }
+    size_t mem_free = 0, mem_total = 0;
+    ggml_backend_dev_memory(gpu, &mem_free, &mem_total);
+    if (mem_total == 0) {
+        err = "GPU device reports no memory total";
+        return false;
+    }
+    plan = llama_uma_plan_compute(prof, (int64_t) mem_total);
+    if (plan.k > prof.n_layer) {
+        err = "no feasible plan: model exceeds the wire budget even with all expert layers excluded";
+        return false;
+    }
+    const char * lay_str = plan.layout == LLAMA_UMA_LAYOUT_STD ? "std" : plan.layout == LLAMA_UMA_LAYOUT_REPACK ? "repack" : "gpu-std";
+    fprintf(stderr, "uma: auto plan: wire_budget=%lld MiB k=%u layout=%s predicted pp=%.1f t/s tg=%.1f t/s\n",
+            (long long) (plan.wire_budget_bytes / (1024*1024)), plan.k, lay_str, plan.pred_pp_tps, plan.pred_tg_tps);
+    if (out_prof != nullptr) {
+        *out_prof = prof;
+    }
+    return true;
+}
+
+bool llama_uma_inject_load_overrides(const char * path_model, llama_model_params & params, std::vector<std::string> & patterns, std::vector<llama_model_tensor_buft_override> & overrides) {
     const char * env = getenv("LLAMA_UMA_POLICY");
     if (env == nullptr || env[0] == '\0') {
         return true;
@@ -72,7 +318,7 @@ bool llama_uma_inject_load_overrides(llama_model_params & params, std::vector<st
     llama_uma_policy policy       = LLAMA_UMA_POLICY_NONE;
     uint32_t         n_cpu_layers = 0;
     if (!llama_uma_router::parse_policy(env, policy, n_cpu_layers)) {
-        fprintf(stderr, "uma: unrecognized LLAMA_UMA_POLICY value '%s' (known: gpu-only, cpu-static:N)\n", env);
+        fprintf(stderr, "uma: unrecognized LLAMA_UMA_POLICY value '%s' (known: gpu-only, cpu-static:N, auto)\n", env);
         return false;
     }
     llama_uma_layout layout = LLAMA_UMA_LAYOUT_DEFAULT;
@@ -83,9 +329,23 @@ bool llama_uma_inject_load_overrides(llama_model_params & params, std::vector<st
             return false;
         }
         if (policy != LLAMA_UMA_POLICY_CPU_STATIC) {
-            fprintf(stderr, "uma: LLAMA_UMA_LAYOUT requires LLAMA_UMA_POLICY=cpu-static:N (layout applies to the designated layers)\n");
+            fprintf(stderr, "uma: LLAMA_UMA_LAYOUT requires LLAMA_UMA_POLICY=cpu-static:N (auto plans its own layout)\n");
             return false;
         }
+    }
+    if (policy == LLAMA_UMA_POLICY_AUTO && !params.vocab_only) {
+        llama_uma_plan plan;
+        std::string err;
+        if (!llama_uma_auto_plan(path_model, plan, err)) {
+            fprintf(stderr, "uma: auto plan failed: %s\n", err.c_str());
+            return false;
+        }
+        if (plan.k == 0) {
+            return true;
+        }
+        policy       = LLAMA_UMA_POLICY_CPU_STATIC;
+        n_cpu_layers = plan.k;
+        layout       = plan.layout;
     }
     if (policy != LLAMA_UMA_POLICY_CPU_STATIC || params.vocab_only) {
         return true;
@@ -250,7 +510,7 @@ void llama_uma_router::observe_experts_read() {
 bool llama_uma_router::layer_on_cpu(int il, uint32_t n_tokens) const {
     // single-token decode only: batches (prefill) stay all-GPU, which is the
     // per-pass freedom a load-time split cannot express
-    return policy == LLAMA_UMA_POLICY_CPU_STATIC && n_tokens == 1 && il >= 0 && (uint32_t) il < n_cpu_layers;
+    return placement_active() && n_tokens == 1 && il >= 0 && (uint32_t) il < n_cpu_layers;
 }
 
 bool llama_uma_router::decide(uint32_t n_tokens) {
