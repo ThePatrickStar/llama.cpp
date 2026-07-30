@@ -201,6 +201,26 @@ bool llama_uma_profile::load(const char * path, llama_uma_profile & out, std::st
         err = "non-positive calibration baseline";
         return false;
     }
+    // a negative marginal means calibration noise swamped the effect - the
+    // planner would treat exclusion as free-or-better and overreach
+    if (out.dt_layer_std_tg_us < 0 || out.dt_layer_repack_tg_us < 0 || out.dt_layer_std_pp_us < 0 || out.dt_layer_repack_pp_us < 0) {
+        err = "negative per-layer marginal (noisy calibration - recalibrate)";
+        return false;
+    }
+    if (out.lambda_pp_tokens < 0 || out.lambda_tg_tokens < 0 || out.lambda_pp_tokens + out.lambda_tg_tokens == 0) {
+        err = "invalid workload mix (lambda)";
+        return false;
+    }
+    if (out.wire_margin_frac < 0.0 || out.wire_margin_frac >= 1.0) {
+        err = "wire_margin_frac outside [0,1)";
+        return false;
+    }
+    for (const int64_t b : out.expert_bytes_layers) {
+        if (b <= 0) {
+            err = "non-positive expert layer bytes";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -266,7 +286,11 @@ bool llama_uma_auto_plan(const char * path_model, llama_uma_plan & plan, std::st
     const bool forced = force != nullptr && strcmp(force, "1") == 0;
     if (path_model != nullptr) {
         struct stat st;
-        if (stat(path_model, &st) == 0 && (int64_t) st.st_size != prof.model_file_bytes) {
+        if (stat(path_model, &st) != 0) {
+            err = std::string("cannot stat model file '") + path_model + "' for the profile identity check";
+            return false;
+        }
+        if ((int64_t) st.st_size != prof.model_file_bytes) {
             if (!forced) {
                 err = "profile is for a model of " + std::to_string(prof.model_file_bytes) + " bytes, this file is " + std::to_string((int64_t) st.st_size) + " (set LLAMA_UMA_PROFILE_FORCE=1 only for the wrong-profile ablation)";
                 return false;
