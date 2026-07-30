@@ -1415,6 +1415,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     } else {
         const int64_t t_rebuild_start_us = uma_router ? ggml_time_us() : 0;
 
+        // stale-pointer guard: reserve builds also fire the cb, so cached
+        // topk entries must only ever point into the graph built HERE
+        if (uma_router && uma_router->observe_experts) {
+            uma_router->topk_tensors.assign(uma_router->topk_tensors.size(), nullptr);
+        }
+
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
