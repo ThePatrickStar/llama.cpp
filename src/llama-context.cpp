@@ -2742,8 +2742,46 @@ void llama_context::uma_wrap_std_buffers(const std::map<ggml_backend_buffer_t, s
     ggml_backend_reg_t gpu_reg = gpu_dev == nullptr ? nullptr : ggml_backend_dev_backend_reg(gpu_dev);
     buffer_mapped_norset_t wrap_fn = gpu_reg == nullptr ? nullptr :
         (buffer_mapped_norset_t) ggml_backend_reg_get_proc_address(gpu_reg, "ggml_backend_metal_device_buffer_mapped_norset");
-    if (wrap_fn == nullptr) {
-        // staged fallback (pre-C1 mechanism): batches are pinned to the GPU
+    // capacity-mode gate (C3 finding): the wrap is unwired, but around
+    // submission the driver must make the WHOLE mapped span resident next to
+    // the wired working set. Under a k-forcing cap the budget slack is
+    // smaller than the excluded bytes by construction, so full-span
+    // zero-copy pp can never fit and llama_decode fails closed with res=-3
+    // (clean refusal - measured at C16=12724 MiB, session 20260731-183946;
+    // uncapped the same path is free, results/wo-c2-zerocopy-20260731.md).
+    // Gate on budget headroom: zero-copy only when free >= span + slack
+    // (slack also covers KV/compute buffers not yet allocated at this
+    // point); otherwise fall back to the staged path - the priced capacity
+    // tier, C16-record behavior. LLAMA_UMA_ZEROCOPY=0/1 forces the decision
+    // for ablations (forcing 1 under a tight cap reproduces the refusal -
+    // measurement use only).
+    bool do_wrap = wrap_fn != nullptr;
+    if (do_wrap) {
+        const char * env_zc = getenv("LLAMA_UMA_ZEROCOPY");
+        if (env_zc != nullptr && env_zc[0] != '\0') {
+            do_wrap = env_zc[0] == '1';
+            fprintf(stderr, "uma: layout std: zero-copy FORCED %s (LLAMA_UMA_ZEROCOPY)\n", do_wrap ? "on" : "off");
+        } else {
+            size_t mapped_total = 0;
+            for (const auto & [buf, tgt] : targets) {
+                GGML_UNUSED(tgt);
+                mapped_total += ggml_backend_buffer_get_size(buf);
+            }
+            const size_t slack = (size_t) 2048 * 1024 * 1024;
+            size_t mem_free = 0, mem_total = 0;
+            ggml_backend_dev_memory(gpu_dev, &mem_free, &mem_total);
+            if (mem_free > mem_total) {
+                // Metal reports free = budget - allocated, which underflows
+                // when allocations exceed a lowered budget - treat as no room
+                mem_free = 0;
+            }
+            do_wrap = mem_free >= mapped_total + slack;
+            fprintf(stderr, "uma: layout std: zero-copy gate: budget free %zu MiB vs span %zu + slack 2048 MiB -> %s\n",
+                    mem_free / (1024*1024), mapped_total / (1024*1024), do_wrap ? "zero-copy" : "staged");
+        }
+    }
+    if (!do_wrap) {
+        // staged path (pre-C1 mechanism): batches are pinned to the GPU
         // backend and the sched copies used experts into each split
         if (uma_router->gpu_pin_backend == nullptr) {
             uma_router->gpu_pin_backend = gpu_backend;
