@@ -397,7 +397,7 @@ bool llama_uma_inject_load_overrides(const char * path_model, llama_model_params
     //   default: CUDA -> pinned host; Metal -> no injection (M2 route)
     //   std:     CUDA -> pinned host (same bytes, host-resident either way);
     //            Metal -> plain CPU + extra bufts off (standard layout,
-    //            mmap-friendly, staging-eligible)
+    //            staging-eligible; load-mode forced off mmap below)
     //   repack:  plain CPU + no_host on any platform (re-resolution then
     //            lands on the CPU repack tier; verified: the loader honors
     //            non-CPU override bufts verbatim and re-resolves only the
@@ -426,6 +426,18 @@ bool llama_uma_inject_load_overrides(const char * path_model, llama_model_params
         } else {
             params.use_extra_bufts = false;
         }
+        // fail-closed (design rule #7): a k>0 capacity plan must never
+        // mmap-load - on Metal the weight buffer spans get_mapping_range()
+        // over the Metal-assigned tensors, interleaved exclusion makes that
+        // span ~the whole file, and the residency set wires it eagerly at
+        // creation (results/e5-cq1-20260731-freeze.md: machine-fatal, not
+        // slow). Keyed on cpu_route, not a backend-name test: load-mode
+        // none is safe everywhere, a Metal allowlist could fail open.
+        if (n_cpu_layers > 0 && (params.load_mode == LLAMA_LOAD_MODE_MMAP || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK)) {
+            params.load_mode = params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ? LLAMA_LOAD_MODE_MLOCK : LLAMA_LOAD_MODE_NONE;
+            fprintf(stderr, "uma: forcing load-mode %s for capacity plan (mmap span would wire the full file - see design rule #7)\n",
+                    llama_load_mode_name(params.load_mode));
+        }
     } else {
         inject_buft = ggml_backend_dev_host_buffer_type(dev);
         if (inject_buft == nullptr) {
@@ -452,8 +464,6 @@ bool llama_uma_inject_load_overrides(const char * path_model, llama_model_params
     params.tensor_buft_overrides = overrides.data();
 
     if (cpu_route) {
-        // mmap stays on: plain CPU tensors map zero-copy; the repack tier
-        // copies out of the mapping at load like stock --n-cpu-moe does
         if (layout == LLAMA_UMA_LAYOUT_REPACK) {
             fprintf(stderr, "uma: layout repack: expert weights of layers [0,%u) -> CPU repack tier (no_host)\n", n_cpu_layers);
         } else {
