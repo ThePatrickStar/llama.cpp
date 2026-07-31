@@ -657,6 +657,11 @@ struct llama_model {
     size_t n_devices() const;
     const float * tensor_split() const;
 
+    // uma-moe fork: take ownership of a zero-copy wrap buffer (Metal mapped
+    // view of a CPU weight buffer) so it lives exactly as long as the model
+    // weights it views; destroyed before the viewed buffers (see impl)
+    void uma_hold_wrap_buffer(ggml_backend_buffer_t buf) const;
+
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
 

@@ -388,6 +388,12 @@ private:
     // in-place reads; must run after every sched (re)creation
     void uma_allow_weights_bufts();
 
+    // uma-moe fork: zero-copy staged reads (C1) - wrap the CPU buffers
+    // holding the designated std-layout expert weights in no-rset Metal
+    // mapped views so the GPU reads them in place (no split copies); falls
+    // back to the staged pin when the GPU backend has no wrap entry point
+    void uma_wrap_std_buffers(const std::map<ggml_backend_buffer_t, std::pair<std::vector<ggml_tensor *>, size_t>> & targets);
+
     std::set<ggml_backend_buffer_type_t> uma_bufts_logged;
 
     // perf

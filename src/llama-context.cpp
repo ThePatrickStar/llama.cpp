@@ -2607,6 +2607,9 @@ void llama_context::uma_allow_weights_bufts() {
     if (!uma_router || !uma_router->placement_active()) {
         return;
     }
+    // zero-copy staged reads (C1): distinct CPU buffers holding designated
+    // std-layout expert weights -> (tensors to retarget, max tensor bytes)
+    std::map<ggml_backend_buffer_t, std::pair<std::vector<ggml_tensor *>, size_t>> std_wrap_targets;
     for (uint32_t il = 0; il < uma_router->n_cpu_layers; il++) {
         const auto & layer = model.layers[il];
         for (ggml_tensor * t : { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps }) {
@@ -2632,25 +2635,14 @@ void llama_context::uma_allow_weights_bufts() {
                     if (want_std != ggml_backend_buft_is_host(buft)) {
                         throw std::runtime_error(format("uma: layout %s expert weights for %s landed in %s - load-time layout did not stick", want_std ? "std" : "repack", t->name, ggml_backend_buft_name(buft)));
                     }
-                    // std batches must be PINNED to the GPU backend: the
-                    // op_offload heuristic never fires here because an ACCEL
-                    // backend (BLAS) claims plain-CPU weight buffers first,
-                    // so without the pin batches silently run the slowest CPU
-                    // tier. Same policy-owned principle as the CUDA route.
+                    // std: collect for the zero-copy wrap after the scan
+                    // (uma_wrap_std_buffers pins batches and registers the
+                    // wrapped buft there, or falls back to the staged pin).
                     // repack stays unpinned: CPU-only readable by design.
-                    if (want_std && uma_router->gpu_pin_backend == nullptr) {
-                        for (ggml_backend_t b : backend_ptrs) {
-                            ggml_backend_dev_t d = ggml_backend_get_device(b);
-                            if (d == nullptr) {
-                                continue;
-                            }
-                            const enum ggml_backend_dev_type dt = ggml_backend_dev_type(d);
-                            if (dt == GGML_BACKEND_DEVICE_TYPE_GPU || dt == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                                uma_router->gpu_pin_backend = b;
-                                fprintf(stderr, "uma: layout std: batches pinned to %s (staged in-split reads)\n", ggml_backend_name(b));
-                                break;
-                            }
-                        }
+                    if (want_std) {
+                        auto & tgt = std_wrap_targets[buf];
+                        tgt.first.push_back(t);
+                        tgt.second = std::max(tgt.second, ggml_nbytes(t));
                     }
                     if (uma_bufts_logged.insert(buft).second) {
                         fprintf(stderr, "uma: layout %s verified: expert weights in %s\n", want_std ? "std" : "repack", ggml_backend_buft_name(buft));
@@ -2695,11 +2687,99 @@ void llama_context::uma_allow_weights_bufts() {
                 throw std::runtime_error(format("uma: cpu-static needs host-visible expert weights, refusing buffer type %s for %s", buft_name, t->name));
             }
             ggml_backend_sched_allow_weights_buft(sched.get(), backend_cpu, buft);
+            // zero-copy re-run path (sched recreation or a second context on
+            // the same model): a std wrap presents as a GPU-device mapped
+            // buft - re-register the GPU engine and the pin on this sched
+            if (uma_router->layout == LLAMA_UMA_LAYOUT_STD) {
+                ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
+                if (buft_dev != nullptr &&
+                    (ggml_backend_dev_type(buft_dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                     ggml_backend_dev_type(buft_dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+                    for (ggml_backend_t b : backend_ptrs) {
+                        if (ggml_backend_get_device(b) == buft_dev) {
+                            ggml_backend_sched_allow_weights_buft(sched.get(), b, buft);
+                            uma_router->gpu_pin_backend = b;
+                            break;
+                        }
+                    }
+                }
+            }
             if (uma_bufts_logged.insert(buft).second) {
                 fprintf(stderr, "uma: weights buft %s registered for CPU in-place reads\n", buft_name);
             }
         }
     }
+    uma_wrap_std_buffers(std_wrap_targets);
+}
+
+void llama_context::uma_wrap_std_buffers(const std::map<ggml_backend_buffer_t, std::pair<std::vector<ggml_tensor *>, size_t>> & targets) {
+    if (targets.empty()) {
+        return;
+    }
+    // the batch engine: first GPU/IGPU backend, same choice the staged path
+    // pinned to
+    ggml_backend_t gpu_backend = nullptr;
+    for (ggml_backend_t b : backend_ptrs) {
+        ggml_backend_dev_t d = ggml_backend_get_device(b);
+        if (d == nullptr) {
+            continue;
+        }
+        const enum ggml_backend_dev_type dt = ggml_backend_dev_type(d);
+        if (dt == GGML_BACKEND_DEVICE_TYPE_GPU || dt == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            gpu_backend = b;
+            break;
+        }
+    }
+    if (gpu_backend == nullptr) {
+        // no GPU in this context: the weights stay plain CPU tensors and the
+        // CPU backend computes on them natively (nothing to wrap or pin)
+        return;
+    }
+    // fork-private Metal entry point, reached via proc address so this file
+    // needs no Metal includes; absent on other backends
+    typedef ggml_backend_buffer_t (*buffer_mapped_norset_t)(ggml_backend_dev_t, void *, size_t, size_t);
+    ggml_backend_dev_t gpu_dev = ggml_backend_get_device(gpu_backend);
+    ggml_backend_reg_t gpu_reg = gpu_dev == nullptr ? nullptr : ggml_backend_dev_backend_reg(gpu_dev);
+    buffer_mapped_norset_t wrap_fn = gpu_reg == nullptr ? nullptr :
+        (buffer_mapped_norset_t) ggml_backend_reg_get_proc_address(gpu_reg, "ggml_backend_metal_device_buffer_mapped_norset");
+    if (wrap_fn == nullptr) {
+        // staged fallback (pre-C1 mechanism): batches are pinned to the GPU
+        // backend and the sched copies used experts into each split
+        if (uma_router->gpu_pin_backend == nullptr) {
+            uma_router->gpu_pin_backend = gpu_backend;
+            fprintf(stderr, "uma: layout std: batches pinned to %s (staged in-split reads)\n", ggml_backend_name(gpu_backend));
+        }
+        return;
+    }
+    for (const auto & [buf, tgt] : targets) {
+        const std::vector<ggml_tensor *> & tensors = tgt.first;
+        void * base = ggml_backend_buffer_get_base(buf);
+        const size_t size = ggml_backend_buffer_get_size(buf);
+        for (ggml_tensor * t : tensors) {
+            const char * p = (const char *) t->data;
+            if (p < (const char *) base || p + ggml_nbytes(t) > (const char *) base + size) {
+                throw std::runtime_error(format("uma: expert tensor %s lies outside its buffer - refusing zero-copy wrap", t->name));
+            }
+        }
+        ggml_backend_buffer_t wrap = wrap_fn(gpu_dev, base, size, tgt.second);
+        if (wrap == nullptr) {
+            throw std::runtime_error("uma: zero-copy wrap of a CPU expert buffer failed");
+        }
+        ggml_backend_buffer_set_usage(wrap, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        // lifetime: the wrap only views the CPU buffer's pages; the model
+        // holds it so it dies with the weights (before them, see impl)
+        model.uma_hold_wrap_buffer(wrap);
+        for (ggml_tensor * t : tensors) {
+            t->buffer = wrap; // t->data unchanged - same pages, now GPU-bindable
+        }
+        ggml_backend_buffer_type_t wrap_buft = ggml_backend_buffer_get_type(wrap);
+        ggml_backend_sched_allow_weights_buft(sched.get(), gpu_backend, wrap_buft); // pp reads in place
+        ggml_backend_sched_allow_weights_buft(sched.get(), backend_cpu, wrap_buft); // decode reads the same pages
+        fprintf(stderr, "uma: layout std: zero-copy wrap: %zu expert tensors in %s (%.1f MiB, no rset, in-place reads)\n",
+                tensors.size(), ggml_backend_buft_name(wrap_buft), size / (1024.0 * 1024.0));
+    }
+    uma_router->gpu_pin_backend = gpu_backend;
+    fprintf(stderr, "uma: layout std: batches pinned to %s (zero-copy in-place reads)\n", ggml_backend_name(gpu_backend));
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {

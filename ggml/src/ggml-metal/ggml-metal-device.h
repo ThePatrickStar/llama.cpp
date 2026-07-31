@@ -305,6 +305,9 @@ typedef struct ggml_metal_buffer * ggml_metal_buffer_t;
 
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared);
 ggml_metal_buffer_t ggml_metal_buffer_map (ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size);
+// uma-moe fork: same wrap but with no residency set - transient
+// per-command-buffer residency, wired footprint stays off the wire budget
+ggml_metal_buffer_t ggml_metal_buffer_map_norset(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size);
 
 void   ggml_metal_buffer_free     (ggml_metal_buffer_t buf);
 void * ggml_metal_buffer_get_base (ggml_metal_buffer_t buf);

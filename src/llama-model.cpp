@@ -1021,6 +1021,11 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // uma-moe fork: zero-copy wrap buffers (Metal mapped views of CPU weight
+    // buffers, no residency set). Declared after ctxs_bufs so they are
+    // destroyed BEFORE the CPU buffers whose memory they view.
+    std::vector<ggml_backend_buffer_ptr> uma_wrap_bufs;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -1696,6 +1701,10 @@ size_t llama_model::n_tensors() const {
 
 size_t llama_model::n_devices() const {
     return devices.size();
+}
+
+void llama_model::uma_hold_wrap_buffer(ggml_backend_buffer_t buf) const {
+    pimpl->uma_wrap_bufs.emplace_back(buf);
 }
 
 const float * llama_model::tensor_split() const {

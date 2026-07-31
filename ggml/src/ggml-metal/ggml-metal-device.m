@@ -1582,7 +1582,7 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
     return res;
 }
 
-ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size) {
+static ggml_metal_buffer_t ggml_metal_buffer_map_impl(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size, bool use_rset) {
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
 
     res->dev = dev;
@@ -1664,7 +1664,7 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
         }
     }
 
-    res->use_residency_sets = props_dev->use_residency_sets;
+    res->use_residency_sets = use_rset && props_dev->use_residency_sets;
 
     if (!ggml_metal_buffer_rset_init(res)) {
         GGML_LOG_ERROR("%s: error: failed to initialize residency set\n", __func__);
@@ -1675,6 +1675,19 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
     ggml_metal_device_rsets_add(dev, res->rset);
 
     return res;
+}
+
+ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size) {
+    return ggml_metal_buffer_map_impl(dev, ptr, size, max_tensor_size, true);
+}
+
+// uma-moe fork: wrap host memory WITHOUT a residency set - pages get
+// transient per-command-buffer residency (kernel args bind via setBuffer)
+// instead of being eagerly wired for the buffer's lifetime. Used for the
+// zero-copy view of CPU-resident expert weights, whose wired footprint must
+// stay out of the planner's Metal wire budget.
+ggml_metal_buffer_t ggml_metal_buffer_map_norset(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size) {
+    return ggml_metal_buffer_map_impl(dev, ptr, size, max_tensor_size, false);
 }
 
 void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
