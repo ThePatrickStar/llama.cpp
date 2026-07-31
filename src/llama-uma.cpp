@@ -6,6 +6,7 @@
 
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -189,6 +190,12 @@ bool llama_uma_profile::load(const char * path, llama_uma_profile & out, std::st
     if (!take_f64("replan_cost_ms",        out.replan_cost_ms))        return false;
     if (!take_f64("decide_cost_us",        out.decide_cost_us))        return false;
     if (!take_f64("wire_margin_frac",      out.wire_margin_frac))      return false;
+    // OPTIONAL (schema v1 + A1, 2026-07-31): absent = 0 = pure-frac margin.
+    // Old profiles round-trip unchanged; a profile carrying this key on a
+    // pre-A1 binary fails closed via the unknown-key check, as intended.
+    if (kv.count("wire_margin_floor_bytes") != 0) {
+        if (!take_i64("wire_margin_floor_bytes", out.wire_margin_floor_bytes)) return false;
+    }
     if (!take_i64("gpu_working_set_bytes", out.gpu_working_set_bytes)) return false;
     if (!take_i64("wired_transient_ok",    out.wired_transient_ok))    return false;
     if (!take_i64("lambda_pp_tokens",      out.lambda_pp_tokens))      return false;
@@ -215,6 +222,10 @@ bool llama_uma_profile::load(const char * path, llama_uma_profile & out, std::st
         err = "wire_margin_frac outside [0,1)";
         return false;
     }
+    if (out.wire_margin_floor_bytes < 0) {
+        err = "negative wire_margin_floor_bytes";
+        return false;
+    }
     for (const int64_t b : out.expert_bytes_layers) {
         if (b <= 0) {
             err = "non-positive expert layer bytes";
@@ -227,7 +238,12 @@ bool llama_uma_profile::load(const char * path, llama_uma_profile & out, std::st
 llama_uma_plan llama_uma_plan_compute(const llama_uma_profile & prof, int64_t wire_budget_bytes) {
     llama_uma_plan best;
     best.wire_budget_bytes = wire_budget_bytes;
-    const double budget = (double) wire_budget_bytes * (1.0 - prof.wire_margin_frac);
+    // margin = max(absolute floor, fractional): the measured slack need is
+    // absolute (llama transients + shared-pool clients; +256 MiB headroom
+    // failed bench pp, +512 passed - results/e5-cq1-c16.md), so a bare
+    // fraction under-margins small capacity budgets
+    const double margin = std::max((double) prof.wire_margin_floor_bytes, (double) wire_budget_bytes * prof.wire_margin_frac);
+    const double budget = (double) wire_budget_bytes - margin;
     const double passes = (double) ((prof.lambda_pp_tokens + prof.calib_ubatch - 1) / prof.calib_ubatch);
 
     double best_j = -1.0;

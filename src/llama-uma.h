@@ -151,10 +151,16 @@ struct llama_uma_profile {
     double  tax_hostres_pp_frac_per_layer = 0.0;
     double  replan_cost_ms = 0.0;
     double  decide_cost_us = 0.0;
-    // capacity
-    double  wire_margin_frac      = 0.0;
-    int64_t gpu_working_set_bytes = 0;
-    int64_t wired_transient_ok    = 0;
+    // capacity. margin = max(wire_margin_floor_bytes, frac * budget): the
+    // measured slack drivers are absolute costs (llama transients ~150 MiB +
+    // the shared iogpu pool's other clients), so small budgets need an
+    // absolute floor while big budgets keep the fractional margin.
+    // wire_margin_floor_bytes is an OPTIONAL schema-v1 key (2026-07-31,
+    // WO-A1); absent = 0 = pre-A1 pure-frac behavior.
+    double  wire_margin_frac        = 0.0;
+    int64_t wire_margin_floor_bytes = 0;
+    int64_t gpu_working_set_bytes   = 0;
+    int64_t wired_transient_ok      = 0;
     // workload mix defaults
     int64_t lambda_pp_tokens = 512;
     int64_t lambda_tg_tokens = 128;
