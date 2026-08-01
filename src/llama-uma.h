@@ -147,6 +147,13 @@ struct llama_uma_profile {
     double  dt_layer_repack_tg_us = 0.0;
     double  dt_layer_std_pp_us    = 0.0;
     double  dt_layer_repack_pp_us = 0.0;
+    // load-path tier (WO-A2, 2026-07-31): capacity plans execute -lm none
+    // (G1b/WO-B force it), where the DECODE marginal is ~10% cheaper than
+    // mmap; pp marginals and gpu baselines are tier-flat
+    // (results/wo-a2-loadpath-tier-20260731.md). OPTIONAL schema-v1 pair,
+    // all-or-nothing; -1 = absent = price k>0 tg with the mmap marginals.
+    double  dt_layer_std_tg_none_us    = -1.0;
+    double  dt_layer_repack_tg_none_us = -1.0;
     // carried for reporting/regime checks, not consumed by the v1 planner
     double  tax_hostres_pp_frac_per_layer = 0.0;
     double  replan_cost_ms = 0.0;

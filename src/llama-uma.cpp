@@ -186,6 +186,20 @@ bool llama_uma_profile::load(const char * path, llama_uma_profile & out, std::st
     if (!take_f64("dt_layer_repack_tg_us", out.dt_layer_repack_tg_us)) return false;
     if (!take_f64("dt_layer_std_pp_us",    out.dt_layer_std_pp_us))    return false;
     if (!take_f64("dt_layer_repack_pp_us", out.dt_layer_repack_pp_us)) return false;
+    // OPTIONAL pair (schema v1 + A2, 2026-07-31): none-tier decode marginals.
+    // All-or-nothing - a lone key means a truncated/mis-merged profile.
+    {
+        const bool has_std    = kv.count("dt_layer_std_tg_none_us")    != 0;
+        const bool has_repack = kv.count("dt_layer_repack_tg_none_us") != 0;
+        if (has_std != has_repack) {
+            err = "dt_layer_std_tg_none_us and dt_layer_repack_tg_none_us must appear together";
+            return false;
+        }
+        if (has_std) {
+            if (!take_f64("dt_layer_std_tg_none_us",    out.dt_layer_std_tg_none_us))    return false;
+            if (!take_f64("dt_layer_repack_tg_none_us", out.dt_layer_repack_tg_none_us)) return false;
+        }
+    }
     if (!take_f64("tax_hostres_pp_frac_per_layer", out.tax_hostres_pp_frac_per_layer)) return false;
     if (!take_f64("replan_cost_ms",        out.replan_cost_ms))        return false;
     if (!take_f64("decide_cost_us",        out.decide_cost_us))        return false;
@@ -211,6 +225,12 @@ bool llama_uma_profile::load(const char * path, llama_uma_profile & out, std::st
     // a negative marginal means calibration noise swamped the effect - the
     // planner would treat exclusion as free-or-better and overreach
     if (out.dt_layer_std_tg_us < 0 || out.dt_layer_repack_tg_us < 0 || out.dt_layer_std_pp_us < 0 || out.dt_layer_repack_pp_us < 0) {
+        err = "negative per-layer marginal (noisy calibration - recalibrate)";
+        return false;
+    }
+    // -1 exactly = absent sentinel; anything else negative is a bad profile
+    if ((out.dt_layer_std_tg_none_us    != -1.0 && out.dt_layer_std_tg_none_us    < 0) ||
+        (out.dt_layer_repack_tg_none_us != -1.0 && out.dt_layer_repack_tg_none_us < 0)) {
         err = "negative per-layer marginal (noisy calibration - recalibrate)";
         return false;
     }
@@ -259,9 +279,14 @@ llama_uma_plan llama_uma_plan_compute(const llama_uma_profile & prof, int64_t wi
                 best.pred_pp_tps = 1e6 * (double) prof.calib_pp_tokens / t_pp;
                 best.pred_tg_tps = 1e6 / t_tg;
             } else {
+                // k>0 = capacity plan = -lm none at load (G1b/WO-B): price
+                // decode with the none-tier marginals when calibrated. pp
+                // marginals and baselines are tier-flat (WO-A2).
+                const double dt_tg_std    = prof.dt_layer_std_tg_none_us    >= 0.0 ? prof.dt_layer_std_tg_none_us    : prof.dt_layer_std_tg_us;
+                const double dt_tg_repack = prof.dt_layer_repack_tg_none_us >= 0.0 ? prof.dt_layer_repack_tg_none_us : prof.dt_layer_repack_tg_us;
                 const struct { llama_uma_layout layout; double dt_pp, dt_tg; } cands[] = {
-                    { LLAMA_UMA_LAYOUT_STD,    prof.dt_layer_std_pp_us,    prof.dt_layer_std_tg_us    },
-                    { LLAMA_UMA_LAYOUT_REPACK, prof.dt_layer_repack_pp_us, prof.dt_layer_repack_tg_us },
+                    { LLAMA_UMA_LAYOUT_STD,    prof.dt_layer_std_pp_us,    dt_tg_std    },
+                    { LLAMA_UMA_LAYOUT_REPACK, prof.dt_layer_repack_pp_us, dt_tg_repack },
                 };
                 for (const auto & c : cands) {
                     const double t_pp = prof.t_pass_gpu_pp_us + k * c.dt_pp;
