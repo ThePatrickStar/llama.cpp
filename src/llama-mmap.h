@@ -72,3 +72,11 @@ private:
 };
 
 size_t llama_path_max();
+
+// M5 residency give-back: drop the resident pages of [addr, addr+len) so they
+// re-fault from the file-backed mmap on next access. Page-aligned INWARD (start
+// rounded up, end rounded down) so a neighbouring tensor's pages are never
+// dropped. Meaningful ONLY for MAP_SHARED file-backed pages NOT held resident by
+// a Metal residency set (run under GGML_METAL_NO_RESIDENCY=1). Returns the bytes
+// actually advised (0 on unsupported platforms or an empty aligned range).
+size_t llama_uma_madvise_dontneed(void * addr, size_t len);

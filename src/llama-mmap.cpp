@@ -777,3 +777,29 @@ const bool llama_mlock::SUPPORTED = false;
 size_t llama_path_max() {
     return PATH_MAX;
 }
+
+size_t llama_uma_madvise_dontneed(void * addr, size_t len) {
+#if defined(_POSIX_MAPPED_FILES)
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    uintptr_t first = (uintptr_t) addr;
+    uintptr_t last  = first + len;
+    // INWARD alignment (destructive advice): round start up, end down, so we
+    // never drop a page shared with a neighbouring tensor (#26003 discipline).
+    first = (first + page - 1) & ~(page - 1);
+    last  = last & ~(page - 1);
+    if (last <= first) {
+        return 0;
+    }
+    // MADV_DONTNEED on a MAP_SHARED PROT_READ mapping deactivates/frees the
+    // resident pages; the next touch re-faults the identical bytes from the
+    // GGUF. Immutable weights => correctness-safe.
+    if (madvise((void *) first, (size_t) (last - first), MADV_DONTNEED) != 0) {
+        LLAMA_LOG_WARN("warning: madvise(MADV_DONTNEED) failed: %s\n", strerror(errno));
+        return 0;
+    }
+    return (size_t) (last - first);
+#else
+    (void) addr; (void) len;
+    return 0;
+#endif
+}
