@@ -384,6 +384,21 @@ private:
     // env: LLAMA_UMA_POLICY (uma-moe fork)
     std::unique_ptr<llama_uma_router> uma_router;
 
+    // uma-moe fork M5 (residency give-back): env LLAMA_UMA_GIVEBACK_K keeps the
+    // K hottest experts per layer resident and MADV_DONTNEED-evicts the cold
+    // experts' slabs so they re-fault from the file-backed GGUF mmap. -1 = off.
+    // Freeze-safety: only engaged with GGML_METAL_NO_RESIDENCY set (ctor gate).
+    int32_t uma_giveback_k      = -1;
+    int32_t uma_giveback_period = 256;  // decode tokens between give-back sweeps
+    int32_t uma_giveback_tick   = 0;    // decode-token counter for the rate limit
+
+    // uma-moe fork M5: evict the cold experts' page ranges (per-expert slab,
+    // not per-layer) off the hot-K set read from uma_router->expert_freq.
+    // Rate-limited from the decode-only observe point; a no-op unless
+    // LLAMA_UMA_GIVEBACK_K is set. Never touches non-host (Metal-resident)
+    // buffers, so it stays off the eager-residency-set freeze class.
+    void uma_apply_residency();
+
     // uma-moe fork: register the designated expert weight bufts for CPU
     // in-place reads; must run after every sched (re)creation
     void uma_allow_weights_bufts();

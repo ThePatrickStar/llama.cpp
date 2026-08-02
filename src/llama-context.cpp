@@ -12,8 +12,10 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -343,6 +345,45 @@ llama_context::llama_context(
                 throw std::runtime_error("LLAMA_UMA_LAYOUT requires LLAMA_UMA_POLICY=cpu-static:N");
             }
             uma_router->layout = uma_layout;
+        }
+        // M5 residency give-back (uma-moe fork): keep the K hottest experts per
+        // layer resident and MADV_DONTNEED-evict the cold experts' slabs so they
+        // re-fault from the file-backed GGUF mmap. Env-gated so a default run is
+        // untouched. Drives off the expert-hotness histogram, so it force-enables
+        // the observe channel. The core new mechanism for co-location give-back.
+        const char * LLAMA_UMA_GIVEBACK_K = getenv("LLAMA_UMA_GIVEBACK_K");
+        if (LLAMA_UMA_GIVEBACK_K && LLAMA_UMA_GIVEBACK_K[0] != '\0') {
+            if (!uma_router) {
+                throw std::runtime_error("LLAMA_UMA_GIVEBACK_K requires an active LLAMA_UMA_POLICY router");
+            }
+            // FREEZE-SAFETY (non-negotiable, D-M5.8): MADV_DONTNEED on a page a
+            // live Metal residency set holds gets it re-requested on the ~5ms
+            // heartbeat and wedges the GPU pipeline OS-wide (the E5 freeze
+            // class). Give-back is only safe with residency sets OFF, so the
+            // weights stay reclaimable file-backed page cache. Refuse otherwise.
+            if (getenv("GGML_METAL_NO_RESIDENCY") == nullptr) {
+                throw std::runtime_error("LLAMA_UMA_GIVEBACK_K requires GGML_METAL_NO_RESIDENCY set: MADV_DONTNEED on pages held by a live Metal residency set re-wires them and can wedge the machine");
+            }
+            char * end = nullptr;
+            const long k = strtol(LLAMA_UMA_GIVEBACK_K, &end, 10);
+            if (end == LLAMA_UMA_GIVEBACK_K || *end != '\0' || k < 0 || k > (long) model.hparams.n_expert) {
+                throw std::runtime_error(format("invalid LLAMA_UMA_GIVEBACK_K '%s' (want 0..n_expert=%u)", LLAMA_UMA_GIVEBACK_K, model.hparams.n_expert));
+            }
+            uma_giveback_k = (int32_t) k;
+            // give-back ranks by expert_freq; turn the observe channel on so the
+            // histogram populates and the topk-cb caches fire (same as OBSERVE).
+            uma_router->observe_experts = true;
+            const char * LLAMA_UMA_GIVEBACK_PERIOD = getenv("LLAMA_UMA_GIVEBACK_PERIOD");
+            if (LLAMA_UMA_GIVEBACK_PERIOD && LLAMA_UMA_GIVEBACK_PERIOD[0] != '\0') {
+                char * pend = nullptr;
+                const long p = strtol(LLAMA_UMA_GIVEBACK_PERIOD, &pend, 10);
+                if (pend == LLAMA_UMA_GIVEBACK_PERIOD || *pend != '\0' || p <= 0) {
+                    throw std::runtime_error(format("invalid LLAMA_UMA_GIVEBACK_PERIOD '%s' (want a positive integer)", LLAMA_UMA_GIVEBACK_PERIOD));
+                }
+                uma_giveback_period = (int32_t) p;
+            }
+            fprintf(stderr, "uma: residency give-back ON, keep top-%d experts/layer, sweep every %d decode tokens (GGML_METAL_NO_RESIDENCY set)\n",
+                    uma_giveback_k, uma_giveback_period);
         }
     }
 
@@ -804,6 +845,15 @@ void llama_context::synchronize() {
             uma_router->observe_pass(1, ggml_time_us() - t_compute_start_us);
             if (uma_router->observe_experts) {
                 uma_router->observe_experts_read();
+                // M5 residency give-back: rate-limited cold-expert eviction.
+                // Fires only every uma_giveback_period decode tokens so the
+                // hotness histogram stabilizes and a shed amortizes (M4 trigger
+                // discipline: never per token). No-op unless LLAMA_UMA_GIVEBACK_K
+                // is set (uma_giveback_k >= 0). Post-sync, decode-only path.
+                if (uma_giveback_k >= 0 && ++uma_giveback_tick >= uma_giveback_period) {
+                    uma_giveback_tick = 0;
+                    uma_apply_residency();
+                }
             }
         }
     } else if (n_queued_tokens > 1) {
@@ -2601,6 +2651,92 @@ static bool uma_buft_host_visible(const char * name) {
         p++;
     }
     return *p == '\0' || strcmp(p, "_Mapped") == 0;
+}
+
+void llama_context::uma_apply_residency() {
+    // M5 residency give-back: evict each layer's COLD experts (per-expert slab,
+    // NOT per-layer - every layer runs every token, but within a layer the hot
+    // set is small: 40-60% expert carryover). Keep the K hottest per layer
+    // resident by expert_freq; MADV_DONTNEED the rest so they re-fault from the
+    // file-backed GGUF mmap on the next route-miss. Env-gated (uma_giveback_k
+    // >= 0) and only reached when GGML_METAL_NO_RESIDENCY is set (ctor gate),
+    // so it never advises a page a live Metal residency set re-wires.
+    if (!uma_router || uma_giveback_k < 0) {
+        return;
+    }
+    const uint32_t n_layer  = uma_router->n_layer;
+    const uint32_t n_expert = uma_router->n_expert;
+    if (n_expert == 0) {
+        return;
+    }
+    const uint32_t keep = std::min<uint32_t>((uint32_t) uma_giveback_k, n_expert);
+    if (keep >= n_expert) {
+        return;  // keeping every expert => nothing cold to shed
+    }
+
+    size_t   evicted_bytes = 0;
+    uint32_t evicted_slabs = 0;
+    uint32_t skipped_nonhost = 0;
+    uint32_t skipped_anon    = 0;
+    std::vector<uint32_t> order(n_expert);  // expert-index scratch, per layer
+
+    for (uint32_t il = 0; il < n_layer; il++) {
+        const uint32_t * freq = uma_router->expert_freq.data() + (size_t) il * n_expert;
+        // partition experts so [0,keep) are the `keep` hottest (unordered) and
+        // [keep,n_expert) are the cold experts to evict. nth_element is O(n).
+        for (uint32_t e = 0; e < n_expert; e++) {
+            order[e] = e;
+        }
+        std::nth_element(order.begin(), order.begin() + keep, order.end(),
+                [freq](uint32_t a, uint32_t b) { return freq[a] > freq[b]; });
+
+        const auto & layer = model.layers[il];
+        for (ggml_tensor * t : { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps }) {
+            if (t == nullptr || t->buffer == nullptr || t->data == nullptr) {
+                continue;
+            }
+            // FREEZE-SAFETY: only advise host (CPU / file-backed mmap) buffers.
+            // A Metal device buffer's pages may be held by a residency set whose
+            // 5ms heartbeat re-wires anything we drop -> the E5 OS-wide wedge.
+            // Skip anything non-host: give-back is a page-cache/mmap mechanism.
+            if (!ggml_backend_buffer_is_host(t->buffer)) {
+                skipped_nonhost++;
+                continue;
+            }
+            // experts live in one 3D tensor [n_embd, n_ff_exp, n_expert];
+            // expert e's contiguous slab is t->data + e*t->nb[2], size t->nb[2].
+            if (t->ne[2] != (int64_t) n_expert) {
+                continue;
+            }
+            // CORRECTNESS GATE: only evict pages that are FILE-BACKED by the
+            // GGUF mmap. Dropping those re-faults identical immutable bytes from
+            // disk; dropping ANONYMOUS host pages (e.g. -lm none copies) would
+            // zero-fill on refault and corrupt the weights. A whole tensor is
+            // one contiguous span, so testing it once covers all its slabs.
+            if (!model.uma_addr_in_mmap(t->data, ggml_nbytes(t))) {
+                skipped_anon++;
+                continue;
+            }
+            for (uint32_t j = keep; j < n_expert; j++) {
+                const uint32_t e = order[j];
+                void * slab = (char *) t->data + (size_t) e * t->nb[2];
+                const size_t adv = llama_uma_madvise_dontneed(slab, (size_t) t->nb[2]);
+                if (adv > 0) {
+                    evicted_bytes += adv;
+                    evicted_slabs++;
+                }
+            }
+        }
+    }
+
+    // measurement evidence, deliberately via fprintf not LLAMA_LOG (llama-bench
+    // installs a null log callback): a give-back run must prove it evicted.
+    if (evicted_slabs > 0 || skipped_nonhost > 0 || skipped_anon > 0) {
+        fprintf(stderr, "uma: give-back sweep @ %lld tok: kept top-%u/%u experts/layer, evicted %u cold slabs = %.1f MiB%s%s\n",
+                (long long) uma_router->n_expert_obs, keep, n_expert, evicted_slabs, evicted_bytes / (1024.0 * 1024.0),
+                skipped_nonhost > 0 ? " (some experts non-host: not sheddable)" : "",
+                skipped_anon    > 0 ? " (some host experts NOT mmap-backed: skipped to avoid zero-fill)" : "");
+    }
 }
 
 void llama_context::uma_allow_weights_bufts() {

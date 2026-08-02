@@ -1707,6 +1707,25 @@ void llama_model::uma_hold_wrap_buffer(ggml_backend_buffer_t buf) const {
     pimpl->uma_wrap_bufs.emplace_back(buf);
 }
 
+bool llama_model::uma_addr_in_mmap(const void * p, size_t len) const {
+    if (p == nullptr || len == 0) {
+        return false;
+    }
+    const uintptr_t lo = (uintptr_t) p;
+    const uintptr_t hi = lo + len;
+    if (hi < lo) {  // overflow
+        return false;
+    }
+    for (const auto & mapping : pimpl->mappings) {
+        const uintptr_t base = (uintptr_t) mapping->addr();
+        const uintptr_t end  = base + mapping->size();
+        if (lo >= base && hi <= end) {
+            return true;
+        }
+    }
+    return false;
+}
+
 const float * llama_model::tensor_split() const {
     return params.tensor_split;
 }

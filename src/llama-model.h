@@ -662,6 +662,15 @@ struct llama_model {
     // weights it views; destroyed before the viewed buffers (see impl)
     void uma_hold_wrap_buffer(ggml_backend_buffer_t buf) const;
 
+    // uma-moe fork M5: true iff [p, p+len) lies fully inside one of the model's
+    // GGUF mmap regions. The residency give-back path requires this before it
+    // MADV_DONTNEED-evicts an expert slab: dropping FILE-BACKED mmap pages
+    // re-faults the identical bytes from disk, but dropping ANONYMOUS (e.g.
+    // -lm none / heap-copied) pages zero-fills on refault and CORRUPTS the
+    // immutable weights. Empty (no mmap, e.g. -lm none) => always false =>
+    // give-back safely evicts nothing.
+    bool uma_addr_in_mmap(const void * p, size_t len) const;
+
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
 
