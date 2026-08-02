@@ -594,6 +594,30 @@ llama_context::~llama_context() {
             fprintf(stderr, "uma: observe experts: reuse %.1f%% over %" PRId64 " decode tokens\n",
                     100.0 * (double) uma_router->reuse_num/uma_router->reuse_den, uma_router->n_expert_obs);
         }
+        // M5 coverage(S): dump the per-(layer,expert) hotness histogram so the
+        // supply-curve analyzer (scripts/coverage_curve.py) can place K_hot. Env-gated
+        // (LLAMA_UMA_DUMP_FREQ=path); requires the observe-experts channel populated.
+        const char * dump_path = getenv("LLAMA_UMA_DUMP_FREQ");
+        if (uma_router->observe_experts && dump_path && dump_path[0] != '\0') {
+            FILE * df = fopen(dump_path, "w");
+            if (df) {
+                const uint32_t nl = uma_router->n_layer, ne = uma_router->n_expert;
+                fprintf(df, "# n_layer=%u n_expert=%u n_expert_used=%u decode_tokens=%lld\n",
+                        nl, ne, uma_router->n_expert_used, (long long) uma_router->n_expert_obs);
+                fprintf(df, "layer,expert,count\n");
+                for (uint32_t il = 0; il < nl; il++) {
+                    const uint32_t * freq = uma_router->expert_freq.data() + (size_t) il * ne;
+                    for (uint32_t e = 0; e < ne; e++) {
+                        fprintf(df, "%u,%u,%u\n", il, e, freq[e]);
+                    }
+                }
+                fclose(df);
+                fprintf(stderr, "uma: dumped expert_freq (%u layers x %u experts, %lld decode tokens) to %s\n",
+                        nl, ne, (long long) uma_router->n_expert_obs, dump_path);
+            } else {
+                fprintf(stderr, "uma: WARNING could not open LLAMA_UMA_DUMP_FREQ path '%s'\n", dump_path);
+            }
+        }
     }
 
     if (!model.hparams.no_alloc) {
