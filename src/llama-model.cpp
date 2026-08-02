@@ -37,6 +37,11 @@
 #include <string>
 #include <vector>
 
+// uma-moe fork M5 S1: pread/dup/close for the expert streaming manifest
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_LLAMA:
@@ -1001,7 +1006,14 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 
 struct llama_model::impl {
     impl() = default;
-    ~impl() = default;
+    ~impl() {
+        // uma-moe fork M5 S1: close the dup'd streaming read fds
+        for (int fd : uma_stream_fds) {
+            if (fd >= 0) {
+                ::close(fd);
+            }
+        }
+    }
 
     uint64_t n_elements = 0;
 
@@ -1025,6 +1037,22 @@ struct llama_model::impl {
     // buffers, no residency set). Declared after ctxs_bufs so they are
     // destroyed BEFORE the CPU buffers whose memory they view.
     std::vector<ggml_backend_buffer_ptr> uma_wrap_bufs;
+
+    // uma-moe fork M5 S1: expert streaming manifest (env LLAMA_UMA_STREAM_K).
+    // One entry per (layer, kind) = il*LLAMA_UMA_STREAM_N_KIND + kind; only the
+    // front uma_stream_k_val layers are captured (valid=true). uma_stream_fds
+    // holds a dup'd read fd per source file (closed in the dtor above).
+    struct uma_stream_slab {
+        ggml_tensor * tensor     = nullptr; // the expert weight tensor (shape + mmap compare)
+        size_t        offs       = 0;       // absolute file offset of expert 0
+        size_t        slab_bytes = 0;       // per-expert bytes (= tensor->nb[2])
+        int64_t       n_expert   = 0;
+        uint16_t      file_idx   = 0;
+        bool          valid      = false;
+    };
+    std::vector<uma_stream_slab> uma_stream_slabs; // size n_layer * LLAMA_UMA_STREAM_N_KIND
+    std::vector<int>             uma_stream_fds;   // dup'd read fd per source file
+    uint32_t                     uma_stream_k_val = 0;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -1665,6 +1693,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // uma-moe fork M5 S1: capture the expert streaming manifest here - the
+    // loader files are still open (to dup a read fd) and the mmap is retained
+    // (for the self-check). No-op unless LLAMA_UMA_STREAM_K is set.
+    uma_stream_build_manifest(ml);
+
     return true;
 }
 
@@ -1724,6 +1757,179 @@ bool llama_model::uma_addr_in_mmap(const void * p, size_t len) const {
         }
     }
     return false;
+}
+
+uint32_t llama_model::uma_stream_k() const {
+    return pimpl->uma_stream_k_val;
+}
+
+size_t llama_model::uma_stream_slab_bytes(int il, int kind) const {
+    if (il < 0 || kind < 0 || kind >= LLAMA_UMA_STREAM_N_KIND) {
+        return 0;
+    }
+    const size_t idx = (size_t) il * LLAMA_UMA_STREAM_N_KIND + kind;
+    if (idx >= pimpl->uma_stream_slabs.size()) {
+        return 0;
+    }
+    const auto & slab = pimpl->uma_stream_slabs[idx];
+    return slab.valid ? slab.slab_bytes : 0;
+}
+
+bool llama_model::uma_stream_pread_expert(int il, int kind, int e, void * dst) const {
+    if (dst == nullptr || il < 0 || kind < 0 || kind >= LLAMA_UMA_STREAM_N_KIND) {
+        return false;
+    }
+    const size_t idx = (size_t) il * LLAMA_UMA_STREAM_N_KIND + kind;
+    if (idx >= pimpl->uma_stream_slabs.size()) {
+        return false;
+    }
+    const auto & slab = pimpl->uma_stream_slabs[idx];
+    if (!slab.valid || e < 0 || (int64_t) e >= slab.n_expert) {
+        return false;
+    }
+    if (slab.file_idx >= pimpl->uma_stream_fds.size()) {
+        return false;
+    }
+    const int fd = pimpl->uma_stream_fds[slab.file_idx];
+    if (fd < 0) {
+        return false;
+    }
+    char * out = (char *) dst;
+    size_t remaining = slab.slab_bytes;
+    off_t  off = (off_t) (slab.offs + (size_t) e * slab.slab_bytes);
+    while (remaining > 0) {
+        const ssize_t n = pread(fd, out, remaining, off);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false; // unexpected EOF
+        }
+        out       += n;
+        off       += n;
+        remaining -= (size_t) n;
+    }
+    return true;
+}
+
+bool llama_model::uma_stream_selfcheck() const {
+    // pread sample slabs and memcmp vs the retained GGUF mmap. The mmap holds
+    // the same immutable file bytes, so any offset/stride/fd error surfaces as a
+    // mismatch. No mmap retained (e.g. -lm none) => cannot compare => skip.
+    if (pimpl->mappings.empty()) {
+        fprintf(stderr, "uma: stream self-check SKIPPED (no GGUF mmap retained; -lm none?)\n");
+        return true;
+    }
+    std::vector<char> buf;
+    bool     checked_stride = false;
+    uint32_t n_checked      = 0;
+    for (size_t idx = 0; idx < pimpl->uma_stream_slabs.size(); idx++) {
+        const auto & slab = pimpl->uma_stream_slabs[idx];
+        if (!slab.valid) {
+            continue;
+        }
+        if (slab.file_idx >= pimpl->mappings.size()) {
+            fprintf(stderr, "uma: stream self-check: file idx %u has no mmap\n", slab.file_idx);
+            return false;
+        }
+        const char * base  = (const char *) pimpl->mappings[slab.file_idx]->addr();
+        const size_t msize = pimpl->mappings[slab.file_idx]->size();
+        const int il   = (int) (idx / LLAMA_UMA_STREAM_N_KIND);
+        const int kind = (int) (idx % LLAMA_UMA_STREAM_N_KIND);
+        // check the middle expert of every valid slab; for the first slab also
+        // check e0 and e_last, exercising the per-expert stride not just the base
+        std::vector<int> experts = { (int) (slab.n_expert / 2) };
+        if (!checked_stride) {
+            experts = { 0, (int) (slab.n_expert / 2), (int) (slab.n_expert - 1) };
+            checked_stride = true;
+        }
+        buf.resize(slab.slab_bytes);
+        for (const int e : experts) {
+            const size_t foff = slab.offs + (size_t) e * slab.slab_bytes;
+            if (foff + slab.slab_bytes > msize) {
+                fprintf(stderr, "uma: stream self-check: (il=%d kind=%d e=%d) offset out of mmap bounds\n", il, kind, e);
+                return false;
+            }
+            if (!uma_stream_pread_expert(il, kind, e, buf.data())) {
+                fprintf(stderr, "uma: stream self-check: pread failed (il=%d kind=%d e=%d)\n", il, kind, e);
+                return false;
+            }
+            if (memcmp(buf.data(), base + foff, slab.slab_bytes) != 0) {
+                fprintf(stderr, "uma: stream self-check: MISMATCH pread vs mmap (il=%d kind=%d e=%d, %zu bytes)\n", il, kind, e, slab.slab_bytes);
+                return false;
+            }
+            n_checked++;
+        }
+    }
+    fprintf(stderr, "uma: stream self-check PASS (%u sample slabs, pread == mmap)\n", n_checked);
+    return true;
+}
+
+void llama_model::uma_stream_build_manifest(const struct llama_model_loader & ml) {
+    const char * env = getenv("LLAMA_UMA_STREAM_K");
+    if (env == nullptr || env[0] == '\0') {
+        return;
+    }
+    char * end = nullptr;
+    const long k = strtol(env, &end, 10);
+    if (end == env || *end != '\0' || k <= 0) {
+        throw std::runtime_error(format("invalid LLAMA_UMA_STREAM_K '%s' (want a positive integer)", env));
+    }
+    const uint32_t n_layer = hparams.n_layer();
+    pimpl->uma_stream_k_val = std::min<uint32_t>((uint32_t) k, n_layer);
+    pimpl->uma_stream_slabs.assign((size_t) n_layer * LLAMA_UMA_STREAM_N_KIND, {});
+
+    // dup a read fd per source file so the preads outlive the loader's llama_file
+    pimpl->uma_stream_fds.assign(ml.files.size(), -1);
+    for (size_t f = 0; f < ml.files.size(); f++) {
+        const int src = ml.files[f]->file_id();
+        pimpl->uma_stream_fds[f] = src >= 0 ? ::dup(src) : -1;
+        if (pimpl->uma_stream_fds[f] < 0) {
+            throw std::runtime_error(format("uma stream: failed to dup a read fd for source file %zu", f));
+        }
+    }
+
+    uint32_t n_slabs = 0;
+    for (uint32_t il = 0; il < pimpl->uma_stream_k_val; il++) {
+        const auto & layer = layers[il];
+        ggml_tensor * kinds[LLAMA_UMA_STREAM_N_KIND];
+        kinds[LLAMA_UMA_STREAM_GATE] = layer.ffn_gate_exps;
+        kinds[LLAMA_UMA_STREAM_UP]   = layer.ffn_up_exps;
+        kinds[LLAMA_UMA_STREAM_DOWN] = layer.ffn_down_exps;
+        for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+            ggml_tensor * t = kinds[kind];
+            if (t == nullptr) {
+                continue; // e.g. a merged gate_up arch: no separate gate/up (out of S1.1.1 scope)
+            }
+            const auto * w = ml.get_weight(ggml_get_name(t));
+            if (w == nullptr) {
+                throw std::runtime_error(format("uma stream: no loader weight for expert tensor %s", ggml_get_name(t)));
+            }
+            // experts stored contiguously as [.., .., n_expert]; per-expert slab = nb[2]
+            if (t->ne[2] <= 0 || (size_t) t->nb[2] * (size_t) t->ne[2] != ggml_nbytes(t)) {
+                throw std::runtime_error(format("uma stream: unexpected expert layout for %s (ne2=%lld nb2=%zu nbytes=%zu)",
+                        ggml_get_name(t), (long long) t->ne[2], (size_t) t->nb[2], ggml_nbytes(t)));
+            }
+            auto & slab = pimpl->uma_stream_slabs[(size_t) il * LLAMA_UMA_STREAM_N_KIND + kind];
+            slab.tensor     = t;
+            slab.offs       = w->offs;
+            slab.slab_bytes = t->nb[2];
+            slab.n_expert   = t->ne[2];
+            slab.file_idx   = w->idx;
+            slab.valid      = true;
+            n_slabs++;
+        }
+    }
+
+    fprintf(stderr, "uma: stream manifest built: layers [0,%u), %u expert slabs, %zu source file(s)\n",
+            pimpl->uma_stream_k_val, n_slabs, ml.files.size());
+
+    if (!uma_stream_selfcheck()) {
+        throw std::runtime_error("uma stream: self-check FAILED - pread bytes differ from the GGUF mmap (offset formula or fd wrong)");
+    }
 }
 
 const float * llama_model::tensor_split() const {

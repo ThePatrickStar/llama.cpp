@@ -547,6 +547,17 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
+// uma-moe fork M5 S1: the three per-expert weight tensors an MoE layer streams.
+// One convention shared by the manifest (llama-model), the fill op (llama-context)
+// and the graph wrap (llama-graph). Merged gate_up architectures are out of scope
+// for S1.1.1 (Qwen3-30B uses the separate gate/up/down path).
+enum llama_uma_stream_kind {
+    LLAMA_UMA_STREAM_GATE   = 0,
+    LLAMA_UMA_STREAM_UP     = 1,
+    LLAMA_UMA_STREAM_DOWN   = 2,
+    LLAMA_UMA_STREAM_N_KIND = 3,
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -670,6 +681,26 @@ struct llama_model {
     // immutable weights. Empty (no mmap, e.g. -lm none) => always false =>
     // give-back safely evicts nothing.
     bool uma_addr_in_mmap(const void * p, size_t len) const;
+
+    // uma-moe fork M5 S1: expert streaming manifest (env LLAMA_UMA_STREAM_K=K).
+    // At load, capture each expert tensor's absolute file offset + per-expert
+    // slab bytes for the front K layers, and dup() a read fd per source file so
+    // cold experts can be pread on demand into a resident slot pool (give-back
+    // admission / co-fit). No-op unless LLAMA_UMA_STREAM_K is set - a default
+    // run keeps the manifest empty and pays nothing. Called at the end of
+    // load_tensors while the loader files are still open and the mmap retained.
+    void uma_stream_build_manifest(const struct llama_model_loader & ml);
+    // number of front layers streaming (0 = streaming off)
+    uint32_t uma_stream_k() const;
+    // per-expert slab bytes for (il, kind), or 0 if that slab is not streaming
+    size_t uma_stream_slab_bytes(int il, int kind) const;
+    // pread expert e's slab for (il, kind) into dst (>= slab_bytes). Positional
+    // pread, no shared fd offset - safe to call concurrently. false on any error.
+    bool uma_stream_pread_expert(int il, int kind, int e, void * dst) const;
+    // built-in guard (measurement discipline): pread sample slabs and memcmp vs
+    // the retained GGUF mmap. Validates the S1.0 offset formula + the dup fd
+    // end-to-end. Skipped (returns true) when no mmap is retained (-lm none).
+    bool uma_stream_selfcheck() const;
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
