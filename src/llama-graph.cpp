@@ -1994,7 +1994,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // compressed slot pool could not hold one token's experts - and warmup output
     // is discarded anyway); the original expert tensors stay resident for it.
     ggml_tensor * route_ids = selected_experts;
-    if (uma_stream && uma_stream->streams_layer(il) && !cparams.warmup) {
+    if (uma_stream && uma_stream->streams_layer(il) && !cparams.warmup &&
+        uma_stream->decouple && uma_stream->expert_table(il) && selected_experts->ne[1] == 1) {
+        // decode decouple (Part 1): the GPU gathers slot_ids from the static expert->slot
+        // table via ggml_get_rows - NO forced-CPU admit op. The slots are static (warm-
+        // start), so NO fill op either. This removes the per-layer CPU->GPU sync round-trip
+        // that dominates the serial tax; the matmuls read the slot tensors via slot_ids.
+        ggml_tensor * g = ggml_get_rows(ctx0, uma_stream->expert_table(il), selected_experts); // [1,n_used,1,1] I32
+        ggml_tensor * slot_ids = ggml_reshape_2d(ctx0, g, selected_experts->ne[0], selected_experts->ne[1]);
+        cb(slot_ids, "ffn_moe_decouple_route", il);
+        route_ids = slot_ids;
+        if (up_exps   && uma_stream->streams(il, LLAMA_UMA_STREAM_UP))   { up_exps   = uma_stream->slot(il, LLAMA_UMA_STREAM_UP); }
+        if (gate_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_GATE)) { gate_exps = uma_stream->slot(il, LLAMA_UMA_STREAM_GATE); }
+        if (down_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_DOWN)) { down_exps = uma_stream->slot(il, LLAMA_UMA_STREAM_DOWN); }
+    } else if (uma_stream && uma_stream->streams_layer(il) && !cparams.warmup) {
         ggml_tensor * slot_ids = ggml_custom_4d(ctx0, GGML_TYPE_I32,
                 selected_experts->ne[0], selected_experts->ne[1], 1, 1,
                 &selected_experts, 1, llama_uma_stream_admit, 1, uma_stream->admit_ud(il));

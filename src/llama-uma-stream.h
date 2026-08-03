@@ -61,12 +61,18 @@ struct llama_uma_stream_state {
     uint32_t n_expert     = 0;
     uint64_t n_miss       = 0;  // expert preads (slot misses) over the context lifetime
     uint64_t n_read       = 0;  // total expert-reads (admits) over the context lifetime
+    bool     decouple     = false; // LLAMA_UMA_STREAM_DECOUPLE: GPU-gather decode routing (Part 1)
 
     // index = il*3 + kind. slots[i]==nullptr means (il,kind) is not streaming.
     std::vector<ggml_tensor *>                slots;
     std::vector<llama_uma_stream_fill_ud>     uds;        // per (il,kind)
     std::vector<llama_uma_stream_admit_ud>    admit_uds;  // per il
     std::vector<llama_uma_stream_layer_lru>   lru;        // per il
+    // decouple mode: per-layer expert->slot table, I32 [1,n_expert,1,1], Metal
+    // StorageModeShared (GPU-readable, CPU-writable). The GPU gathers slot_ids from
+    // it via ggml_get_rows instead of a forced-CPU admit op. slot_of_expert[il]==nullptr
+    // if not built. Static (warm-start-seeded) in Part 1; background-updated in Part 2.
+    std::vector<ggml_tensor *>                slot_of_expert; // per il
 
     // context-lifetime resources. The Metal wraps only view host_bases (noCopy),
     // so they are released BEFORE the pages are freed; meta_ctx holds only tensor
@@ -98,6 +104,9 @@ struct llama_uma_stream_state {
     }
     void * admit_ud(int il) const {
         return (void *) &admit_uds[(size_t) il];
+    }
+    ggml_tensor * expert_table(int il) const {
+        return (size_t) il < slot_of_expert.size() ? slot_of_expert[(size_t) il] : nullptr;
     }
 };
 

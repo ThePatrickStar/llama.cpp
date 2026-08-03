@@ -2965,6 +2965,7 @@ static void uma_stream_warm_start(llama_uma_stream_state * S, const llama_model 
         }
         llama_uma_stream_layer_lru & L = S->lru[il];
         const uint64_t * fq = freq.data() + (size_t) il * n_expert;
+        int32_t * tbl = (S->decouple && S->expert_table((int) il)) ? (int32_t *) S->expert_table((int) il)->data : nullptr;
         std::vector<uint32_t> order(n_expert);
         for (uint32_t e = 0; e < n_expert; e++) { order[e] = e; }
         std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
@@ -2975,6 +2976,7 @@ static void uma_stream_warm_start(llama_uma_stream_state * S, const llama_model 
             const uint32_t e = order[r];
             L.expert_in_slot[r] = (int32_t) e;
             L.slot_of_expert[e] = (int32_t) r;
+            if (tbl) { tbl[e] = (int32_t) r; } // decouple: expert e resident in slot r (GPU table)
             L.last_used[r]      = (uint64_t) (n_slots - r); // hotter => more-recently-used
             L.pin_protected[r]  = r < H ? 1 : 0;
             for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
@@ -3046,13 +3048,22 @@ void llama_context::uma_stream_setup() {
         uma_stream->model    = &model;
         uma_stream->n_slots  = n_slots;
         uma_stream->n_expert = n_expert;
+        // decouple mode (Part 1): GPU-gather decode routing needs a static, warm-started
+        // resident set (the slots do not change during decode), so HOTFREQ is required.
+        const bool decouple = getenv("LLAMA_UMA_STREAM_DECOUPLE") != nullptr;
+        uma_stream->decouple = decouple;
+        if (decouple && getenv("LLAMA_UMA_STREAM_HOTFREQ") == nullptr) {
+            throw std::runtime_error("uma stream: LLAMA_UMA_STREAM_DECOUPLE requires LLAMA_UMA_STREAM_HOTFREQ (static warm-started slots)");
+        }
         const uint32_t n_layer = model.hparams.n_layer();
         uma_stream->slots.assign((size_t) n_layer * LLAMA_UMA_STREAM_N_KIND, nullptr);
         uma_stream->uds.assign((size_t) n_layer * LLAMA_UMA_STREAM_N_KIND, {});
         uma_stream->admit_uds.assign((size_t) n_layer, {});
         uma_stream->lru.assign((size_t) n_layer, {});
+        uma_stream->slot_of_expert.assign((size_t) n_layer, nullptr);
 
-        const size_t n_slabs_max = (size_t) k * LLAMA_UMA_STREAM_N_KIND;
+        // one extra tensor per streaming layer for the decouple expert->slot table
+        const size_t n_slabs_max = (size_t) k * (LLAMA_UMA_STREAM_N_KIND + 1);
         ggml_init_params ip = { ggml_tensor_overhead() * (n_slabs_max + 8), nullptr, /*.no_alloc =*/ true };
         uma_stream->meta_ctx.reset(ggml_init(ip));
         if (!uma_stream->meta_ctx) {
@@ -3122,6 +3133,37 @@ void llama_context::uma_stream_setup() {
                 L.pinned.assign(n_slots, 0);
                 L.pin_protected.assign(n_slots, 0);
                 L.newly_admitted.assign(n_slots, 0);
+
+                // decouple mode: per-layer expert->slot table (I32 [1,n_expert,1,1]) on a
+                // StorageModeShared no-rset wrap. The GPU gathers slot_ids from it via
+                // ggml_get_rows (no forced-CPU op). Warm-start seeds it; 0 = sentinel slot.
+                if (decouple) {
+                    const size_t tbl_bytes = (size_t) n_expert * sizeof(int32_t);
+                    const size_t talloc    = ((tbl_bytes + page - 1) / page) * page;
+                    void * thost = nullptr;
+                    if (posix_memalign(&thost, page, talloc) != 0 || thost == nullptr) {
+                        throw std::runtime_error("uma stream: table host allocation failed");
+                    }
+                    ggml_backend_buffer_t twrap = wrap_fn(gpu_dev, thost, talloc, tbl_bytes);
+                    if (twrap == nullptr) {
+                        free(thost);
+                        throw std::runtime_error(format("uma stream: table wrap failed il=%u", il));
+                    }
+                    memset(thost, 0, talloc); // non-resident experts -> sentinel slot 0
+                    uma_stream->host_bases.push_back(thost);
+                    uma_stream->wraps.emplace_back(twrap);
+                    const int64_t tbl_ne[GGML_MAX_DIMS] = { 1, (int64_t) n_expert, 1, 1 };
+                    ggml_tensor * tbl = ggml_new_tensor(mctx, GGML_TYPE_I32, GGML_MAX_DIMS, tbl_ne);
+                    if (tbl == nullptr) {
+                        throw std::runtime_error("uma stream: failed to create expert table tensor");
+                    }
+                    char tname[64];
+                    snprintf(tname, sizeof(tname), "uma.table.%u", il);
+                    ggml_set_name(tbl, tname);
+                    tbl->buffer = twrap;
+                    tbl->data   = thost;
+                    uma_stream->slot_of_expert[il] = tbl;
+                }
             }
         }
         fprintf(stderr, "uma: stream slot pool built: %zu slots x %u/%u experts (Metal StorageModeShared, no rset), layers [0,%u)\n",
