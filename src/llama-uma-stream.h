@@ -62,6 +62,7 @@ struct llama_uma_stream_state {
     uint64_t n_miss       = 0;  // expert preads (slot misses) over the context lifetime
     uint64_t n_read       = 0;  // total expert-reads (admits) over the context lifetime
     bool     decouple     = false; // LLAMA_UMA_STREAM_DECOUPLE: GPU-gather decode routing (Part 1)
+    bool     adapt        = false; // LLAMA_UMA_STREAM_ADAPT: online resident-set maintenance (Part 2 Step 3)
 
     // index = il*3 + kind. slots[i]==nullptr means (il,kind) is not streaming.
     std::vector<ggml_tensor *>                slots;

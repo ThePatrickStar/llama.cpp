@@ -892,11 +892,16 @@ void llama_context::synchronize() {
                 }
             }
         }
-        // decouple miss detection (Part 2): count this token's non-resident selections
-        // post-sync (one D2H per streaming layer via the cached topk; no per-layer CPU op
-        // in the graph, so the decouple stays sync-free). uma_router is null in stream mode.
+        // decouple maintenance (Part 2): post-sync, per selected expert - count residency and
+        // (Step 3, LLAMA_UMA_STREAM_ADAPT) online-admit misses so the resident set adapts to
+        // the live workload (no matched-freq oracle). Runs in the GPU-idle window (after
+        // synchronize), so slot + table writes are torn-write-safe with NO background thread;
+        // the next graph_compute sees the updated StorageModeShared state. One D2H per layer;
+        // no per-layer graph op, so the decouple stays sync-free.
         if (uma_stream && uma_stream->decouple && t_compute_start_us != 0) {
             const uint32_t n_used = model.hparams.n_expert_used;
+            const uint32_t Sn     = uma_stream->n_slots;
+            const bool     adapt  = uma_stream->adapt;
             std::vector<int32_t> ids(n_used);
             for (uint32_t il = 0; il < uma_stream->topk.size(); il++) {
                 ggml_tensor * t = uma_stream->topk[il];
@@ -907,16 +912,75 @@ void llama_context::synchronize() {
                     continue;
                 }
                 ggml_backend_tensor_get(t, ids.data(), 0, n_used * sizeof(int32_t));
-                const auto & soe = uma_stream->lru[il].slot_of_expert;
+                llama_uma_stream_layer_lru & L = uma_stream->lru[il];
+                int32_t * tbl = uma_stream->expert_table((int) il) ?
+                    (int32_t *) uma_stream->expert_table((int) il)->data : nullptr;
+                L.pass++;
                 for (uint32_t j = 0; j < n_used; j++) {
                     const int32_t e = ids[j];
                     if (e < 0 || (uint32_t) e >= uma_stream->n_expert) {
                         continue;
                     }
                     uma_stream->n_read++;
-                    if (soe[e] < 0) {
-                        uma_stream->n_miss++; // selected expert not resident = decouple miss
+                    int32_t slot = L.slot_of_expert[e];
+                    if (slot >= 0) {
+                        // hit: refresh recency (adapt LRU keeps the live working set resident)
+                        L.pinned[slot]    = L.pass;
+                        L.last_used[slot] = L.tick++;
+                        continue;
                     }
+                    uma_stream->n_miss++; // selected expert not resident = decouple miss
+                    if (!adapt) {
+                        continue; // static mode (Step 2): count only
+                    }
+                    // online admit (pure LRU): evict the LRU-cold slot not pinned this token
+                    uint64_t best_lu = UINT64_MAX;
+                    slot = -1;
+                    for (uint32_t s = 0; s < Sn; s++) {
+                        if (L.expert_in_slot[s] < 0) { slot = (int32_t) s; break; }
+                        if (L.pinned[s] != L.pass && L.last_used[s] < best_lu) {
+                            best_lu = L.last_used[s];
+                            slot    = (int32_t) s;
+                        }
+                    }
+                    if (slot < 0) {
+                        continue; // all S slots needed this token (>= S misses at once); next token
+                    }
+                    // pread the expert into the slot for every streaming kind, THEN publish the
+                    // table entry (so the next pass never routes to a half-filled slot)
+                    bool ok = true;
+                    for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+                        if (!uma_stream->streams((int) il, kind)) { continue; }
+                        const size_t slab = model.uma_stream_slab_bytes((int) il, kind);
+                        char * base = (char *) uma_stream->slot((int) il, kind)->data;
+                        if (!model.uma_stream_pread_expert((int) il, kind, e, base + (size_t) slot * slab)) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (!ok) {
+                        // partial pread (some kinds filled, one failed): the slot bytes are now
+                        // mixed old/new = corrupt, so the OLD expert must not stay routable.
+                        // Invalidate the slot (empty); a later admit refills it cleanly. e stays
+                        // a miss. Adapt runs online, so a transient I/O error must not abort.
+                        const int32_t bad = L.expert_in_slot[slot];
+                        if (bad >= 0) {
+                            L.slot_of_expert[bad] = -1;
+                            if (tbl) { tbl[bad] = 0; }
+                        }
+                        L.expert_in_slot[slot] = -1;
+                        continue;
+                    }
+                    const int32_t old = L.expert_in_slot[slot];
+                    if (old >= 0) {
+                        L.slot_of_expert[old] = -1;
+                        if (tbl) { tbl[old] = 0; } // evicted -> sentinel slot 0
+                    }
+                    L.expert_in_slot[slot] = e;
+                    L.slot_of_expert[e]    = slot;
+                    L.pinned[slot]         = L.pass;
+                    L.last_used[slot]      = L.tick++;
+                    if (tbl) { tbl[e] = slot; } // publish AFTER the pread
                 }
             }
         }
@@ -3082,10 +3146,12 @@ void llama_context::uma_stream_setup() {
         uma_stream->n_expert = n_expert;
         // decouple mode (Part 1): GPU-gather decode routing needs a static, warm-started
         // resident set (the slots do not change during decode), so HOTFREQ is required.
-        const bool decouple = getenv("LLAMA_UMA_STREAM_DECOUPLE") != nullptr;
+        const bool adapt    = getenv("LLAMA_UMA_STREAM_ADAPT") != nullptr; // Step 3: online maintenance
+        const bool decouple = adapt || getenv("LLAMA_UMA_STREAM_DECOUPLE") != nullptr; // adapt needs the table
         uma_stream->decouple = decouple;
+        uma_stream->adapt    = adapt;
         if (decouple && getenv("LLAMA_UMA_STREAM_HOTFREQ") == nullptr) {
-            throw std::runtime_error("uma stream: LLAMA_UMA_STREAM_DECOUPLE requires LLAMA_UMA_STREAM_HOTFREQ (static warm-started slots)");
+            throw std::runtime_error("uma stream: LLAMA_UMA_STREAM_DECOUPLE/ADAPT requires LLAMA_UMA_STREAM_HOTFREQ (initial slot seed)");
         }
         const uint32_t n_layer = model.hparams.n_layer();
         uma_stream->slots.assign((size_t) n_layer * LLAMA_UMA_STREAM_N_KIND, nullptr);
