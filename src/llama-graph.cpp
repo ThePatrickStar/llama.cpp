@@ -1990,13 +1990,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // streamed expert matmuls route via slot_ids instead of selected_experts.
     // Default path (uma_stream == nullptr, or non-streaming layer): route_ids ==
     // selected_experts and no wrap, so the graph is byte-identical to stock.
+    // skip streaming during warmup (n_expert_used is forced to n_expert then, so a
+    // compressed slot pool could not hold one token's experts - and warmup output
+    // is discarded anyway); the original expert tensors stay resident for it.
     ggml_tensor * route_ids = selected_experts;
-    if (uma_stream && uma_stream->streams_layer(il)) {
+    if (uma_stream && uma_stream->streams_layer(il) && !cparams.warmup) {
         ggml_tensor * slot_ids = ggml_custom_4d(ctx0, GGML_TYPE_I32,
                 selected_experts->ne[0], selected_experts->ne[1], 1, 1,
                 &selected_experts, 1, llama_uma_stream_admit, 1, uma_stream->admit_ud(il));
         cb(slot_ids, "ffn_moe_stream_admit", il);
-        route_ids = uma_stream->debug_routesel ? selected_experts : slot_ids;
+        route_ids = slot_ids;
         if (up_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_UP)) {
             up_exps = ggml_custom_inplace(ctx0, uma_stream->slot(il, LLAMA_UMA_STREAM_UP),
                     &slot_ids, 1, llama_uma_stream_fill, 1, uma_stream->ud(il, LLAMA_UMA_STREAM_UP));

@@ -2783,36 +2783,29 @@ void llama_uma_stream_admit(ggml_tensor * dst, int ith, int /*nth*/, void * user
     if (dst->type != GGML_TYPE_I32 || dst->data == nullptr) {
         GGML_ABORT("uma stream admit: (il=%d) slot_ids not I32/allocated", ud->il);
     }
-    const int32_t * sp  = (const int32_t *) sel->data;
-    int32_t       * out = (int32_t *) dst->data;
-    const int64_t   n   = ggml_nelements(sel);
-    const uint32_t  Sn  = S->n_slots;
+    // selected_experts is a STRIDED VIEW of the argsort (ggml_argsort_top_k:
+    // nb[1] = n_expert*4, the first n_expert_used columns), so it MUST be read
+    // via its strides - a flat read pulls in unselected experts for n_tokens > 1
+    // (prefill). slot_ids (dst) is a fresh contiguous [n_used, n_tok] tensor.
+    const int64_t  n_used = sel->ne[0]; // n_expert_used
+    const int64_t  n_tok  = sel->ne[1]; // n_tokens
+    int32_t      * out    = (int32_t *) dst->data;
+    const uint32_t Sn     = S->n_slots;
     L.pass++;
     L.n_newly = 0;
-    if (S->debug_identity) {
-        // bisect: slot_of_expert[e] = e (needs S == n_expert). Reproduces the
-        // byte-identical S1.1.1 permutation through the admit/slot_ids/fill path.
-        for (int64_t i = 0; i < n; i++) {
-            const int32_t e = sp[i];
-            if (e < 0 || (uint32_t) e >= S->n_expert) { out[i] = 0; continue; }
-            if (L.slot_of_expert[e] < 0) {
-                L.slot_of_expert[e]           = e;
-                L.expert_in_slot[e]           = e;
-                L.newly_admitted[L.n_newly++] = e;
-            }
-            L.pinned[e]    = L.pass;
-            L.last_used[e] = L.tick++;
-            out[i]         = e;
-        }
-    } else {
-        for (int64_t i = 0; i < n; i++) {
-            const int32_t e = sp[i];
+    for (int64_t t = 0; t < n_tok; t++) {
+        const int32_t * sp = (const int32_t *)((const char *) sel->data + t * sel->nb[1]);
+        for (int64_t j = 0; j < n_used; j++) {
+            const int32_t e  = sp[j];
+            const int64_t oi = t * n_used + j;
             if (e < 0 || (uint32_t) e >= S->n_expert) {
-                out[i] = 0; // padding id: routes to slot 0 but its gating weight is 0
+                out[oi] = 0; // padding id: routes to slot 0 but its gating weight is 0
                 continue;
             }
             int32_t slot = L.slot_of_expert[e];
             if (slot < 0) {
+                // miss: admit into an empty slot, else evict the LRU-cold slot
+                // that is not pinned by an expert this batch still needs
                 uint64_t best_lu = UINT64_MAX;
                 for (uint32_t s = 0; s < Sn; s++) {
                     if (L.expert_in_slot[s] < 0) { slot = (int32_t) s; break; } // empty wins
@@ -2834,18 +2827,7 @@ void llama_uma_stream_admit(ggml_tensor * dst, int ith, int /*nth*/, void * user
             }
             L.pinned[slot]    = L.pass;
             L.last_used[slot] = L.tick++;
-            out[i]            = slot;
-        }
-    }
-    if (S->debug_nocache) {
-        // bisect: re-pread every expert used this pass (not just newly-admitted),
-        // like S1.1.1. If this makes output == stock, the bug is the cache (a hit
-        // reads a slot that does not actually hold the expert's bytes).
-        L.n_newly = 0;
-        for (uint32_t s = 0; s < Sn; s++) {
-            if (L.pinned[s] == L.pass) {
-                L.newly_admitted[L.n_newly++] = L.expert_in_slot[s];
-            }
+            out[oi]           = slot;
         }
     }
 }
@@ -2885,16 +2867,6 @@ void llama_context::uma_stream_setup() {
     if (k == 0) {
         return; // streaming off (default runs)
     }
-    // CORRECTNESS GATE: the streaming graph (admit op + slot-routed mul_mat_id)
-    // trips a Metal op-fusion that computes wrong numerics ONLY on the streaming
-    // path (fusion is numerically neutral for stock; unfused streaming output is
-    // byte-identical to stock, verified). The Metal compute context reads
-    // use_fusion at init, before any llama-side hook runs, so it can only be
-    // disabled from the environment. Refuse rather than silently miscompute.
-    // TODO: add a fork-private per-context fusion setter to drop this env need.
-    if (getenv("GGML_METAL_FUSION_DISABLE") == nullptr) {
-        throw std::runtime_error("uma stream: set GGML_METAL_FUSION_DISABLE=1 in the environment - a Metal op-fusion mis-fires on the streaming graph and would produce wrong output (unfused output is byte-identical to stock)");
-    }
     const uint32_t n_expert      = model.hparams.n_expert;
     const uint32_t n_expert_used = model.hparams.n_expert_used;
 
@@ -2910,12 +2882,6 @@ void llama_context::uma_stream_setup() {
             throw std::runtime_error(format("invalid LLAMA_UMA_STREAM_S '%s' (want %u..%u)", env_s, n_expert_used, n_expert));
         }
         n_slots = (uint32_t) s;
-    }
-    const bool debug_identity = getenv("LLAMA_UMA_STREAM_IDENTITY") != nullptr;
-    const bool debug_nocache  = getenv("LLAMA_UMA_STREAM_NOCACHE")  != nullptr;
-    const bool debug_routesel = getenv("LLAMA_UMA_STREAM_ROUTESEL") != nullptr;
-    if (debug_identity) {
-        n_slots = n_expert; // identity map needs one slot per expert
     }
 
     // GPU backend + the fork's no-rset Metal wrap entry (the WO-C zero-copy path)
@@ -2949,9 +2915,6 @@ void llama_context::uma_stream_setup() {
         uma_stream->model    = &model;
         uma_stream->n_slots  = n_slots;
         uma_stream->n_expert = n_expert;
-        uma_stream->debug_identity = debug_identity;
-        uma_stream->debug_nocache  = debug_nocache;
-        uma_stream->debug_routesel = debug_routesel;
         const uint32_t n_layer = model.hparams.n_layer();
         uma_stream->slots.assign((size_t) n_layer * LLAMA_UMA_STREAM_N_KIND, nullptr);
         uma_stream->uds.assign((size_t) n_layer * LLAMA_UMA_STREAM_N_KIND, {});

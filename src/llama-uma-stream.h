@@ -54,9 +54,6 @@ struct llama_uma_stream_state {
     const llama_model * model = nullptr;
     uint32_t n_slots      = 0;  // S (slots per layer,kind); == n_expert => no compression
     uint32_t n_expert     = 0;
-    bool     debug_identity = false; // LLAMA_UMA_STREAM_IDENTITY: slot_of_expert[e]=e (bisect)
-    bool     debug_nocache  = false; // LLAMA_UMA_STREAM_NOCACHE: re-pread every used expert/pass (bisect)
-    bool     debug_routesel = false; // LLAMA_UMA_STREAM_ROUTESEL: route matmul via selected_experts (bisect, identity only)
 
     // index = il*3 + kind. slots[i]==nullptr means (il,kind) is not streaming.
     std::vector<ggml_tensor *>                slots;
