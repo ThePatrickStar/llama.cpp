@@ -892,6 +892,34 @@ void llama_context::synchronize() {
                 }
             }
         }
+        // decouple miss detection (Part 2): count this token's non-resident selections
+        // post-sync (one D2H per streaming layer via the cached topk; no per-layer CPU op
+        // in the graph, so the decouple stays sync-free). uma_router is null in stream mode.
+        if (uma_stream && uma_stream->decouple && t_compute_start_us != 0) {
+            const uint32_t n_used = model.hparams.n_expert_used;
+            std::vector<int32_t> ids(n_used);
+            for (uint32_t il = 0; il < uma_stream->topk.size(); il++) {
+                ggml_tensor * t = uma_stream->topk[il];
+                if (t == nullptr || !uma_stream->streams_layer((int) il)) {
+                    continue;
+                }
+                if (t->type != GGML_TYPE_I32 || t->ne[0] < (int64_t) n_used) {
+                    continue;
+                }
+                ggml_backend_tensor_get(t, ids.data(), 0, n_used * sizeof(int32_t));
+                const auto & soe = uma_stream->lru[il].slot_of_expert;
+                for (uint32_t j = 0; j < n_used; j++) {
+                    const int32_t e = ids[j];
+                    if (e < 0 || (uint32_t) e >= uma_stream->n_expert) {
+                        continue;
+                    }
+                    uma_stream->n_read++;
+                    if (soe[e] < 0) {
+                        uma_stream->n_miss++; // selected expert not resident = decouple miss
+                    }
+                }
+            }
+        }
     } else if (n_queued_tokens > 1) {
         if (!cparams.no_perf) {
             t_p_eval_us += ggml_time_us() - t_compute_start_us;
@@ -1537,6 +1565,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // topk entries must only ever point into the graph built HERE
         if (uma_router && uma_router->observe_experts) {
             uma_router->topk_tensors.assign(uma_router->topk_tensors.size(), nullptr);
+        }
+        // same guard for the decouple miss-detection topk cache (stream path)
+        if (uma_stream && uma_stream->decouple) {
+            uma_stream->topk.assign(uma_stream->topk.size(), nullptr);
         }
 
         res->reset();
@@ -3061,6 +3093,7 @@ void llama_context::uma_stream_setup() {
         uma_stream->admit_uds.assign((size_t) n_layer, {});
         uma_stream->lru.assign((size_t) n_layer, {});
         uma_stream->slot_of_expert.assign((size_t) n_layer, nullptr);
+        uma_stream->topk.assign((size_t) n_layer, nullptr);
 
         // one extra tensor per streaming layer for the decouple expert->slot table
         const size_t n_slabs_max = (size_t) k * (LLAMA_UMA_STREAM_N_KIND + 1);
@@ -3448,6 +3481,14 @@ llm_graph_cb llama_context::graph_get_cb() const {
         if (uma_router && il >= 0 && uma_router->observe_experts && strcmp(name, "ffn_moe_topk") == 0) {
             ggml_set_output(cur);
             uma_router->observe_experts_cache(il, cur);
+        }
+        // decouple miss detection (Part 2): cache the streaming layer's topk (marked
+        // output) so synchronize() can count non-resident selections post-sync. uma_router
+        // is null in streaming mode, so this is the streaming-path equivalent.
+        if (uma_stream && uma_stream->decouple && il >= 0 && strcmp(name, "ffn_moe_topk") == 0 &&
+            uma_stream->streams_layer(il)) {
+            ggml_set_output(cur);
+            uma_stream->topk[il] = cur;
         }
 
         // uma-moe fork M5 S1.1.1: the streaming fill op (GGML_OP_CUSTOM, CPU-only)

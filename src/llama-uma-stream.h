@@ -73,6 +73,10 @@ struct llama_uma_stream_state {
     // it via ggml_get_rows instead of a forced-CPU admit op. slot_of_expert[il]==nullptr
     // if not built. Static (warm-start-seeded) in Part 1; background-updated in Part 2.
     std::vector<ggml_tensor *>                slot_of_expert; // per il
+    // decouple miss detection (Part 2): per-layer cached topk (selected_experts,
+    // marked output) read post-sync to count non-resident selections. No per-layer
+    // CPU op (would reintroduce the sync tax) - one D2H per layer per token, post-sync.
+    std::vector<ggml_tensor *>                topk;           // per il
 
     // context-lifetime resources. The Metal wraps only view host_bases (noCopy),
     // so they are released BEFORE the pages are freed; meta_ctx holds only tensor
