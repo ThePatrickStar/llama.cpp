@@ -581,6 +581,18 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    // M5 finish: supply-curve telemetry - steady-state phys_footprint (the load-time
+    // free-excluded value reflects lazy fill) + the realized slot miss rate.
+    if (uma_stream) {
+        const double miss_pct = uma_stream->n_read > 0 ? 100.0 * (double) uma_stream->n_miss / (double) uma_stream->n_read : 0.0;
+        fprintf(stderr, "uma: stream teardown: phys_footprint %zu MiB (steady-state), misses %llu / %llu reads (%.2f%%), S=%u/%u\n",
+                llama_uma_phys_footprint_mib(),
+                (unsigned long long) uma_stream->n_miss, (unsigned long long) uma_stream->n_read,
+                miss_pct, uma_stream->n_slots, uma_stream->n_expert);
+    } else if (getenv("LLAMA_UMA_FOOTPRINT")) {
+        // stock baseline footprint (no streaming), for the supply-curve comparison
+        fprintf(stderr, "uma: teardown: phys_footprint %zu MiB (steady-state, stock)\n", llama_uma_phys_footprint_mib());
+    }
     if (uma_router && uma_router->n_decide > 0) {
         // stderr on purpose, see the activation line in llama-uma.cpp
         fprintf(stderr, "uma: %" PRId64 " decisions, %" PRId64 " replans, %.3f us avg, %d graphs reused, %d splits last graph\n",
@@ -2802,20 +2814,39 @@ void llama_uma_stream_admit(ggml_tensor * dst, int ith, int /*nth*/, void * user
                 out[oi] = 0; // padding id: routes to slot 0 but its gating weight is 0
                 continue;
             }
+            S->n_read++; // valid expert-read (supply-curve miss-rate denominator)
             int32_t slot = L.slot_of_expert[e];
             if (slot < 0) {
                 // miss: admit into an empty slot, else evict the LRU-cold slot
                 // that is not pinned by an expert this batch still needs
                 uint64_t best_lu = UINT64_MAX;
+                // pass 1: prefer an empty slot, else the LRU-cold slot that is neither
+                // in-batch-pinned (needed this pass) nor hot-pinned (warm-start set)
                 for (uint32_t s = 0; s < Sn; s++) {
                     if (L.expert_in_slot[s] < 0) { slot = (int32_t) s; break; } // empty wins
-                    if (L.pinned[s] != L.pass && L.last_used[s] < best_lu) {
+                    if (!L.pin_protected[s] && L.pinned[s] != L.pass && L.last_used[s] < best_lu) {
                         best_lu = L.last_used[s];
                         slot    = (int32_t) s;
                     }
                 }
+                // pass 2: no unpinned victim (e.g. a large prefill ubatch that needs more
+                // churn than S-H). The hot pin is a SOFT bias, so yield it - still never
+                // evicting an in-batch expert. The victim no longer holds a hot expert, so
+                // drop its protection.
                 if (slot < 0) {
-                    GGML_ABORT("uma stream admit: (il=%d) batch needs > S=%u distinct experts; raise LLAMA_UMA_STREAM_S", ud->il, Sn);
+                    best_lu = UINT64_MAX;
+                    for (uint32_t s = 0; s < Sn; s++) {
+                        if (L.pinned[s] != L.pass && L.last_used[s] < best_lu) {
+                            best_lu = L.last_used[s];
+                            slot    = (int32_t) s;
+                        }
+                    }
+                    if (slot >= 0) {
+                        L.pin_protected[slot] = 0;
+                    }
+                }
+                if (slot < 0) {
+                    GGML_ABORT("uma stream admit: (il=%d) batch needs > S=%u distinct experts (all in-batch-pinned); raise LLAMA_UMA_STREAM_S", ud->il, Sn);
                 }
                 const int32_t old = L.expert_in_slot[slot];
                 if (old >= 0) {
@@ -2830,6 +2861,7 @@ void llama_uma_stream_admit(ggml_tensor * dst, int ith, int /*nth*/, void * user
             out[oi]           = slot;
         }
     }
+    S->n_miss += L.n_newly; // supply-curve telemetry: misses this pass (n_read counted per valid read above)
 }
 
 // uma-moe fork M5 S1.1.2: fill op (forced onto CPU). Preads the experts admitted
@@ -2860,6 +2892,105 @@ void llama_uma_stream_fill(ggml_tensor * dst, int ith, int /*nth*/, void * userd
             GGML_ABORT("uma stream fill: pread failed (il=%d kind=%d e=%d)", ud->il, ud->kind, e);
         }
     }
+}
+
+// uma-moe fork M5 finish: hot-K warm start + LFU pin. Seed each streaming layer's slots
+// with its top-S hottest experts (from an LLAMA_UMA_STREAM_HOTFREQ dump = the
+// m5-capture-freq CSV) and pin the top-H against LRU eviction, so the resident set starts
+// LFU-optimal instead of cold. No env -> cold start (current behavior). Called once after
+// the slot pool is built; preads work from the dup'd fd regardless of free_excluded order.
+static void uma_stream_warm_start(llama_uma_stream_state * S, const llama_model & model) {
+    const char * freq_path = getenv("LLAMA_UMA_STREAM_HOTFREQ");
+    if (freq_path == nullptr || freq_path[0] == '\0') {
+        return; // cold start
+    }
+    const uint32_t n_expert      = S->n_expert;
+    const uint32_t n_slots       = S->n_slots;
+    const uint32_t n_expert_used = model.hparams.n_expert_used;
+    const uint32_t k             = model.uma_stream_k();
+
+    // pin count H: hottest experts/layer immune to eviction. Default leaves >= n_used
+    // unpinned churn slots so a cold miss always has a victim (else the first miss aborts).
+    const uint32_t pin_cap = n_slots > n_expert_used ? n_slots - n_expert_used : 0;
+    uint32_t H = pin_cap;
+    if (const char * env_h = getenv("LLAMA_UMA_STREAM_PIN")) {
+        char * end = nullptr;
+        const long h = strtol(env_h, &end, 10);
+        if (end == env_h || *end != '\0' || h < 0) {
+            throw std::runtime_error(format("invalid LLAMA_UMA_STREAM_PIN '%s' (want 0..%u)", env_h, pin_cap));
+        }
+        H = (uint32_t) h;
+        if (H > pin_cap) {
+            fprintf(stderr, "uma: STREAM_PIN=%ld clamped to %u (need >= %u unpinned churn slots)\n", h, pin_cap, n_expert_used);
+            H = pin_cap;
+        }
+    }
+
+    // parse the freq dump: "# n_layer=.. n_expert=.." header, then "layer,expert,count".
+    FILE * f = fopen(freq_path, "r");
+    if (f == nullptr) {
+        throw std::runtime_error(format("uma stream: cannot open LLAMA_UMA_STREAM_HOTFREQ '%s'", freq_path));
+    }
+    std::vector<uint64_t> freq((size_t) k * n_expert, 0); // freq[il*n_expert + e]
+    char line[256];
+    uint32_t hdr_layer = 0, hdr_expert = 0;
+    bool have_hdr = false;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#') {
+            if (sscanf(line, "# n_layer=%u n_expert=%u", &hdr_layer, &hdr_expert) == 2) {
+                have_hdr = true;
+            }
+            continue;
+        }
+        if (line[0] == 'l') { continue; } // "layer,expert,count" header
+        unsigned il = 0, e = 0; unsigned long long c = 0;
+        if (sscanf(line, "%u,%u,%llu", &il, &e, &c) != 3) { continue; }
+        if (il < k && e < n_expert) {
+            freq[(size_t) il * n_expert + e] = c;
+        }
+    }
+    fclose(f);
+    if (!have_hdr || hdr_expert != n_expert) {
+        throw std::runtime_error(format("uma stream: HOTFREQ header n_expert=%u != model n_expert=%u (wrong dump?)", hdr_expert, n_expert));
+    }
+    if (hdr_layer < k) {
+        fprintf(stderr, "uma: WARNING HOTFREQ n_layer=%u < streaming K=%u; missing layers seed by id\n", hdr_layer, k);
+    }
+
+    // per streaming layer: rank experts by count desc (tie-break by id), seed the top-S.
+    uint32_t seeded = 0;
+    for (uint32_t il = 0; il < k; il++) {
+        if (!S->streams_layer((int) il)) {
+            continue;
+        }
+        llama_uma_stream_layer_lru & L = S->lru[il];
+        const uint64_t * fq = freq.data() + (size_t) il * n_expert;
+        std::vector<uint32_t> order(n_expert);
+        for (uint32_t e = 0; e < n_expert; e++) { order[e] = e; }
+        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+            if (fq[a] != fq[b]) { return fq[a] > fq[b]; }
+            return a < b; // deterministic tie-break
+        });
+        for (uint32_t r = 0; r < n_slots; r++) {
+            const uint32_t e = order[r];
+            L.expert_in_slot[r] = (int32_t) e;
+            L.slot_of_expert[e] = (int32_t) r;
+            L.last_used[r]      = (uint64_t) (n_slots - r); // hotter => more-recently-used
+            L.pin_protected[r]  = r < H ? 1 : 0;
+            for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+                if (!S->streams((int) il, kind)) { continue; }
+                const size_t slab = model.uma_stream_slab_bytes((int) il, kind);
+                char * base = (char *) S->slot((int) il, kind)->data;
+                if (!model.uma_stream_pread_expert((int) il, kind, (int) e, base + (size_t) r * slab)) {
+                    throw std::runtime_error(format("uma stream warm-start: pread failed (il=%u kind=%d e=%u)", il, kind, e));
+                }
+            }
+        }
+        L.tick = n_slots; // runtime LRU ticks continue above the seed
+        seeded++;
+    }
+    fprintf(stderr, "uma: stream warm-start: seeded %u layers x top-%u experts, pinned top-%u (from %s)\n",
+            seeded, n_slots, H, freq_path);
 }
 
 void llama_context::uma_stream_setup() {
@@ -2989,6 +3120,7 @@ void llama_context::uma_stream_setup() {
                 L.expert_in_slot.assign(n_slots, -1);
                 L.last_used.assign(n_slots, 0);
                 L.pinned.assign(n_slots, 0);
+                L.pin_protected.assign(n_slots, 0);
                 L.newly_admitted.assign(n_slots, 0);
             }
         }
@@ -2996,9 +3128,15 @@ void llama_context::uma_stream_setup() {
                 uma_stream->wraps.size(), n_slots, n_expert, k);
 
         // the slot pool is resident; the streamed experts were loaded only to
-        // validate offsets + shape the slots. Discard their RAM now - cold
-        // experts stream from the fd on a miss (the footprint give-back).
+        // validate offsets + shape the slots. Discard their RAM FIRST (before the
+        // warm-fill faults slot pages in) so the ~18 GB expert transient and the slot
+        // pages are never both resident - large-S all-layers safety. Cold experts
+        // stream from the fd on a miss (the footprint give-back).
         model.uma_stream_free_excluded();
+
+        // seed the hot working set into the (now sole) resident slots + pin, preading
+        // from the dup'd fd (the free above does not close it).
+        uma_stream_warm_start(uma_stream.get(), model);
     }
 
     // register the slot bufts on the CURRENT sched (re-run on every sched (re)creation)

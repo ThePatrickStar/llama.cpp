@@ -22,6 +22,10 @@
 struct llama_model;
 struct llama_uma_stream_state;
 
+// process phys_footprint in MiB (TASK_VM_INFO on Darwin, 0 elsewhere). Defined in
+// llama-model.cpp; read at context teardown for the supply-curve steady state.
+size_t llama_uma_phys_footprint_mib();
+
 // per-(layer, kind) fill op userdata; context-persistent, stable address
 struct llama_uma_stream_fill_ud {
     llama_uma_stream_state * state = nullptr;
@@ -44,6 +48,7 @@ struct llama_uma_stream_layer_lru {
     std::vector<int32_t>  expert_in_slot; // n_slots
     std::vector<uint64_t> last_used;      // n_slots
     std::vector<uint64_t> pinned;         // n_slots (== pass when pinned this pass)
+    std::vector<uint8_t>  pin_protected;  // n_slots (1 = hot/warm-start, never an eviction victim)
     std::vector<int32_t>  newly_admitted; // experts admitted this pass (<= n_slots)
     uint32_t n_newly = 0;
     uint64_t tick    = 0;                 // monotonic LRU clock
@@ -54,6 +59,8 @@ struct llama_uma_stream_state {
     const llama_model * model = nullptr;
     uint32_t n_slots      = 0;  // S (slots per layer,kind); == n_expert => no compression
     uint32_t n_expert     = 0;
+    uint64_t n_miss       = 0;  // expert preads (slot misses) over the context lifetime
+    uint64_t n_read       = 0;  // total expert-reads (admits) over the context lifetime
 
     // index = il*3 + kind. slots[i]==nullptr means (il,kind) is not streaming.
     std::vector<ggml_tensor *>                slots;

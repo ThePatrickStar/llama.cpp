@@ -43,10 +43,10 @@
 #include <unistd.h>
 
 // uma-moe fork M5 S1.1.3: phys_footprint telemetry for the footprint give-back
+// (external linkage: also read at context teardown for the supply-curve steady state)
 #if defined(__APPLE__)
 #include <mach/mach.h>
-namespace {
-size_t uma_phys_footprint_mib() {
+size_t llama_uma_phys_footprint_mib() {
     task_vm_info_data_t v;
     mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t) &v, &c) != KERN_SUCCESS) {
@@ -54,9 +54,8 @@ size_t uma_phys_footprint_mib() {
     }
     return (size_t) (v.phys_footprint / (1024 * 1024));
 }
-}
 #else
-namespace { size_t uma_phys_footprint_mib() { return 0; } }
+size_t llama_uma_phys_footprint_mib() { return 0; }
 #endif
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -1888,7 +1887,7 @@ bool llama_model::uma_stream_selfcheck() const {
 }
 
 size_t llama_model::uma_stream_free_excluded() const {
-    const size_t foot_before = uma_phys_footprint_mib();
+    const size_t foot_before = llama_uma_phys_footprint_mib();
     size_t freed = 0;
     uint32_t n = 0;
     for (const auto & slab : pimpl->uma_stream_slabs) {
@@ -1912,7 +1911,7 @@ size_t llama_model::uma_stream_free_excluded() const {
         }
     }
     if (freed > 0) {
-        const size_t foot_after = uma_phys_footprint_mib();
+        const size_t foot_after = llama_uma_phys_footprint_mib();
         fprintf(stderr, "uma: stream free-excluded: discarded %.1f MiB across %u streamed expert tensors (now disk-only); phys_footprint %zu -> %zu MiB\n",
                 freed / (1024.0 * 1024.0), n, foot_before, foot_after);
     }
