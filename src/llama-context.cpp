@@ -2625,6 +2625,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.uma_stream  =*/ uma_stream.get(),
     };
 }
 
@@ -2763,7 +2764,146 @@ void llama_context::uma_apply_residency() {
     }
 }
 
+// uma-moe fork M5 S1.1.1: fill op run on the CPU backend (forced by graph_get_cb).
+// Preads each selected expert (dst->src[1]) into its full-size slot at
+// dst->data + expert_id*slab. The downstream matmul consuming dst depends on this
+// op, so the scheduler orders the fill before the GPU read (the CPU->GPU sync).
+void llama_uma_stream_fill(ggml_tensor * dst, int ith, int /*nth*/, void * userdata) {
+    if (ith != 0) {
+        return; // n_tasks == 1
+    }
+    const auto * ud  = (const llama_uma_stream_fill_ud *) userdata;
+    const ggml_tensor * ids = dst->src[1]; // selected_experts, I32 [n_expert_used, n_tokens]
+    if (ids == nullptr || ids->type != GGML_TYPE_I32 || ids->data == nullptr) {
+        GGML_ABORT("uma stream fill: (il=%d kind=%d) ids tensor not CPU-resident I32", ud->il, ud->kind);
+    }
+    const size_t slab = ud->model->uma_stream_slab_bytes(ud->il, ud->kind);
+    if (slab == 0 || dst->data == nullptr) {
+        GGML_ABORT("uma stream fill: (il=%d kind=%d) slot not streaming or unallocated", ud->il, ud->kind);
+    }
+    const int32_t * idp = (const int32_t *) ids->data;
+    const int64_t   n   = ggml_nelements(ids);
+    char * base = (char *) dst->data;
+    for (int64_t i = 0; i < n; i++) {
+        const int32_t e = idp[i];
+        if (e < 0) {
+            continue; // padding slot in the topk ids
+        }
+        if (!ud->model->uma_stream_pread_expert(ud->il, ud->kind, (int) e, base + (size_t) e * slab)) {
+            GGML_ABORT("uma stream fill: pread failed (il=%d kind=%d e=%d)", ud->il, ud->kind, (int) e);
+        }
+    }
+}
+
+void llama_context::uma_stream_setup() {
+    const uint32_t k = model.uma_stream_k();
+    if (k == 0) {
+        return; // streaming off (default runs)
+    }
+
+    // GPU backend + the fork's no-rset Metal wrap entry (the WO-C zero-copy path)
+    ggml_backend_t gpu_backend = nullptr;
+    for (ggml_backend_t b : backend_ptrs) {
+        ggml_backend_dev_t d = ggml_backend_get_device(b);
+        if (d == nullptr) {
+            continue;
+        }
+        const enum ggml_backend_dev_type dt = ggml_backend_dev_type(d);
+        if (dt == GGML_BACKEND_DEVICE_TYPE_GPU || dt == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            gpu_backend = b;
+            break;
+        }
+    }
+    if (gpu_backend == nullptr) {
+        throw std::runtime_error("uma stream: LLAMA_UMA_STREAM_K needs a GPU backend (Metal in S1.1.1)");
+    }
+    ggml_backend_dev_t gpu_dev = ggml_backend_get_device(gpu_backend);
+    ggml_backend_reg_t gpu_reg = gpu_dev == nullptr ? nullptr : ggml_backend_dev_backend_reg(gpu_dev);
+    typedef ggml_backend_buffer_t (*buffer_mapped_norset_t)(ggml_backend_dev_t, void *, size_t, size_t);
+    buffer_mapped_norset_t wrap_fn = gpu_reg == nullptr ? nullptr :
+        (buffer_mapped_norset_t) ggml_backend_reg_get_proc_address(gpu_reg, "ggml_backend_metal_device_buffer_mapped_norset");
+    if (wrap_fn == nullptr) {
+        throw std::runtime_error("uma stream: no Metal no-rset wrap entry (S1.1.1 streaming is Metal-only)");
+    }
+
+    // build the resident slot pool ONCE (context lifetime)
+    if (!uma_stream) {
+        uma_stream = std::make_unique<llama_uma_stream_state>();
+        uma_stream->model = &model;
+        const uint32_t n_layer = model.hparams.n_layer();
+        uma_stream->slots.assign((size_t) n_layer * LLAMA_UMA_STREAM_N_KIND, nullptr);
+        uma_stream->uds.assign((size_t) n_layer * LLAMA_UMA_STREAM_N_KIND, {});
+
+        const size_t n_slabs_max = (size_t) k * LLAMA_UMA_STREAM_N_KIND;
+        ggml_init_params ip = { ggml_tensor_overhead() * (n_slabs_max + 8), nullptr, /*.no_alloc =*/ true };
+        uma_stream->meta_ctx.reset(ggml_init(ip));
+        if (!uma_stream->meta_ctx) {
+            throw std::runtime_error("uma stream: failed to init slot meta context");
+        }
+        ggml_context * mctx = uma_stream->meta_ctx.get();
+
+        const size_t page = 16384; // Apple Silicon vm_page_size; newBufferWithBytesNoCopy needs a page-aligned base + length
+        for (uint32_t il = 0; il < k; il++) {
+            const auto & layer = model.layers[il];
+            ggml_tensor * srcs[LLAMA_UMA_STREAM_N_KIND];
+            srcs[LLAMA_UMA_STREAM_GATE] = layer.ffn_gate_exps;
+            srcs[LLAMA_UMA_STREAM_UP]   = layer.ffn_up_exps;
+            srcs[LLAMA_UMA_STREAM_DOWN] = layer.ffn_down_exps;
+            for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+                ggml_tensor * src = srcs[kind];
+                if (src == nullptr || model.uma_stream_slab_bytes(il, kind) == 0) {
+                    continue;
+                }
+                const size_t nbytes = ggml_nbytes(src);
+                const size_t alloc  = ((nbytes + page - 1) / page) * page;
+                void * host = nullptr;
+                if (posix_memalign(&host, page, alloc) != 0 || host == nullptr) {
+                    throw std::runtime_error("uma stream: slot host allocation failed");
+                }
+                ggml_backend_buffer_t wrap = wrap_fn(gpu_dev, host, alloc, nbytes);
+                if (wrap == nullptr) {
+                    free(host);
+                    throw std::runtime_error(format("uma stream: Metal no-rset wrap failed for slot il=%u kind=%d", il, kind));
+                }
+                ggml_backend_buffer_set_usage(wrap, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                // own host + wrap immediately so any later throw releases them
+                // (the dtor frees wraps before host pages). wrap owns nothing of
+                // host (noCopy), so the raw ptr stays usable below.
+                uma_stream->host_bases.push_back(host);
+                uma_stream->wraps.emplace_back(wrap);
+
+                ggml_tensor * st = ggml_new_tensor(mctx, src->type, GGML_MAX_DIMS, src->ne);
+                if (st == nullptr) {
+                    throw std::runtime_error("uma stream: failed to create a slot tensor");
+                }
+                char name[64];
+                snprintf(name, sizeof(name), "uma.slot.%u.%d", il, kind);
+                ggml_set_name(st, name);
+                st->buffer = wrap;
+                st->data   = host;
+                if (st->nb[2] != src->nb[2]) {
+                    throw std::runtime_error(format("uma stream: slot stride %zu != source %zu (il=%u kind=%d)", (size_t) st->nb[2], (size_t) src->nb[2], il, kind));
+                }
+
+                const size_t i = (size_t) il * LLAMA_UMA_STREAM_N_KIND + kind;
+                uma_stream->slots[i] = st;
+                uma_stream->uds[i]   = { &model, (int) il, kind };
+            }
+        }
+        fprintf(stderr, "uma: stream slot pool built: %zu Metal StorageModeShared slots (no rset), layers [0,%u)\n",
+                uma_stream->wraps.size(), k);
+    }
+
+    // register the slot bufts on the CURRENT sched (re-run on every sched (re)creation)
+    for (const auto & wrap : uma_stream->wraps) {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(wrap.get());
+        ggml_backend_sched_allow_weights_buft(sched.get(), gpu_backend, buft);
+        ggml_backend_sched_allow_weights_buft(sched.get(), backend_cpu, buft);
+    }
+}
+
 void llama_context::uma_allow_weights_bufts() {
+    uma_stream_setup();
     if (!uma_router || !uma_router->placement_active()) {
         return;
     }
@@ -3021,6 +3161,16 @@ llm_graph_cb llama_context::graph_get_cb() const {
         if (uma_router && il >= 0 && uma_router->observe_experts && strcmp(name, "ffn_moe_topk") == 0) {
             ggml_set_output(cur);
             uma_router->observe_experts_cache(il, cur);
+        }
+
+        // uma-moe fork M5 S1.1.1: the streaming fill op (GGML_OP_CUSTOM, CPU-only)
+        // is forced onto the CPU backend. Its output aliases a Metal weights slot,
+        // so the default from_buffer assignment would abort (no backend supports
+        // both that buft and CUSTOM); a forced assignment skips that path.
+        if (il >= 0 && (strcmp(name, "ffn_moe_stream_gate") == 0 ||
+                        strcmp(name, "ffn_moe_stream_up")   == 0 ||
+                        strcmp(name, "ffn_moe_stream_down") == 0)) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
         }
 
         if (uma_router && il >= 0 && uma_router->placement_active() && (uint32_t) il < uma_router->n_cpu_layers) {

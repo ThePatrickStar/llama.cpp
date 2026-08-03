@@ -18,6 +18,7 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_uma_stream_state; // uma-moe fork M5 S1.1.1: expert streaming slot pool
 
 struct llama_memory_context_i;
 
@@ -711,6 +712,10 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // uma-moe fork M5 S1.1.1: expert streaming slot pool (nullptr = off). Constant
+    // per context, so it does not participate in allow_reuse (topology-invariant).
+    const llama_uma_stream_state * uma_stream = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -933,6 +938,9 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
+
+    // uma-moe fork M5 S1.1.1: expert streaming slot pool (nullptr = off)
+    const llama_uma_stream_state * uma_stream;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;

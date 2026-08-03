@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-uma-stream.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 
@@ -1360,6 +1361,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
+    uma_stream       (params.uma_stream),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -1978,6 +1980,30 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
         cur = ggml_mul(ctx0, repeated, weights);
         cb(cur, "ffn_moe_weighted", il);
+    }
+
+    // uma-moe fork M5 S1.1.1: expert residency streaming. For the front-K layers,
+    // pread the selected experts into a resident slot pool (a CPU fill op) and read
+    // the slots in place. Passing selected_experts as the fill's src[1] makes the
+    // expert matmul depend on the fill (orders CPU-fill before GPU-read = the sync).
+    // Full-size slots => slot_id == expert_id, so selected_experts routes unchanged.
+    // Default path (uma_stream == nullptr, or non-streaming layer): no wrap.
+    if (uma_stream) {
+        if (up_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_UP)) {
+            up_exps = ggml_custom_inplace(ctx0, uma_stream->slot(il, LLAMA_UMA_STREAM_UP),
+                    &selected_experts, 1, llama_uma_stream_fill, 1, uma_stream->ud(il, LLAMA_UMA_STREAM_UP));
+            cb(up_exps, "ffn_moe_stream_up", il);
+        }
+        if (gate_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_GATE)) {
+            gate_exps = ggml_custom_inplace(ctx0, uma_stream->slot(il, LLAMA_UMA_STREAM_GATE),
+                    &selected_experts, 1, llama_uma_stream_fill, 1, uma_stream->ud(il, LLAMA_UMA_STREAM_GATE));
+            cb(gate_exps, "ffn_moe_stream_gate", il);
+        }
+        if (down_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_DOWN)) {
+            down_exps = ggml_custom_inplace(ctx0, uma_stream->slot(il, LLAMA_UMA_STREAM_DOWN),
+                    &selected_experts, 1, llama_uma_stream_fill, 1, uma_stream->ud(il, LLAMA_UMA_STREAM_DOWN));
+            cb(down_exps, "ffn_moe_stream_down", il);
+        }
     }
 
     ggml_tensor * up = nullptr;

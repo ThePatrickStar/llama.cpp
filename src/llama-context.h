@@ -8,6 +8,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-uma.h"
+#include "llama-uma-stream.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -408,6 +409,15 @@ private:
     // mapped views so the GPU reads them in place (no split copies); falls
     // back to the staged pin when the GPU backend has no wrap entry point
     void uma_wrap_std_buffers(const std::map<ggml_backend_buffer_t, std::pair<std::vector<ggml_tensor *>, size_t>> & targets);
+
+    // uma-moe fork M5 S1.1.1: expert residency streaming (env LLAMA_UMA_STREAM_K,
+    // manifest built in the model). Builds the resident slot pool ONCE (Metal
+    // StorageModeShared, no rset) and registers the slot bufts on the current
+    // sched; called from uma_allow_weights_bufts after every sched (re)creation.
+    // No-op unless model.uma_stream_k() > 0. build_moe_ffn wraps the front-K
+    // layers' expert matmuls with a CPU fill op that preads into these slots.
+    void uma_stream_setup();
+    std::unique_ptr<llama_uma_stream_state> uma_stream;
 
     std::set<ggml_backend_buffer_type_t> uma_bufts_logged;
 
