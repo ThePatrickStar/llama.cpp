@@ -803,3 +803,31 @@ size_t llama_uma_madvise_dontneed(void * addr, size_t len) {
     return 0;
 #endif
 }
+
+size_t llama_uma_madvise_discard_anon(void * addr, size_t len) {
+#if defined(_POSIX_MAPPED_FILES)
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    uintptr_t first = (uintptr_t) addr;
+    uintptr_t last  = first + len;
+    first = (first + page - 1) & ~(page - 1); // inward align (destructive advice)
+    last  = last & ~(page - 1);
+    if (last <= first) {
+        return 0;
+    }
+#if defined(__APPLE__) && defined(MADV_FREE_REUSABLE)
+    const int advice = MADV_FREE_REUSABLE; // drops phys_footprint on Darwin
+#elif defined(MADV_DONTNEED)
+    const int advice = MADV_DONTNEED;      // frees anon on Linux
+#else
+    return 0;
+#endif
+    if (madvise((void *) first, (size_t) (last - first), advice) != 0) {
+        LLAMA_LOG_WARN("warning: madvise(anon discard) failed: %s\n", strerror(errno));
+        return 0;
+    }
+    return (size_t) (last - first);
+#else
+    (void) addr; (void) len;
+    return 0;
+#endif
+}

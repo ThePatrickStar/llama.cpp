@@ -702,6 +702,15 @@ struct llama_model {
     // end-to-end. Skipped (returns true) when no mmap is retained (-lm none).
     bool uma_stream_selfcheck() const;
 
+    // uma-moe fork M5 S1.1.3: after the context builds its resident slot pool,
+    // discard the streamed-layer experts' resident (anonymous CPU) pages via
+    // MADV_DONTNEED. The streaming load path routes them to a no-mmap CPU buffer
+    // solely to validate offsets + shape the slots; the graph reads the slot
+    // pool, never these, so discarding returns the RAM (the co-fit give-back) and
+    // cold experts stream from the fd on a miss. Returns bytes discarded.
+    // Idempotent; only touches non-mmap host pages (never file-backed/Metal).
+    size_t uma_stream_free_excluded() const;
+
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
 

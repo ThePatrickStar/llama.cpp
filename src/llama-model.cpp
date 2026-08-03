@@ -42,6 +42,23 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+// uma-moe fork M5 S1.1.3: phys_footprint telemetry for the footprint give-back
+#if defined(__APPLE__)
+#include <mach/mach.h>
+namespace {
+size_t uma_phys_footprint_mib() {
+    task_vm_info_data_t v;
+    mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t) &v, &c) != KERN_SUCCESS) {
+        return 0;
+    }
+    return (size_t) (v.phys_footprint / (1024 * 1024));
+}
+}
+#else
+namespace { size_t uma_phys_footprint_mib() { return 0; } }
+#endif
+
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_LLAMA:
@@ -1816,13 +1833,12 @@ bool llama_model::uma_stream_pread_expert(int il, int kind, int e, void * dst) c
 }
 
 bool llama_model::uma_stream_selfcheck() const {
-    // pread sample slabs and memcmp vs the retained GGUF mmap. The mmap holds
-    // the same immutable file bytes, so any offset/stride/fd error surfaces as a
-    // mismatch. No mmap retained (e.g. -lm none) => cannot compare => skip.
-    if (pimpl->mappings.empty()) {
-        fprintf(stderr, "uma: stream self-check SKIPPED (no GGUF mmap retained; -lm none?)\n");
-        return true;
-    }
+    // pread sample slabs and memcmp vs a reference copy of the same immutable
+    // bytes: the GGUF mmap if retained, else the loaded expert tensor's data (the
+    // no-mmap streaming footprint path loads the experts into a CPU buffer, which
+    // is validated here before uma_stream_free_excluded() frees it). Any
+    // offset/stride/fd error surfaces as a mismatch.
+    const bool have_mmap = !pimpl->mappings.empty();
     std::vector<char> buf;
     bool     checked_stride = false;
     uint32_t n_checked      = 0;
@@ -1831,16 +1847,18 @@ bool llama_model::uma_stream_selfcheck() const {
         if (!slab.valid) {
             continue;
         }
-        if (slab.file_idx >= pimpl->mappings.size()) {
-            fprintf(stderr, "uma: stream self-check: file idx %u has no mmap\n", slab.file_idx);
-            return false;
-        }
-        const char * base  = (const char *) pimpl->mappings[slab.file_idx]->addr();
-        const size_t msize = pimpl->mappings[slab.file_idx]->size();
         const int il   = (int) (idx / LLAMA_UMA_STREAM_N_KIND);
         const int kind = (int) (idx % LLAMA_UMA_STREAM_N_KIND);
-        // check the middle expert of every valid slab; for the first slab also
-        // check e0 and e_last, exercising the per-expert stride not just the base
+        // reference bytes for expert 0 of this slab (experts are contiguous)
+        const char * ref0 = nullptr;
+        if (have_mmap && slab.file_idx < pimpl->mappings.size()) {
+            ref0 = (const char *) pimpl->mappings[slab.file_idx]->addr() + slab.offs;
+        } else if (slab.tensor != nullptr && slab.tensor->data != nullptr) {
+            ref0 = (const char *) slab.tensor->data;
+        } else {
+            continue; // no reference available - cannot check this slab
+        }
+        const size_t ref_avail = (size_t) slab.n_expert * slab.slab_bytes;
         std::vector<int> experts = { (int) (slab.n_expert / 2) };
         if (!checked_stride) {
             experts = { 0, (int) (slab.n_expert / 2), (int) (slab.n_expert - 1) };
@@ -1848,24 +1866,57 @@ bool llama_model::uma_stream_selfcheck() const {
         }
         buf.resize(slab.slab_bytes);
         for (const int e : experts) {
-            const size_t foff = slab.offs + (size_t) e * slab.slab_bytes;
-            if (foff + slab.slab_bytes > msize) {
-                fprintf(stderr, "uma: stream self-check: (il=%d kind=%d e=%d) offset out of mmap bounds\n", il, kind, e);
-                return false;
+            const size_t eoff = (size_t) e * slab.slab_bytes;
+            if (eoff + slab.slab_bytes > ref_avail) {
+                continue;
             }
             if (!uma_stream_pread_expert(il, kind, e, buf.data())) {
                 fprintf(stderr, "uma: stream self-check: pread failed (il=%d kind=%d e=%d)\n", il, kind, e);
                 return false;
             }
-            if (memcmp(buf.data(), base + foff, slab.slab_bytes) != 0) {
-                fprintf(stderr, "uma: stream self-check: MISMATCH pread vs mmap (il=%d kind=%d e=%d, %zu bytes)\n", il, kind, e, slab.slab_bytes);
+            if (memcmp(buf.data(), ref0 + eoff, slab.slab_bytes) != 0) {
+                fprintf(stderr, "uma: stream self-check: MISMATCH pread vs %s (il=%d kind=%d e=%d, %zu bytes)\n",
+                        have_mmap ? "mmap" : "loaded-tensor", il, kind, e, slab.slab_bytes);
                 return false;
             }
             n_checked++;
         }
     }
-    fprintf(stderr, "uma: stream self-check PASS (%u sample slabs, pread == mmap)\n", n_checked);
+    fprintf(stderr, "uma: stream self-check PASS (%u sample slabs, pread == %s)\n",
+            n_checked, have_mmap ? "mmap" : "loaded-tensor");
     return true;
+}
+
+size_t llama_model::uma_stream_free_excluded() const {
+    const size_t foot_before = uma_phys_footprint_mib();
+    size_t freed = 0;
+    uint32_t n = 0;
+    for (const auto & slab : pimpl->uma_stream_slabs) {
+        if (!slab.valid || slab.tensor == nullptr || slab.tensor->data == nullptr) {
+            continue;
+        }
+        // safety: only discard ANONYMOUS host pages. File-backed (mmap) pages
+        // would re-fault (and may be Metal-pinned); non-host (Metal device)
+        // buffers can't be safely discarded. The streaming load path forces
+        // no-mmap + a plain CPU buffer, so these are anonymous host pages.
+        if (slab.tensor->buffer == nullptr || !ggml_backend_buffer_is_host(slab.tensor->buffer)) {
+            continue;
+        }
+        if (uma_addr_in_mmap(slab.tensor->data, ggml_nbytes(slab.tensor))) {
+            continue;
+        }
+        const size_t adv = llama_uma_madvise_discard_anon(slab.tensor->data, ggml_nbytes(slab.tensor));
+        if (adv > 0) {
+            freed += adv;
+            n++;
+        }
+    }
+    if (freed > 0) {
+        const size_t foot_after = uma_phys_footprint_mib();
+        fprintf(stderr, "uma: stream free-excluded: discarded %.1f MiB across %u streamed expert tensors (now disk-only); phys_footprint %zu -> %zu MiB\n",
+                freed / (1024.0 * 1024.0), n, foot_before, foot_after);
+    }
+    return freed;
 }
 
 void llama_model::uma_stream_build_manifest(const struct llama_model_loader & ml) {

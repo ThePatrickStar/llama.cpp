@@ -376,6 +376,48 @@ bool llama_uma_auto_plan(const char * path_model, llama_uma_plan & plan, std::st
 }
 
 bool llama_uma_inject_load_overrides(const char * path_model, llama_model_params & params, std::vector<std::string> & patterns, std::vector<llama_model_tensor_buft_override> & overrides) {
+    // M5 S1.1.3 streaming footprint give-back: route the front-K layers' expert
+    // weights off the pinned Metal weights buffer into a dedicated CPU buffer, and
+    // force no-mmap (a Metal mmap buffer's get_mapping_range span would wire the
+    // excluded pages -> the E5 freeze). After the context builds its resident slot
+    // pool, uma_stream_free_excluded() frees this buffer, so only the S slots stay
+    // resident and the cold experts stream from the fd on demand.
+    const char * env_stream = getenv("LLAMA_UMA_STREAM_K");
+    if (env_stream != nullptr && env_stream[0] != '\0' && !params.vocab_only) {
+        char * end = nullptr;
+        const long k = strtol(env_stream, &end, 10);
+        if (end == env_stream || *end != '\0' || k <= 0 || k > 4096) {
+            fprintf(stderr, "uma: invalid LLAMA_UMA_STREAM_K '%s' (want 1..4096)\n", env_stream);
+            return false;
+        }
+        if (getenv("LLAMA_UMA_POLICY") != nullptr) {
+            fprintf(stderr, "uma: LLAMA_UMA_STREAM_K and LLAMA_UMA_POLICY are mutually exclusive\n");
+            return false;
+        }
+        if (params.tensor_buft_overrides != nullptr && params.tensor_buft_overrides[0].pattern != nullptr) {
+            fprintf(stderr, "uma: refusing to mix tensor overrides with LLAMA_UMA_STREAM_K\n");
+            return false;
+        }
+        ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+        patterns.reserve((size_t) k);
+        overrides.reserve((size_t) k + 1);
+        for (long il = 0; il < k; il++) {
+            char pat[64];
+            snprintf(pat, sizeof(pat), "blk\\.%ld\\.ffn_(up|down|gate|gate_up)_(ch|)exps", il);
+            patterns.push_back(pat);
+            overrides.push_back({ patterns.back().c_str(), cpu_buft });
+        }
+        overrides.push_back({ nullptr, nullptr });
+        params.tensor_buft_overrides = overrides.data();
+        params.use_extra_bufts = false; // plain CPU std layout (not repacked)
+        if (params.load_mode == LLAMA_LOAD_MODE_MMAP || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
+            params.load_mode = params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ? LLAMA_LOAD_MODE_MLOCK : LLAMA_LOAD_MODE_NONE;
+        }
+        fprintf(stderr, "uma: stream K=%ld: front-layer experts -> CPU buffer (freeable) + load-mode %s\n",
+                k, llama_load_mode_name(params.load_mode));
+        return true;
+    }
+
     const char * env = getenv("LLAMA_UMA_POLICY");
     if (env == nullptr || env[0] == '\0') {
         return true;

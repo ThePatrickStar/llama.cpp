@@ -80,3 +80,9 @@ size_t llama_path_max();
 // a Metal residency set (run under GGML_METAL_NO_RESIDENCY=1). Returns the bytes
 // actually advised (0 on unsupported platforms or an empty aligned range).
 size_t llama_uma_madvise_dontneed(void * addr, size_t len);
+
+// uma-moe fork M5 S1.1.3: return ANONYMOUS (private, non-file-backed) pages to the
+// OS. On Darwin MADV_FREE_REUSABLE drops phys_footprint immediately (the charged
+// metric; MADV_DONTNEED/MADV_FREE do NOT for anon); on Linux MADV_DONTNEED frees
+// anon (zero-fill on refault). The caller must never read the range again.
+size_t llama_uma_madvise_discard_anon(void * addr, size_t len);

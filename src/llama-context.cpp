@@ -2994,6 +2994,11 @@ void llama_context::uma_stream_setup() {
         }
         fprintf(stderr, "uma: stream slot pool built: %zu slots x %u/%u experts (Metal StorageModeShared, no rset), layers [0,%u)\n",
                 uma_stream->wraps.size(), n_slots, n_expert, k);
+
+        // the slot pool is resident; the streamed experts were loaded only to
+        // validate offsets + shape the slots. Discard their RAM now - cold
+        // experts stream from the fd on a miss (the footprint give-back).
+        model.uma_stream_free_excluded();
     }
 
     // register the slot bufts on the CURRENT sched (re-run on every sched (re)creation)
