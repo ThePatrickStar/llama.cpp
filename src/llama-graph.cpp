@@ -1982,26 +1982,34 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
-    // uma-moe fork M5 S1.1.1: expert residency streaming. For the front-K layers,
-    // pread the selected experts into a resident slot pool (a CPU fill op) and read
-    // the slots in place. Passing selected_experts as the fill's src[1] makes the
-    // expert matmul depend on the fill (orders CPU-fill before GPU-read = the sync).
-    // Full-size slots => slot_id == expert_id, so selected_experts routes unchanged.
-    // Default path (uma_stream == nullptr, or non-streaming layer): no wrap.
-    if (uma_stream) {
+    // uma-moe fork M5 S1.1.2: expert residency streaming with a compressed LRU
+    // slot pool. Per streaming layer: an admit op maps the token's selected
+    // experts to slots (emitting slot_ids), per-kind fill ops pread the newly-
+    // admitted experts into their slots (each fill aliases the slot tensor so the
+    // matmul weight depends on it = the CPU-fill -> GPU-read sync), and the
+    // streamed expert matmuls route via slot_ids instead of selected_experts.
+    // Default path (uma_stream == nullptr, or non-streaming layer): route_ids ==
+    // selected_experts and no wrap, so the graph is byte-identical to stock.
+    ggml_tensor * route_ids = selected_experts;
+    if (uma_stream && uma_stream->streams_layer(il)) {
+        ggml_tensor * slot_ids = ggml_custom_4d(ctx0, GGML_TYPE_I32,
+                selected_experts->ne[0], selected_experts->ne[1], 1, 1,
+                &selected_experts, 1, llama_uma_stream_admit, 1, uma_stream->admit_ud(il));
+        cb(slot_ids, "ffn_moe_stream_admit", il);
+        route_ids = uma_stream->debug_routesel ? selected_experts : slot_ids;
         if (up_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_UP)) {
             up_exps = ggml_custom_inplace(ctx0, uma_stream->slot(il, LLAMA_UMA_STREAM_UP),
-                    &selected_experts, 1, llama_uma_stream_fill, 1, uma_stream->ud(il, LLAMA_UMA_STREAM_UP));
+                    &slot_ids, 1, llama_uma_stream_fill, 1, uma_stream->ud(il, LLAMA_UMA_STREAM_UP));
             cb(up_exps, "ffn_moe_stream_up", il);
         }
         if (gate_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_GATE)) {
             gate_exps = ggml_custom_inplace(ctx0, uma_stream->slot(il, LLAMA_UMA_STREAM_GATE),
-                    &selected_experts, 1, llama_uma_stream_fill, 1, uma_stream->ud(il, LLAMA_UMA_STREAM_GATE));
+                    &slot_ids, 1, llama_uma_stream_fill, 1, uma_stream->ud(il, LLAMA_UMA_STREAM_GATE));
             cb(gate_exps, "ffn_moe_stream_gate", il);
         }
         if (down_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_DOWN)) {
             down_exps = ggml_custom_inplace(ctx0, uma_stream->slot(il, LLAMA_UMA_STREAM_DOWN),
-                    &selected_experts, 1, llama_uma_stream_fill, 1, uma_stream->ud(il, LLAMA_UMA_STREAM_DOWN));
+                    &slot_ids, 1, llama_uma_stream_fill, 1, uma_stream->ud(il, LLAMA_UMA_STREAM_DOWN));
             cb(down_exps, "ffn_moe_stream_down", il);
         }
     }
@@ -2030,7 +2038,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, route_ids, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2043,7 +2051,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, route_ids, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2132,7 +2140,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, route_ids, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {

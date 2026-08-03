@@ -2764,33 +2764,118 @@ void llama_context::uma_apply_residency() {
     }
 }
 
-// uma-moe fork M5 S1.1.1: fill op run on the CPU backend (forced by graph_get_cb).
-// Preads each selected expert (dst->src[1]) into its full-size slot at
-// dst->data + expert_id*slab. The downstream matmul consuming dst depends on this
-// op, so the scheduler orders the fill before the GPU read (the CPU->GPU sync).
+// uma-moe fork M5 S1.1.2: admit op (forced onto CPU by graph_get_cb). Reads
+// selected_experts (dst->src[0]), assigns each selected expert a slot via the
+// per-layer LRU (admitting misses into an empty or LRU-cold unpinned slot,
+// recording them in lru[il].newly_admitted), and writes slot_ids into dst. In-
+// batch experts are pinned so a batch never evicts an expert it still needs.
+void llama_uma_stream_admit(ggml_tensor * dst, int ith, int /*nth*/, void * userdata) {
+    if (ith != 0) {
+        return; // n_tasks == 1
+    }
+    const auto * ud = (const llama_uma_stream_admit_ud *) userdata;
+    llama_uma_stream_state * S = ud->state;
+    llama_uma_stream_layer_lru & L = S->lru[ud->il];
+    const ggml_tensor * sel = dst->src[0]; // selected_experts, I32 [n_expert_used, n_tokens]
+    if (sel == nullptr || sel->type != GGML_TYPE_I32 || sel->data == nullptr) {
+        GGML_ABORT("uma stream admit: (il=%d) selected_experts not CPU-resident I32", ud->il);
+    }
+    if (dst->type != GGML_TYPE_I32 || dst->data == nullptr) {
+        GGML_ABORT("uma stream admit: (il=%d) slot_ids not I32/allocated", ud->il);
+    }
+    const int32_t * sp  = (const int32_t *) sel->data;
+    int32_t       * out = (int32_t *) dst->data;
+    const int64_t   n   = ggml_nelements(sel);
+    const uint32_t  Sn  = S->n_slots;
+    L.pass++;
+    L.n_newly = 0;
+    if (S->debug_identity) {
+        // bisect: slot_of_expert[e] = e (needs S == n_expert). Reproduces the
+        // byte-identical S1.1.1 permutation through the admit/slot_ids/fill path.
+        for (int64_t i = 0; i < n; i++) {
+            const int32_t e = sp[i];
+            if (e < 0 || (uint32_t) e >= S->n_expert) { out[i] = 0; continue; }
+            if (L.slot_of_expert[e] < 0) {
+                L.slot_of_expert[e]           = e;
+                L.expert_in_slot[e]           = e;
+                L.newly_admitted[L.n_newly++] = e;
+            }
+            L.pinned[e]    = L.pass;
+            L.last_used[e] = L.tick++;
+            out[i]         = e;
+        }
+    } else {
+        for (int64_t i = 0; i < n; i++) {
+            const int32_t e = sp[i];
+            if (e < 0 || (uint32_t) e >= S->n_expert) {
+                out[i] = 0; // padding id: routes to slot 0 but its gating weight is 0
+                continue;
+            }
+            int32_t slot = L.slot_of_expert[e];
+            if (slot < 0) {
+                uint64_t best_lu = UINT64_MAX;
+                for (uint32_t s = 0; s < Sn; s++) {
+                    if (L.expert_in_slot[s] < 0) { slot = (int32_t) s; break; } // empty wins
+                    if (L.pinned[s] != L.pass && L.last_used[s] < best_lu) {
+                        best_lu = L.last_used[s];
+                        slot    = (int32_t) s;
+                    }
+                }
+                if (slot < 0) {
+                    GGML_ABORT("uma stream admit: (il=%d) batch needs > S=%u distinct experts; raise LLAMA_UMA_STREAM_S", ud->il, Sn);
+                }
+                const int32_t old = L.expert_in_slot[slot];
+                if (old >= 0) {
+                    L.slot_of_expert[old] = -1; // evict
+                }
+                L.expert_in_slot[slot]        = e;
+                L.slot_of_expert[e]           = slot;
+                L.newly_admitted[L.n_newly++] = e;
+            }
+            L.pinned[slot]    = L.pass;
+            L.last_used[slot] = L.tick++;
+            out[i]            = slot;
+        }
+    }
+    if (S->debug_nocache) {
+        // bisect: re-pread every expert used this pass (not just newly-admitted),
+        // like S1.1.1. If this makes output == stock, the bug is the cache (a hit
+        // reads a slot that does not actually hold the expert's bytes).
+        L.n_newly = 0;
+        for (uint32_t s = 0; s < Sn; s++) {
+            if (L.pinned[s] == L.pass) {
+                L.newly_admitted[L.n_newly++] = L.expert_in_slot[s];
+            }
+        }
+    }
+}
+
+// uma-moe fork M5 S1.1.2: fill op (forced onto CPU). Preads the experts admitted
+// THIS pass (lru[il].newly_admitted, set by the admit op) into their slots at
+// dst->data + slot*slab. src[1] is slot_ids (a dependency anchor so this runs
+// after admit). Output aliases the slot tensor so the matmul weight depends on
+// the fill = the CPU-fill -> GPU-read sync. Hits (already resident) are not
+// re-pread; their slot bytes are immutable weights written on a previous pass.
 void llama_uma_stream_fill(ggml_tensor * dst, int ith, int /*nth*/, void * userdata) {
     if (ith != 0) {
         return; // n_tasks == 1
     }
-    const auto * ud  = (const llama_uma_stream_fill_ud *) userdata;
-    const ggml_tensor * ids = dst->src[1]; // selected_experts, I32 [n_expert_used, n_tokens]
-    if (ids == nullptr || ids->type != GGML_TYPE_I32 || ids->data == nullptr) {
-        GGML_ABORT("uma stream fill: (il=%d kind=%d) ids tensor not CPU-resident I32", ud->il, ud->kind);
-    }
-    const size_t slab = ud->model->uma_stream_slab_bytes(ud->il, ud->kind);
+    const auto * ud = (const llama_uma_stream_fill_ud *) userdata;
+    llama_uma_stream_state * S = ud->state;
+    const llama_uma_stream_layer_lru & L = S->lru[ud->il];
+    const size_t slab = S->model->uma_stream_slab_bytes(ud->il, ud->kind);
     if (slab == 0 || dst->data == nullptr) {
         GGML_ABORT("uma stream fill: (il=%d kind=%d) slot not streaming or unallocated", ud->il, ud->kind);
     }
-    const int32_t * idp = (const int32_t *) ids->data;
-    const int64_t   n   = ggml_nelements(ids);
     char * base = (char *) dst->data;
-    for (int64_t i = 0; i < n; i++) {
-        const int32_t e = idp[i];
-        if (e < 0) {
-            continue; // padding slot in the topk ids
+    for (uint32_t j = 0; j < L.n_newly; j++) {
+        const int32_t e    = L.newly_admitted[j];
+        const int32_t slot = L.slot_of_expert[e];
+        if (slot < 0 || (uint32_t) slot >= S->n_slots) {
+            GGML_ABORT("uma stream fill: (il=%d kind=%d) bad slot %d for expert %d", ud->il, ud->kind, slot, e);
         }
-        if (!ud->model->uma_stream_pread_expert(ud->il, ud->kind, (int) e, base + (size_t) e * slab)) {
-            GGML_ABORT("uma stream fill: pread failed (il=%d kind=%d e=%d)", ud->il, ud->kind, (int) e);
+        if (!S->model->uma_stream_pread_expert(ud->il, ud->kind, (int) e, base + (size_t) slot * slab)) {
+            GGML_ABORT("uma stream fill: pread failed (il=%d kind=%d e=%d)", ud->il, ud->kind, e);
         }
     }
 }
@@ -2799,6 +2884,38 @@ void llama_context::uma_stream_setup() {
     const uint32_t k = model.uma_stream_k();
     if (k == 0) {
         return; // streaming off (default runs)
+    }
+    // CORRECTNESS GATE: the streaming graph (admit op + slot-routed mul_mat_id)
+    // trips a Metal op-fusion that computes wrong numerics ONLY on the streaming
+    // path (fusion is numerically neutral for stock; unfused streaming output is
+    // byte-identical to stock, verified). The Metal compute context reads
+    // use_fusion at init, before any llama-side hook runs, so it can only be
+    // disabled from the environment. Refuse rather than silently miscompute.
+    // TODO: add a fork-private per-context fusion setter to drop this env need.
+    if (getenv("GGML_METAL_FUSION_DISABLE") == nullptr) {
+        throw std::runtime_error("uma stream: set GGML_METAL_FUSION_DISABLE=1 in the environment - a Metal op-fusion mis-fires on the streaming graph and would produce wrong output (unfused output is byte-identical to stock)");
+    }
+    const uint32_t n_expert      = model.hparams.n_expert;
+    const uint32_t n_expert_used = model.hparams.n_expert_used;
+
+    // S = resident slots per (layer,kind). Default n_expert (no compression, pure
+    // remap); LLAMA_UMA_STREAM_S shrinks it (the footprint win). Must be able to
+    // hold one token's experts; a batch needing > S distinct experts aborts.
+    uint32_t n_slots = n_expert;
+    const char * env_s = getenv("LLAMA_UMA_STREAM_S");
+    if (env_s && env_s[0] != '\0') {
+        char * end = nullptr;
+        const long s = strtol(env_s, &end, 10);
+        if (end == env_s || *end != '\0' || s < (long) n_expert_used || s > (long) n_expert) {
+            throw std::runtime_error(format("invalid LLAMA_UMA_STREAM_S '%s' (want %u..%u)", env_s, n_expert_used, n_expert));
+        }
+        n_slots = (uint32_t) s;
+    }
+    const bool debug_identity = getenv("LLAMA_UMA_STREAM_IDENTITY") != nullptr;
+    const bool debug_nocache  = getenv("LLAMA_UMA_STREAM_NOCACHE")  != nullptr;
+    const bool debug_routesel = getenv("LLAMA_UMA_STREAM_ROUTESEL") != nullptr;
+    if (debug_identity) {
+        n_slots = n_expert; // identity map needs one slot per expert
     }
 
     // GPU backend + the fork's no-rset Metal wrap entry (the WO-C zero-copy path)
@@ -2829,10 +2946,17 @@ void llama_context::uma_stream_setup() {
     // build the resident slot pool ONCE (context lifetime)
     if (!uma_stream) {
         uma_stream = std::make_unique<llama_uma_stream_state>();
-        uma_stream->model = &model;
+        uma_stream->model    = &model;
+        uma_stream->n_slots  = n_slots;
+        uma_stream->n_expert = n_expert;
+        uma_stream->debug_identity = debug_identity;
+        uma_stream->debug_nocache  = debug_nocache;
+        uma_stream->debug_routesel = debug_routesel;
         const uint32_t n_layer = model.hparams.n_layer();
         uma_stream->slots.assign((size_t) n_layer * LLAMA_UMA_STREAM_N_KIND, nullptr);
         uma_stream->uds.assign((size_t) n_layer * LLAMA_UMA_STREAM_N_KIND, {});
+        uma_stream->admit_uds.assign((size_t) n_layer, {});
+        uma_stream->lru.assign((size_t) n_layer, {});
 
         const size_t n_slabs_max = (size_t) k * LLAMA_UMA_STREAM_N_KIND;
         ggml_init_params ip = { ggml_tensor_overhead() * (n_slabs_max + 8), nullptr, /*.no_alloc =*/ true };
@@ -2849,18 +2973,21 @@ void llama_context::uma_stream_setup() {
             srcs[LLAMA_UMA_STREAM_GATE] = layer.ffn_gate_exps;
             srcs[LLAMA_UMA_STREAM_UP]   = layer.ffn_up_exps;
             srcs[LLAMA_UMA_STREAM_DOWN] = layer.ffn_down_exps;
+            bool layer_streams = false;
             for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
                 ggml_tensor * src = srcs[kind];
                 if (src == nullptr || model.uma_stream_slab_bytes(il, kind) == 0) {
                     continue;
                 }
-                const size_t nbytes = ggml_nbytes(src);
-                const size_t alloc  = ((nbytes + page - 1) / page) * page;
+                // the slot buffer holds n_slots experts (not n_expert): the
+                // per-expert slab stride is src->nb[2], so S slots = S*nb[2]
+                const size_t slot_bytes = (size_t) n_slots * (size_t) src->nb[2];
+                const size_t alloc      = ((slot_bytes + page - 1) / page) * page;
                 void * host = nullptr;
                 if (posix_memalign(&host, page, alloc) != 0 || host == nullptr) {
                     throw std::runtime_error("uma stream: slot host allocation failed");
                 }
-                ggml_backend_buffer_t wrap = wrap_fn(gpu_dev, host, alloc, nbytes);
+                ggml_backend_buffer_t wrap = wrap_fn(gpu_dev, host, alloc, slot_bytes);
                 if (wrap == nullptr) {
                     free(host);
                     throw std::runtime_error(format("uma stream: Metal no-rset wrap failed for slot il=%u kind=%d", il, kind));
@@ -2872,7 +2999,9 @@ void llama_context::uma_stream_setup() {
                 uma_stream->host_bases.push_back(host);
                 uma_stream->wraps.emplace_back(wrap);
 
-                ggml_tensor * st = ggml_new_tensor(mctx, src->type, GGML_MAX_DIMS, src->ne);
+                // slot tensor is [ne0, ne1, n_slots] (compressed expert dim)
+                const int64_t slot_ne[GGML_MAX_DIMS] = { src->ne[0], src->ne[1], (int64_t) n_slots, 1 };
+                ggml_tensor * st = ggml_new_tensor(mctx, src->type, GGML_MAX_DIMS, slot_ne);
                 if (st == nullptr) {
                     throw std::runtime_error("uma stream: failed to create a slot tensor");
                 }
@@ -2887,11 +3016,21 @@ void llama_context::uma_stream_setup() {
 
                 const size_t i = (size_t) il * LLAMA_UMA_STREAM_N_KIND + kind;
                 uma_stream->slots[i] = st;
-                uma_stream->uds[i]   = { &model, (int) il, kind };
+                uma_stream->uds[i]   = { uma_stream.get(), (int) il, kind };
+                layer_streams = true;
+            }
+            if (layer_streams) {
+                uma_stream->admit_uds[il] = { uma_stream.get(), (int) il };
+                llama_uma_stream_layer_lru & L = uma_stream->lru[il];
+                L.slot_of_expert.assign(n_expert, -1);
+                L.expert_in_slot.assign(n_slots, -1);
+                L.last_used.assign(n_slots, 0);
+                L.pinned.assign(n_slots, 0);
+                L.newly_admitted.assign(n_slots, 0);
             }
         }
-        fprintf(stderr, "uma: stream slot pool built: %zu Metal StorageModeShared slots (no rset), layers [0,%u)\n",
-                uma_stream->wraps.size(), k);
+        fprintf(stderr, "uma: stream slot pool built: %zu slots x %u/%u experts (Metal StorageModeShared, no rset), layers [0,%u)\n",
+                uma_stream->wraps.size(), n_slots, n_expert, k);
     }
 
     // register the slot bufts on the CURRENT sched (re-run on every sched (re)creation)
@@ -3167,9 +3306,10 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // is forced onto the CPU backend. Its output aliases a Metal weights slot,
         // so the default from_buffer assignment would abort (no backend supports
         // both that buft and CUSTOM); a forced assignment skips that path.
-        if (il >= 0 && (strcmp(name, "ffn_moe_stream_gate") == 0 ||
-                        strcmp(name, "ffn_moe_stream_up")   == 0 ||
-                        strcmp(name, "ffn_moe_stream_down") == 0)) {
+        if (il >= 0 && (strcmp(name, "ffn_moe_stream_admit") == 0 ||
+                        strcmp(name, "ffn_moe_stream_gate")  == 0 ||
+                        strcmp(name, "ffn_moe_stream_up")    == 0 ||
+                        strcmp(name, "ffn_moe_stream_down")  == 0)) {
             ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
         }
 
