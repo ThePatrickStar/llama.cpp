@@ -3130,6 +3130,7 @@ void llama_context::uma_stream_reseed_resident(uint32_t s_new) {
         // clear all residency: no slot occupied, every expert non-resident (-> sentinel 0)
         std::fill(L.slot_of_expert.begin(), L.slot_of_expert.end(), -1);
         std::fill(L.expert_in_slot.begin(), L.expert_in_slot.end(), -1);
+        std::fill(L.pin_protected.begin(), L.pin_protected.end(), 0);
         if (tbl) { std::fill(tbl, tbl + n_expert, 0); }
         // seed [0, s_new) with the top-s_new ranked experts; pin the top-H
         uint32_t r = 0;
@@ -3184,12 +3185,9 @@ void llama_context::uma_stream_resize(uint32_t s_new) {
     if (target == cur) {
         return;
     }
-    typedef ggml_backend_buffer_t (*wrap_fn_t)(ggml_backend_dev_t, void *, size_t, size_t);
-    const wrap_fn_t wrap_fn = (wrap_fn_t) uma_stream_wrap_fn;
-    const size_t    page    = 16384;
-    const size_t    foot_before = llama_uma_phys_footprint_mib();
-    const int64_t   t0_us       = ggml_time_us();
-    const uint32_t  n_layer     = model.hparams.n_layer();
+    const size_t   foot_before = llama_uma_phys_footprint_mib();
+    const int64_t  t0_us       = ggml_time_us();
+    const uint32_t n_layer     = model.hparams.n_layer();
 
     // 1. free ALL slot buffers first (releases the Metal wraps that pin the pages, then
     //    munmap returns the pages to the OS), dropping phys_footprint to the non-expert
@@ -3207,49 +3205,89 @@ void llama_context::uma_stream_resize(uint32_t s_new) {
             }
         }
     }
-    // 2. reallocate each slot buffer at the new size and repoint its tensor
-    for (uint32_t il = 0; il < n_layer; il++) {
-        for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
-            const size_t i = (size_t) il * LLAMA_UMA_STREAM_N_KIND + kind;
-            ggml_tensor * st = uma_stream->slots[i];
-            if (st == nullptr) { continue; }
-            const size_t slab       = (size_t) st->nb[2];
-            const size_t slot_bytes = (size_t) target * slab;
-            const size_t alloc      = ((slot_bytes + page - 1) / page) * page;
-            void * host = mmap(nullptr, alloc, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-            if (host == MAP_FAILED) {
-                throw std::runtime_error("uma stream resize: slot host mmap failed");
+    // 2. reallocate every slot buffer at the new size, with an OOM fallback ladder so a
+    //    resize NEVER crashes the process: a grow that cannot get memory degrades to the
+    //    pre-resize size (just resident, so it fits), then to the minimum, before it gives
+    //    up. Each try_alloc rolls back its own partial allocations on failure.
+    uint32_t eff = target;
+    if (!uma_stream_try_alloc_slots(eff)) {
+        fprintf(stderr, "uma: resize to S=%u could not allocate; falling back to S=%u\n", target, cur);
+        eff = cur;
+        if (!uma_stream_try_alloc_slots(eff)) {
+            eff = model.hparams.n_expert_used; // minimum viable resident set
+            if (!uma_stream_try_alloc_slots(eff)) {
+                throw std::runtime_error("uma stream resize: cannot reallocate the slot pool (OOM)");
             }
-            ggml_backend_buffer_t wrap = wrap_fn(uma_stream_gpu_dev, host, alloc, slot_bytes);
-            if (wrap == nullptr) {
-                munmap(host, alloc);
-                throw std::runtime_error(format("uma stream resize: no-rset wrap failed (il=%u kind=%d)", il, kind));
-            }
-            ggml_backend_buffer_set_usage(wrap, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-            uma_stream->slot_host[i]  = host;
-            uma_stream->slot_alloc[i] = alloc;
-            uma_stream->slot_buf[i].reset(wrap);
-            st->ne[2]  = (int64_t) target;   // shrink/grow the expert dim
-            st->nb[3]  = st->nb[2] * (size_t) target;
-            st->data   = host;
-            st->buffer = wrap;
         }
     }
-    uma_stream->n_slots_active = target;
+    uma_stream->n_slots_active = eff;
 
     // 3. reseed the resident set into the new buffers (pread from the GGUF)
-    uma_stream_reseed_resident(target);
+    uma_stream_reseed_resident(eff);
 
     // 4. force the next decode to rebuild the graph (it references the freed tensors).
     //    the new wraps share the no-rset buft already allowed at setup, and
     //    sched_reset does not clear that allowlist, so no re-registration is needed.
     uma_stream_force_rebuild = true;
     uma_stream->n_resizes++;
-    if (uma_stream->s_min_active == 0 || target < uma_stream->s_min_active) { uma_stream->s_min_active = target; }
-    if (target > uma_stream->s_max_active) { uma_stream->s_max_active = target; }
+    if (uma_stream->s_min_active == 0 || eff < uma_stream->s_min_active) { uma_stream->s_min_active = eff; }
+    if (eff > uma_stream->s_max_active) { uma_stream->s_max_active = eff; }
     const size_t foot_after = llama_uma_phys_footprint_mib();
     fprintf(stderr, "uma: resize S %u -> %u: phys_footprint %zu -> %zu MiB (%.1f ms), avail %zu MiB\n",
-            cur, target, foot_before, foot_after, (ggml_time_us() - t0_us) / 1000.0, llama_uma_avail_reclaim_mib());
+            cur, eff, foot_before, foot_after, (ggml_time_us() - t0_us) / 1000.0, llama_uma_avail_reclaim_mib());
+}
+
+// uma-moe fork M6: (re)allocate every streaming slot buffer at S_new (mmap + no-rset wrap),
+// mutating the persistent slot tensors. Precondition: the slot buffers are already freed
+// (slot_host == nullptr). Returns false + rolls back its own partial allocations on any
+// mmap/wrap failure, so the caller can retry at a smaller size (the OOM fallback ladder).
+bool llama_context::uma_stream_try_alloc_slots(uint32_t s_new) {
+    typedef ggml_backend_buffer_t (*wrap_fn_t)(ggml_backend_dev_t, void *, size_t, size_t);
+    const wrap_fn_t wrap_fn = (wrap_fn_t) uma_stream_wrap_fn;
+    const size_t    page    = 16384;
+    const uint32_t  n_layer = model.hparams.n_layer();
+    std::vector<size_t> done; // indices allocated in THIS call, for rollback
+    auto rollback = [&]() {
+        for (size_t i : done) {
+            uma_stream->slot_buf[i].reset();
+            if (uma_stream->slot_host[i]) {
+                munmap(uma_stream->slot_host[i], uma_stream->slot_alloc[i]);
+                uma_stream->slot_host[i]  = nullptr;
+                uma_stream->slot_alloc[i] = 0;
+            }
+        }
+    };
+    for (uint32_t il = 0; il < n_layer; il++) {
+        for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+            const size_t i = (size_t) il * LLAMA_UMA_STREAM_N_KIND + kind;
+            ggml_tensor * st = uma_stream->slots[i];
+            if (st == nullptr) { continue; }
+            const size_t slab       = (size_t) st->nb[2];
+            const size_t slot_bytes = (size_t) s_new * slab;
+            const size_t alloc      = ((slot_bytes + page - 1) / page) * page;
+            void * host = mmap(nullptr, alloc, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (host == MAP_FAILED) {
+                rollback();
+                return false;
+            }
+            ggml_backend_buffer_t wrap = wrap_fn(uma_stream_gpu_dev, host, alloc, slot_bytes);
+            if (wrap == nullptr) {
+                munmap(host, alloc);
+                rollback();
+                return false;
+            }
+            ggml_backend_buffer_set_usage(wrap, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            uma_stream->slot_host[i]  = host;
+            uma_stream->slot_alloc[i] = alloc;
+            uma_stream->slot_buf[i].reset(wrap);
+            st->ne[2]  = (int64_t) s_new;   // shrink/grow the expert dim
+            st->nb[3]  = st->nb[2] * (size_t) s_new;
+            st->data   = host;
+            st->buffer = wrap;
+            done.push_back(i);
+        }
+    }
+    return true;
 }
 
 // uma-moe fork M6: rate-limited controller tick (decode-only, post-sync). Advances

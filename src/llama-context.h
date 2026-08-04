@@ -443,6 +443,7 @@ private:
     void *  uma_stream_wrap_fn        = nullptr; // buffer_mapped_norset_t, cast in the .cpp
     bool    uma_stream_force_rebuild  = false;   // set by resize; consumed in process_ubatch
     void uma_stream_resize(uint32_t s_new);   // free+realloc the slot buffers to s_new (clamped)
+    bool uma_stream_try_alloc_slots(uint32_t s_new); // (re)allocate all slot buffers at s_new; rolls back its partial allocations and returns false on OOM (precondition: slots freed)
     void uma_stream_reseed_resident(uint32_t s_new); // reseed [0,s_new) from the freq ranking
     void uma_stream_controller_tick();        // rate-limited decode-only driver
 
