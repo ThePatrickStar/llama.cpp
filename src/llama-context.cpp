@@ -588,7 +588,12 @@ llama_context::~llama_context() {
         fprintf(stderr, "uma: stream teardown: phys_footprint %zu MiB (steady-state), misses %llu / %llu reads (%.2f%%), S=%u/%u\n",
                 llama_uma_phys_footprint_mib(),
                 (unsigned long long) uma_stream->n_miss, (unsigned long long) uma_stream->n_read,
-                miss_pct, uma_stream->n_slots, uma_stream->n_expert);
+                miss_pct, uma_stream->n_slots_active, uma_stream->n_expert);
+        if (uma_stream->n_resizes > 0 || uma_stream->n_distress > 0) {
+            fprintf(stderr, "uma: M6 controller teardown: %llu resizes, %llu distress clamps, S reached [%u,%u] of max %u\n",
+                    (unsigned long long) uma_stream->n_resizes, (unsigned long long) uma_stream->n_distress,
+                    uma_stream->s_min_active, uma_stream->s_max_active, uma_stream->n_slots);
+        }
     } else if (getenv("LLAMA_UMA_FOOTPRINT")) {
         // stock baseline footprint (no streaming), for the supply-curve comparison
         fprintf(stderr, "uma: teardown: phys_footprint %zu MiB (steady-state, stock)\n", llama_uma_phys_footprint_mib());
@@ -900,7 +905,7 @@ void llama_context::synchronize() {
         // no per-layer graph op, so the decouple stays sync-free.
         if (uma_stream && uma_stream->decouple && t_compute_start_us != 0) {
             const uint32_t n_used = model.hparams.n_expert_used;
-            const uint32_t Sn     = uma_stream->n_slots;
+            const uint32_t Sn     = uma_stream->n_slots_active; // M6: online admits stay in the active window
             const bool     adapt  = uma_stream->adapt;
             std::vector<int32_t> ids(n_used);
             for (uint32_t il = 0; il < uma_stream->topk.size(); il++) {
@@ -983,6 +988,13 @@ void llama_context::synchronize() {
                     if (tbl) { tbl[e] = slot; } // publish AFTER the pread
                 }
             }
+        }
+
+        // M6 give-back controller: rate-limited runtime S-resize in the same
+        // post-sync GPU-idle window. Reads the M4 budget signal (CTRL) or a
+        // commanded schedule (SCHED); decode-only, never per token.
+        if (uma_stream && uma_stream->decouple && uma_resize_smin >= 0 && t_compute_start_us != 0) {
+            uma_stream_controller_tick();
         }
     } else if (n_queued_tokens > 1) {
         if (!cparams.no_perf) {
@@ -3068,6 +3080,7 @@ static void uma_stream_warm_start(llama_uma_stream_state * S, const llama_model 
             if (fq[a] != fq[b]) { return fq[a] > fq[b]; }
             return a < b; // deterministic tie-break
         });
+        S->ranked[il].assign(order.begin(), order.end()); // M6: keep the ranking for eager grow
         for (uint32_t r = 0; r < n_slots; r++) {
             const uint32_t e = order[r];
             L.expert_in_slot[r] = (int32_t) e;
@@ -3089,6 +3102,137 @@ static void uma_stream_warm_start(llama_uma_stream_state * S, const llama_model 
     }
     fprintf(stderr, "uma: stream warm-start: seeded %u layers x top-%u experts, pinned top-%u (from %s)\n",
             seeded, n_slots, H, freq_path);
+}
+
+// uma-moe fork M6: elastic runtime resize of the resident slot window. Shed
+// (target < current) clears the shed slots' LRU + expert->slot table entries (so
+// no route can point into them) then MADV_FREE_REUSABLE their host pages (the only
+// advice that drops phys_footprint for anon on Darwin). Grow re-warms the
+// re-activated slots from the per-layer freq ranking (pread -> re-fault, publish the
+// table AFTER the pread). Runs decode-only in the post-sync GPU-idle window, so slot
+// + table writes are torn-write-safe with no background thread.
+void llama_context::uma_stream_resize(uint32_t s_new) {
+    if (!uma_stream || !uma_stream->decouple) {
+        return;
+    }
+    const uint32_t smax = uma_stream->n_slots;
+    const uint32_t smin = uma_resize_smin >= 0 ? (uint32_t) uma_resize_smin : smax;
+    uint32_t target = s_new;
+    if (target < smin) {
+        uma_stream->n_distress++;
+        fprintf(stderr, "uma: DISTRESS: budget demands S=%u < knee=%u; holding at knee (admission signal for M7)\n", s_new, smin);
+        target = smin;
+    }
+    if (target > smax) {
+        target = smax;
+    }
+    const uint32_t cur = uma_stream->n_slots_active;
+    if (target == cur) {
+        return;
+    }
+    const size_t   foot_before = llama_uma_phys_footprint_mib();
+    const uint32_t n_layer     = model.hparams.n_layer();
+
+    if (target < cur) {
+        // SHED slots [target, cur): clear LRU + table first (no route can point into
+        // them), then free their host pages.
+        for (uint32_t il = 0; il < n_layer; il++) {
+            if (!uma_stream->streams_layer((int) il)) { continue; }
+            llama_uma_stream_layer_lru & L = uma_stream->lru[il];
+            int32_t * tbl = uma_stream->expert_table((int) il) ? (int32_t *) uma_stream->expert_table((int) il)->data : nullptr;
+            for (uint32_t s = target; s < cur; s++) {
+                const int32_t e = L.expert_in_slot[s];
+                if (e >= 0) {
+                    L.slot_of_expert[e] = -1;
+                    if (tbl) { tbl[e] = 0; } // route non-resident -> sentinel slot 0
+                }
+                L.expert_in_slot[s] = -1;
+                L.pin_protected[s]  = 0;
+                L.last_used[s]      = 0;
+                L.pinned[s]         = 0;
+            }
+            for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+                if (!uma_stream->streams((int) il, kind)) { continue; }
+                const size_t slab = model.uma_stream_slab_bytes((int) il, kind);
+                char * base = (char *) uma_stream->slot((int) il, kind)->data;
+                llama_uma_madvise_discard_anon(base + (size_t) target * slab, (size_t) (cur - target) * slab);
+            }
+        }
+    } else {
+        // GROW slots [cur, target): re-warm from the freq ranking (highest-ranked
+        // not-yet-resident experts), preading -> re-faulting the pages.
+        for (uint32_t il = 0; il < n_layer; il++) {
+            if (!uma_stream->streams_layer((int) il)) { continue; }
+            llama_uma_stream_layer_lru & L = uma_stream->lru[il];
+            int32_t * tbl = uma_stream->expert_table((int) il) ? (int32_t *) uma_stream->expert_table((int) il)->data : nullptr;
+            const std::vector<int32_t> & rank = uma_stream->ranked[il];
+            uint32_t s  = cur;
+            size_t   ri = 0;
+            while (s < target && ri < rank.size()) {
+                const int32_t e = rank[ri++];
+                if (e < 0 || (uint32_t) e >= uma_stream->n_expert || L.slot_of_expert[e] >= 0) {
+                    continue; // already resident (or invalid)
+                }
+                bool ok = true;
+                for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+                    if (!uma_stream->streams((int) il, kind)) { continue; }
+                    const size_t slab = model.uma_stream_slab_bytes((int) il, kind);
+                    char * base = (char *) uma_stream->slot((int) il, kind)->data;
+                    if (!model.uma_stream_pread_expert((int) il, kind, (int) e, base + (size_t) s * slab)) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (!ok) {
+                    L.expert_in_slot[s] = -1; // leave empty on I/O failure; a later admit refills
+                    continue;
+                }
+                L.expert_in_slot[s] = e;
+                L.slot_of_expert[e] = (int32_t) s;
+                L.last_used[s]      = L.tick++;
+                L.pin_protected[s]  = 0;
+                if (tbl) { tbl[e] = (int32_t) s; } // publish AFTER the pread
+                s++;
+            }
+        }
+    }
+
+    uma_stream->n_slots_active = target;
+    uma_stream->n_resizes++;
+    if (uma_stream->s_min_active == 0 || target < uma_stream->s_min_active) { uma_stream->s_min_active = target; }
+    if (target > uma_stream->s_max_active) { uma_stream->s_max_active = target; }
+    const size_t foot_after = llama_uma_phys_footprint_mib();
+    fprintf(stderr, "uma: resize S %u -> %u: phys_footprint %zu -> %zu MiB, avail %zu MiB\n",
+            cur, target, foot_before, foot_after, llama_uma_avail_reclaim_mib());
+}
+
+// uma-moe fork M6: rate-limited controller tick (decode-only, post-sync). Advances
+// the decode-token clock, then resolves a target S from the commanded schedule
+// (SCHED, fires at its exact token points) or the closed-loop budget signal (CTRL,
+// polled every period tokens) and calls uma_stream_resize().
+void llama_context::uma_stream_controller_tick() {
+    uma_resize_dtoken++;
+    while (uma_resize_sched_i < uma_resize_sched.size() &&
+           uma_resize_sched[uma_resize_sched_i].first <= uma_resize_dtoken) {
+        const int32_t target = uma_resize_sched[uma_resize_sched_i].second;
+        uma_resize_sched_i++;
+        uma_stream_resize((uint32_t) (target < 0 ? 0 : target));
+    }
+    if (uma_resize_lowmib <= 0) {
+        return; // CTRL off (SCHED-only or armed-idle)
+    }
+    if (++uma_resize_tick < uma_resize_period) {
+        return;
+    }
+    uma_resize_tick = 0;
+    const size_t   avail = llama_uma_avail_reclaim_mib();
+    const uint32_t cur   = uma_stream->n_slots_active;
+    const uint32_t step  = (uint32_t) (uma_resize_step > 0 ? uma_resize_step : 1);
+    if ((int32_t) avail < uma_resize_lowmib && cur > (uint32_t) uma_resize_smin) {
+        uma_stream_resize(cur > step ? cur - step : 0); // pressure: shed toward the knee
+    } else if (uma_resize_highmib > 0 && (int32_t) avail > uma_resize_highmib && cur < uma_stream->n_slots) {
+        uma_stream_resize(cur + step); // eased: grow toward S_max
+    }
 }
 
 void llama_context::uma_stream_setup() {
@@ -3143,6 +3287,8 @@ void llama_context::uma_stream_setup() {
         uma_stream = std::make_unique<llama_uma_stream_state>();
         uma_stream->model    = &model;
         uma_stream->n_slots  = n_slots;
+        uma_stream->n_slots_active = n_slots; // M6: start at S_max (warm-start seeds the full window)
+        uma_stream->s_max_active   = n_slots;
         uma_stream->n_expert = n_expert;
         // decouple mode (Part 1): GPU-gather decode routing needs a static, warm-started
         // resident set (the slots do not change during decode), so HOTFREQ is required.
@@ -3160,6 +3306,7 @@ void llama_context::uma_stream_setup() {
         uma_stream->lru.assign((size_t) n_layer, {});
         uma_stream->slot_of_expert.assign((size_t) n_layer, nullptr);
         uma_stream->topk.assign((size_t) n_layer, nullptr);
+        uma_stream->ranked.assign((size_t) n_layer, {}); // M6: per-layer freq ranking for eager grow
 
         // one extra tensor per streaming layer for the decouple expert->slot table
         const size_t n_slabs_max = (size_t) k * (LLAMA_UMA_STREAM_N_KIND + 1);
@@ -3278,6 +3425,57 @@ void llama_context::uma_stream_setup() {
         // seed the hot working set into the (now sole) resident slots + pin, preading
         // from the dup'd fd (the free above does not close it).
         uma_stream_warm_start(uma_stream.get(), model);
+
+        // M6 give-back controller config (parsed once). Armed by LLAMA_UMA_STREAM_SMIN
+        // (the knee = a hard floor). Requires DECOUPLE (the GPU-gather routing that makes
+        // the active window respected). Drivers: SCHED = commanded (tok:S,...); CTRL via
+        // LOWMIB/HIGHMIB watermarks on the M4 avail signal, STEP slots per move.
+        if (const char * env_smin = getenv("LLAMA_UMA_STREAM_SMIN")) {
+            if (!uma_stream->decouple) {
+                throw std::runtime_error("uma stream: LLAMA_UMA_STREAM_SMIN (M6 resize) requires DECOUPLE/ADAPT");
+            }
+            char * end = nullptr;
+            const long smin = strtol(env_smin, &end, 10);
+            if (end == env_smin || *end != '\0' || smin < (long) n_expert_used || smin > (long) n_slots) {
+                throw std::runtime_error(format("invalid LLAMA_UMA_STREAM_SMIN '%s' (want %u..%u)", env_smin, n_expert_used, n_slots));
+            }
+            uma_resize_smin = (int32_t) smin;
+        }
+        if (const char * env_p = getenv("LLAMA_UMA_STREAM_RESIZE_PERIOD")) {
+            const long p = strtol(env_p, nullptr, 10);
+            if (p > 0) { uma_resize_period = (int32_t) p; }
+        }
+        if (const char * env_sched = getenv("LLAMA_UMA_STREAM_SCHED")) {
+            const char * p = env_sched; // "tok:S,tok:S,..."
+            while (*p) {
+                char * e1 = nullptr;
+                char * e2 = nullptr;
+                const long tok = strtol(p, &e1, 10);
+                if (e1 == p || *e1 != ':') { break; }
+                const long s = strtol(e1 + 1, &e2, 10);
+                if (e2 == e1 + 1) { break; }
+                uma_resize_sched.emplace_back((int64_t) tok, (int32_t) s);
+                p = (*e2 == ',') ? e2 + 1 : e2;
+            }
+            std::sort(uma_resize_sched.begin(), uma_resize_sched.end());
+        }
+        if (const char * env_lo = getenv("LLAMA_UMA_STREAM_LOWMIB")) {
+            uma_resize_lowmib = (int32_t) strtol(env_lo, nullptr, 10);
+        }
+        if (const char * env_hi = getenv("LLAMA_UMA_STREAM_HIGHMIB")) {
+            uma_resize_highmib = (int32_t) strtol(env_hi, nullptr, 10);
+        }
+        if (const char * env_step = getenv("LLAMA_UMA_STREAM_STEP")) {
+            const long st = strtol(env_step, nullptr, 10);
+            if (st > 0) { uma_resize_step = (int32_t) st; }
+        }
+        if (uma_resize_smin >= 0) {
+            fprintf(stderr, "uma: M6 controller armed: S in [%d,%u], period %d tok, sched=%zu pts, CTRL lo/hi=%d/%d MiB step %d\n",
+                    uma_resize_smin, n_slots, uma_resize_period, uma_resize_sched.size(),
+                    uma_resize_lowmib, uma_resize_highmib, uma_resize_step);
+        } else if (!uma_resize_sched.empty() || uma_resize_lowmib > 0) {
+            fprintf(stderr, "uma: WARNING M6 driver (SCHED/CTRL) set but LLAMA_UMA_STREAM_SMIN unset; controller disabled\n");
+        }
     }
 
     // register the slot bufts on the CURRENT sched (re-run on every sched (re)creation)

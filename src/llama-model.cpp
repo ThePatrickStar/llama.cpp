@@ -54,8 +54,26 @@ size_t llama_uma_phys_footprint_mib() {
     }
     return (size_t) (v.phys_footprint / (1024 * 1024));
 }
+// M6 controller: the M4 reclaimable-available signal, read in-process. Same
+// formula as scripts/mem_sensor.c (purgeable EXCLUDED - it overlaps active/
+// inactive). Allocation-free: stack struct + one syscall.
+size_t llama_uma_avail_reclaim_mib() {
+    host_t host = mach_host_self();
+    vm_size_t page = 0;
+    if (host_page_size(host, &page) != KERN_SUCCESS || page == 0) {
+        page = 16384;
+    }
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(host, HOST_VM_INFO64, (host_info64_t) &vm, &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    const uint64_t pages = (uint64_t) vm.free_count + vm.inactive_count + vm.speculative_count;
+    return (size_t) (pages * (uint64_t) page / (1024 * 1024));
+}
 #else
 size_t llama_uma_phys_footprint_mib() { return 0; }
+size_t llama_uma_avail_reclaim_mib() { return 0; }
 #endif
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {

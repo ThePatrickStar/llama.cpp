@@ -26,6 +26,12 @@ struct llama_uma_stream_state;
 // llama-model.cpp; read at context teardown for the supply-curve steady state.
 size_t llama_uma_phys_footprint_mib();
 
+// M6 controller: reclaimable-available system memory in MiB = (free+inactive+
+// speculative)*page via host_statistics64 (Darwin, 0 elsewhere). Allocation-free.
+// The M4 budget signal, read in-process by the give-back controller. Mirrors
+// scripts/mem_sensor.c. Defined in llama-model.cpp.
+size_t llama_uma_avail_reclaim_mib();
+
 // per-(layer, kind) fill op userdata; context-persistent, stable address
 struct llama_uma_stream_fill_ud {
     llama_uma_stream_state * state = nullptr;
@@ -57,12 +63,22 @@ struct llama_uma_stream_layer_lru {
 
 struct llama_uma_stream_state {
     const llama_model * model = nullptr;
-    uint32_t n_slots      = 0;  // S (slots per layer,kind); == n_expert => no compression
+    uint32_t n_slots      = 0;  // S_max: allocated slots per (layer,kind); tensor ne[2]. Fixed.
+    uint32_t n_slots_active = 0; // M6: current resident window [0,n_slots_active). <= n_slots.
     uint32_t n_expert     = 0;
     uint64_t n_miss       = 0;  // expert preads (slot misses) over the context lifetime
     uint64_t n_read       = 0;  // total expert-reads (admits) over the context lifetime
     bool     decouple     = false; // LLAMA_UMA_STREAM_DECOUPLE: GPU-gather decode routing (Part 1)
     bool     adapt        = false; // LLAMA_UMA_STREAM_ADAPT: online resident-set maintenance (Part 2 Step 3)
+
+    // M6 give-back controller telemetry + eager-grow support
+    uint64_t n_resizes    = 0;  // runtime S-resize events over the context lifetime
+    uint64_t n_distress   = 0;  // times a shed target below the knee was clamped (M7 signal)
+    uint32_t s_min_active = 0;  // smallest n_slots_active reached (0 = unset)
+    uint32_t s_max_active = 0;  // largest n_slots_active reached
+    // per-streaming-layer expert ids ranked hottest-first (from the warm-start freq
+    // dump); grow re-warms newly-active slots from this ranking. ranked[il] size n_expert.
+    std::vector<std::vector<int32_t>> ranked;
 
     // index = il*3 + kind. slots[i]==nullptr means (il,kind) is not streaming.
     std::vector<ggml_tensor *>                slots;

@@ -419,6 +419,26 @@ private:
     void uma_stream_setup();
     std::unique_ptr<llama_uma_stream_state> uma_stream;
 
+    // uma-moe fork M6 (give-back controller): elastic runtime resize of the
+    // stream slot window n_slots_active in [smin, n_slots], driven decode-only
+    // from the post-sync GPU-idle window. Shed = clear the LRU/table entries of
+    // the shed slots then MADV_FREE_REUSABLE their pages (drops phys_footprint);
+    // grow = re-warm the re-activated slots from the freq ranking. smin is the
+    // knee: a hard SLO floor, never crossed while serving (below it => distress).
+    int32_t uma_resize_smin    = -1;   // knee floor; -1 = controller off
+    int32_t uma_resize_period  = 32;   // decode tokens between controller ticks
+    int32_t uma_resize_tick    = 0;    // decode-token counter for the rate limit
+    int64_t uma_resize_dtoken  = 0;    // monotonic decode-token counter (SCHED clock)
+    // commanded schedule: (decode_token -> target S), sorted ascending by token.
+    std::vector<std::pair<int64_t, int32_t>> uma_resize_sched;
+    size_t  uma_resize_sched_i = 0;
+    // closed-loop (CTRL) watermarks in MiB + step; low <= 0 => CTRL off.
+    int32_t uma_resize_lowmib  = 0;    // avail below this => shed one step
+    int32_t uma_resize_highmib = 0;    // avail above this => grow one step
+    int32_t uma_resize_step    = 16;   // slots per shed/grow step (CTRL)
+    void uma_stream_resize(uint32_t s_new);   // shed/grow to s_new (clamped)
+    void uma_stream_controller_tick();        // rate-limited decode-only driver
+
     std::set<ggml_backend_buffer_type_t> uma_bufts_logged;
 
     // perf
