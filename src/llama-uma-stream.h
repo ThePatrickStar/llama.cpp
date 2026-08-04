@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <sys/mman.h>
 #include <vector>
 
 struct llama_model;
@@ -63,8 +64,10 @@ struct llama_uma_stream_layer_lru {
 
 struct llama_uma_stream_state {
     const llama_model * model = nullptr;
-    uint32_t n_slots      = 0;  // S_max: allocated slots per (layer,kind); tensor ne[2]. Fixed.
-    uint32_t n_slots_active = 0; // M6: current resident window [0,n_slots_active). <= n_slots.
+    uint32_t n_slots      = 0;  // S ceiling: max slots per (layer,kind) the controller grows to.
+    uint32_t n_slots_active = 0; // M6: current resident slots. The slot BUFFER is this size and is
+                                 // REALLOCATED on resize (a live Metal buffer pins its pages, so an
+                                 // in-place madvise cannot shed phys_footprint - only release does).
     uint32_t n_expert     = 0;
     uint64_t n_miss       = 0;  // expert preads (slot misses) over the context lifetime
     uint64_t n_read       = 0;  // total expert-reads (admits) over the context lifetime
@@ -97,13 +100,28 @@ struct llama_uma_stream_state {
 
     // context-lifetime resources. The Metal wraps only view host_bases (noCopy),
     // so they are released BEFORE the pages are freed; meta_ctx holds only tensor
-    // structs (no data) and can go last.
+    // structs (no data) and can go last. wraps/host_bases hold the FIXED table
+    // buffers; the resizable slot buffers live in slot_buf/slot_host (per il*3+kind).
     ggml_context_ptr                     meta_ctx;
     std::vector<ggml_backend_buffer_ptr> wraps;
     std::vector<void *>                  host_bases;
 
+    // M6: per-(il,kind) resizable slot buffers. mmap'd (not posix_memalign) so a
+    // resize's munmap returns pages to the OS UNCONDITIONALLY - no malloc large-cache
+    // retention, no reusable-page under-charge - giving a clean phys_footprint.
+    std::vector<ggml_backend_buffer_ptr> slot_buf;   // release before slot_host is unmapped
+    std::vector<void *>                  slot_host;
+    std::vector<size_t>                  slot_alloc;  // mmap length per (il,kind), for munmap
+    uint32_t pin_h = 0;   // warm-start hot-pin count; reseed reuses it, clamped to the new S
+
     ~llama_uma_stream_state() {
-        wraps.clear();
+        slot_buf.clear();  // release resizable slot Metal buffers before their hosts
+        wraps.clear();     // release the fixed table Metal buffers
+        for (size_t i = 0; i < slot_host.size(); i++) {
+            if (slot_host[i]) {
+                munmap(slot_host[i], slot_alloc[i]);
+            }
+        }
         for (void * p : host_bases) {
             free(p);
         }

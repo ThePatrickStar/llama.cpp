@@ -436,7 +436,14 @@ private:
     int32_t uma_resize_lowmib  = 0;    // avail below this => shed one step
     int32_t uma_resize_highmib = 0;    // avail above this => grow one step
     int32_t uma_resize_step    = 16;   // slots per shed/grow step (CTRL)
-    void uma_stream_resize(uint32_t s_new);   // shed/grow to s_new (clamped)
+    // resize reallocates the slot buffers, so it needs the GPU device + no-rset wrap
+    // entry (resolved once in setup) and forces one graph rebuild afterwards (the
+    // reused graph would reference the freed slot tensors).
+    ggml_backend_dev_t uma_stream_gpu_dev = nullptr;
+    void *  uma_stream_wrap_fn        = nullptr; // buffer_mapped_norset_t, cast in the .cpp
+    bool    uma_stream_force_rebuild  = false;   // set by resize; consumed in process_ubatch
+    void uma_stream_resize(uint32_t s_new);   // free+realloc the slot buffers to s_new (clamped)
+    void uma_stream_reseed_resident(uint32_t s_new); // reseed [0,s_new) from the freq ranking
     void uma_stream_controller_tick();        // rate-limited decode-only driver
 
     std::set<ggml_backend_buffer_type_t> uma_bufts_logged;
