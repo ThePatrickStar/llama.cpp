@@ -413,8 +413,11 @@ bool llama_uma_inject_load_overrides(const char * path_model, llama_model_params
         if (params.load_mode == LLAMA_LOAD_MODE_MMAP || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
             params.load_mode = params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ? LLAMA_LOAD_MODE_MLOCK : LLAMA_LOAD_MODE_NONE;
         }
-        fprintf(stderr, "uma: stream K=%ld: front-layer experts -> CPU buffer (freeable) + load-mode %s\n",
-                k, llama_load_mode_name(params.load_mode));
+        const char * lz = getenv("LLAMA_UMA_STREAM_LAZYLOAD");
+        const bool lazy = lz != nullptr && lz[0] != '\0' && lz[0] != '0';
+        fprintf(stderr, "uma: stream K=%ld: front-layer experts -> CPU buffer (freeable) + load-mode %s%s\n",
+                k, llama_load_mode_name(params.load_mode),
+                lazy ? " + LAZYLOAD (experts not read into RAM; slot pool is the sole copy - load transient ~= slot-pool size)" : "");
         return true;
     }
 

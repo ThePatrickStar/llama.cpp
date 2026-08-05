@@ -10,6 +10,7 @@
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <regex>
@@ -1399,6 +1400,55 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     }
 }
 
+// uma-moe fork Fix #2: lazy streaming load. With LLAMA_UMA_STREAM_LAZYLOAD=1 (and
+// LLAMA_UMA_STREAM_K set) the front-K layers' expert WEIGHTS are not read into RAM
+// at load - the context's slot pool (preading only the S resident experts/layer
+// from the fd) is the sole resident copy. The ~18 GB load transient collapses to
+// ~the slot-pool size, so two large MoE co-fit the 36 GB Mac (and loads are faster
+// on every platform). Default (flag unset) leaves the load path byte-identical.
+static bool uma_stream_lazyload_k(long & k_out) {
+    const char * lz = getenv("LLAMA_UMA_STREAM_LAZYLOAD");
+    if (lz == nullptr || lz[0] == '\0' || lz[0] == '0') {
+        return false;
+    }
+    const char * k = getenv("LLAMA_UMA_STREAM_K");
+    if (k == nullptr || k[0] == '\0') {
+        return false;
+    }
+    char * end = nullptr;
+    const long kk = strtol(k, &end, 10);
+    if (end == k || *end != '\0' || kk <= 0) {
+        return false;
+    }
+    k_out = kk;
+    return true;
+}
+
+// true if `name` is a front-K streamed expert WEIGHT tensor - exactly the set
+// uma_stream_build_manifest streams (kinds gate/up/down over layer.ffn_*_exps), so
+// skipping its read is safe: build_moe_ffn routes the matmul through the slot pool,
+// never this tensor. Deliberately excludes biases (.bias), scales (.scale), the
+// merged gate_up_exps (out of streaming scope) and channel _chexps variants - those
+// stay in the graph and must load.
+static bool uma_stream_is_lazy_expert(const char * name, long k) {
+    if (strncmp(name, "blk.", 4) != 0) {
+        return false;
+    }
+    char * end = nullptr;
+    const long il = strtol(name + 4, &end, 10);
+    if (end == name + 4 || *end != '.' || il < 0 || il >= k) {
+        return false;
+    }
+    const char * rest = end; // ".ffn_..."
+    const size_t len = strlen(rest);
+    if (len < 7 || strcmp(rest + len - 7, ".weight") != 0) {
+        return false; // biases/scales keep loading
+    }
+    return strstr(rest, ".ffn_up_exps.")   != nullptr
+        || strstr(rest, ".ffn_down_exps.") != nullptr
+        || strstr(rest, ".ffn_gate_exps.") != nullptr;
+}
+
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         llama_buf_map & bufs,
@@ -1514,6 +1564,11 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+    long   lazy_k = 0;
+    const bool lazy = uma_stream_lazyload_k(lazy_k);
+    size_t n_lazy_skipped     = 0;
+    size_t bytes_lazy_skipped = 0;
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1561,12 +1616,20 @@ bool llama_model_loader::load_all_data(
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
-                file->seek(weight->offs, SEEK_SET);
-                file->read_raw(cur->data, n_size);
-                if (check_tensors) {
-                    validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
-                        return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
-                    }));
+                if (lazy && uma_stream_is_lazy_expert(ggml_get_name(cur), lazy_k)) {
+                    // Fix #2: skip the read. The slot pool (preaded from the fd in
+                    // uma_stream_setup) is the sole resident copy, so this buffer
+                    // region stays untouched -> 0 resident: the ~18 GB transient is gone.
+                    n_lazy_skipped++;
+                    bytes_lazy_skipped += n_size;
+                } else {
+                    file->seek(weight->offs, SEEK_SET);
+                    file->read_raw(cur->data, n_size);
+                    if (check_tensors) {
+                        validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
+                            return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
+                        }));
+                    }
                 }
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
@@ -1635,6 +1698,11 @@ bool llama_model_loader::load_all_data(
         }
 
         size_done += n_size;
+    }
+
+    if (n_lazy_skipped > 0) {
+        LLAMA_LOG_INFO("%s: uma stream lazy-load: skipped %zu expert-weight reads (%.1f MiB left unread / 0 resident; slot pool is the sole copy)\n",
+                __func__, n_lazy_skipped, bytes_lazy_skipped / 1024.0 / 1024.0);
     }
 
     // free temporary resources used for async uploads

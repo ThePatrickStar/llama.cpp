@@ -701,6 +701,10 @@ struct llama_model {
     // the retained GGUF mmap. Validates the S1.0 offset formula + the dup fd
     // end-to-end. Skipped (returns true) when no mmap is retained (-lm none).
     bool uma_stream_selfcheck() const;
+    // Fix #2 lazy variant: the streamed experts were never read into RAM, so there
+    // is no in-process reference. Validate the dup-fd pread against an INDEPENDENT
+    // read via the loader's own llama_file (same strength as the loaded-tensor check).
+    bool uma_stream_selfcheck_lazy(const struct llama_model_loader & ml) const;
 
     // uma-moe fork M5 S1.1.3: after the context builds its resident slot pool,
     // discard the streamed-layer experts' resident (anonymous CPU) pages via

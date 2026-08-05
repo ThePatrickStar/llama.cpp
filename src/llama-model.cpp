@@ -1942,6 +1942,58 @@ bool llama_model::uma_stream_selfcheck() const {
     return true;
 }
 
+bool llama_model::uma_stream_selfcheck_lazy(const struct llama_model_loader & ml) const {
+    // Fix #2: lazy load skipped the streamed expert reads, so neither a mmap nor a
+    // loaded tensor is available as a reference. Read the reference INDEPENDENTLY via
+    // the loader's own llama_file (a distinct fd + code path from the dup-fd pread) and
+    // compare - catches a wrong offs/file_idx/fd or a pread offset-math bug, same
+    // 0/mid/last sampling as uma_stream_selfcheck().
+    std::vector<char> buf, ref;
+    bool     checked_stride = false;
+    uint32_t n_checked      = 0;
+    for (size_t idx = 0; idx < pimpl->uma_stream_slabs.size(); idx++) {
+        const auto & slab = pimpl->uma_stream_slabs[idx];
+        if (!slab.valid) {
+            continue;
+        }
+        const int il   = (int) (idx / LLAMA_UMA_STREAM_N_KIND);
+        const int kind = (int) (idx % LLAMA_UMA_STREAM_N_KIND);
+        if (slab.file_idx >= ml.files.size()) {
+            fprintf(stderr, "uma: stream self-check (lazy): bad file_idx %u (il=%d kind=%d)\n", slab.file_idx, il, kind);
+            return false;
+        }
+        const auto & file = ml.files[slab.file_idx];
+        const size_t fsize = file->size();
+        std::vector<int> experts = { (int) (slab.n_expert / 2) };
+        if (!checked_stride) {
+            experts = { 0, (int) (slab.n_expert / 2), (int) (slab.n_expert - 1) };
+            checked_stride = true;
+        }
+        buf.resize(slab.slab_bytes);
+        ref.resize(slab.slab_bytes);
+        for (const int e : experts) {
+            const size_t off = slab.offs + (size_t) e * slab.slab_bytes;
+            if (off + slab.slab_bytes > fsize) {
+                continue;
+            }
+            file->seek(off, SEEK_SET);
+            file->read_raw(ref.data(), slab.slab_bytes);
+            if (!uma_stream_pread_expert(il, kind, e, buf.data())) {
+                fprintf(stderr, "uma: stream self-check (lazy): pread failed (il=%d kind=%d e=%d)\n", il, kind, e);
+                return false;
+            }
+            if (memcmp(buf.data(), ref.data(), slab.slab_bytes) != 0) {
+                fprintf(stderr, "uma: stream self-check (lazy): MISMATCH pread vs loader read (il=%d kind=%d e=%d, %zu bytes)\n",
+                        il, kind, e, slab.slab_bytes);
+                return false;
+            }
+            n_checked++;
+        }
+    }
+    fprintf(stderr, "uma: stream self-check (lazy) PASS (%u sample slabs, pread == loader read)\n", n_checked);
+    return true;
+}
+
 size_t llama_model::uma_stream_free_excluded() const {
     const size_t foot_before = llama_uma_phys_footprint_mib();
     size_t freed = 0;
@@ -2030,11 +2082,13 @@ void llama_model::uma_stream_build_manifest(const struct llama_model_loader & ml
         }
     }
 
-    fprintf(stderr, "uma: stream manifest built: layers [0,%u), %u expert slabs, %zu source file(s)\n",
-            pimpl->uma_stream_k_val, n_slabs, ml.files.size());
+    const char * lz = getenv("LLAMA_UMA_STREAM_LAZYLOAD");
+    const bool lazy = lz != nullptr && lz[0] != '\0' && lz[0] != '0';
+    fprintf(stderr, "uma: stream manifest built: layers [0,%u), %u expert slabs, %zu source file(s)%s\n",
+            pimpl->uma_stream_k_val, n_slabs, ml.files.size(), lazy ? " (lazy-load: experts never read into RAM)" : "");
 
-    if (!uma_stream_selfcheck()) {
-        throw std::runtime_error("uma stream: self-check FAILED - pread bytes differ from the GGUF mmap (offset formula or fd wrong)");
+    if (lazy ? !uma_stream_selfcheck_lazy(ml) : !uma_stream_selfcheck()) {
+        throw std::runtime_error("uma stream: self-check FAILED - pread bytes differ from the reference (offset formula or fd wrong)");
     }
 }
 

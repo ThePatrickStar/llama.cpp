@@ -3602,7 +3602,16 @@ void llama_context::uma_stream_setup() {
         // warm-fill faults slot pages in) so the ~18 GB expert transient and the slot
         // pages are never both resident - large-S all-layers safety. Cold experts
         // stream from the fd on a miss (the footprint give-back).
-        model.uma_stream_free_excluded();
+        // Fix #2: under LLAMA_UMA_STREAM_LAZYLOAD the loader never read the experts,
+        // so there is nothing resident to free - skip the no-op madvise (its report
+        // would misleadingly count untouched virtual pages as "discarded").
+        const char * lz = getenv("LLAMA_UMA_STREAM_LAZYLOAD");
+        const bool lazy = lz != nullptr && lz[0] != '\0' && lz[0] != '0';
+        if (lazy) {
+            fprintf(stderr, "uma: stream lazy-load: streamed experts were never resident; slot pool is the sole copy\n");
+        } else {
+            model.uma_stream_free_excluded();
+        }
 
         // seed the hot working set into the (now sole) resident slots + pin, preading
         // from the dup'd fd (the free above does not close it).
