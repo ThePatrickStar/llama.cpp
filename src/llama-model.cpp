@@ -71,6 +71,44 @@ size_t llama_uma_avail_reclaim_mib() {
     const uint64_t pages = (uint64_t) vm.free_count + vm.inactive_count + vm.speculative_count;
     return (size_t) (pages * (uint64_t) page / (1024 * 1024));
 }
+#elif defined(__linux__)
+// uma-moe fork M7.0 (CUDA/Spark port): the Linux counterparts of the M4/M5 memory
+// signals. phys_footprint -> VmRSS (pinned host slot pages show in RSS; cudaFreeHost on
+// resize drops them, as munmap does on Metal). avail_reclaim -> /proc/meminfo MemAvailable
+// (the kernel's own reclaimable-inclusive number; mirrors scripts/mem_sensor_linux.py).
+#include <cstdio>
+#include <cstring>
+static size_t uma_read_meminfo_kib(const char * key) {
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (!f) { return 0; }
+    char line[256]; size_t val = 0; const size_t klen = strlen(key);
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, key, klen) == 0) {
+            unsigned long long kb = 0;
+            if (sscanf(line + klen, " %llu kB", &kb) == 1) { val = (size_t) kb; }
+            break;
+        }
+    }
+    fclose(f);
+    return val;
+}
+size_t llama_uma_phys_footprint_mib() {
+    FILE * f = fopen("/proc/self/status", "r");
+    if (!f) { return 0; }
+    char line[256]; size_t rss_kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "VmRSS:", 6) == 0) {
+            unsigned long long kb = 0;
+            if (sscanf(line + 6, " %llu kB", &kb) == 1) { rss_kb = (size_t) kb; }
+            break;
+        }
+    }
+    fclose(f);
+    return rss_kb / 1024;
+}
+size_t llama_uma_avail_reclaim_mib() {
+    return uma_read_meminfo_kib("MemAvailable:") / 1024;
+}
 #else
 size_t llama_uma_phys_footprint_mib() { return 0; }
 size_t llama_uma_avail_reclaim_mib() { return 0; }
