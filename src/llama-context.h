@@ -449,6 +449,14 @@ private:
     ggml_backend_dev_t uma_stream_gpu_dev = nullptr;
     void *  uma_stream_wrap_fn        = nullptr; // buffer_mapped_norset_t, cast in the .cpp
     bool    uma_stream_force_rebuild  = false;   // set by resize; consumed in process_ubatch
+    // M7.0 (CUDA/Spark port): the slot pool is Metal (no-rset wrap over mmap) OR CUDA (the
+    // pinned host buffer type the GPU reads in place - Task C precedent). Picked once in setup.
+    bool    uma_stream_use_cuda_host  = false;
+    ggml_backend_buffer_type_t uma_stream_cuda_host_buft = nullptr;
+    // allocate/free ONE GPU-readable host slot buffer of `bytes`, dispatching Metal vs CUDA.
+    // out_alloc = mmap length (Metal, munmap on free) or 0 (CUDA, the buffer owns the host).
+    bool uma_stream_alloc_slot_buf(size_t bytes, ggml_backend_buffer_t * out_buf, void ** out_host, size_t * out_alloc);
+    void uma_stream_free_slot_buf(size_t i);
     void uma_stream_resize(uint32_t s_new);   // free+realloc the slot buffers to s_new (clamped)
     bool uma_stream_try_alloc_slots(uint32_t s_new); // (re)allocate all slot buffers at s_new; rolls back its partial allocations and returns false on OOM (precondition: slots freed)
     void uma_stream_reseed_resident(uint32_t s_new); // reseed [0,s_new) from the freq ranking

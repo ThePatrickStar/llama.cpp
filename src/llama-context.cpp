@@ -3166,8 +3166,55 @@ void llama_context::uma_stream_reseed_resident(uint32_t s_new) {
 // set from the freq ranking, and forces one graph rebuild (the reused decode graph
 // references the old, freed slot tensors). Runs decode-only in the post-sync GPU-idle
 // window. Frees-before-allocs so the peak footprint is max(old, new), never the sum.
+// M7.0: allocate ONE GPU-readable host slot buffer of `bytes`, dispatching by platform.
+// Metal: mmap(MAP_ANON) + the no-rset wrap (GPU reads in place, unwired/reclaimable),
+// out_alloc = page-aligned mmap length (munmap on free). CUDA/Spark: the pinned host buffer
+// type the GPU reads in place (cudaHostAlloc under the hood, UVA; the Task-C precedent -
+// host-pinned expert weights read in place on GB10, results/m2-spark.md), out_alloc = 0
+// (the ggml buffer owns the host memory; cudaFreeHost runs on reset). Both mark WEIGHTS so
+// the sched allows the GPU to read the slots in place (allow_weights_buft, registered below).
+bool llama_context::uma_stream_alloc_slot_buf(size_t bytes, ggml_backend_buffer_t * out_buf,
+                                              void ** out_host, size_t * out_alloc) {
+    *out_buf = nullptr; *out_host = nullptr; *out_alloc = 0;
+    if (uma_stream_use_cuda_host) {
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(uma_stream_cuda_host_buft, bytes);
+        if (buf == nullptr) { return false; }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        *out_buf   = buf;
+        *out_host  = ggml_backend_buffer_get_base(buf);
+        *out_alloc = 0; // buffer-owned host memory (freed via reset); no munmap
+        return true;
+    }
+    typedef ggml_backend_buffer_t (*wrap_fn_t)(ggml_backend_dev_t, void *, size_t, size_t);
+    const wrap_fn_t wrap_fn = (wrap_fn_t) uma_stream_wrap_fn;
+    const size_t page  = 16384;
+    const size_t alloc = ((bytes + page - 1) / page) * page;
+    void * host = mmap(nullptr, alloc, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (host == MAP_FAILED) { return false; }
+    ggml_backend_buffer_t wrap = wrap_fn(uma_stream_gpu_dev, host, alloc, bytes);
+    if (wrap == nullptr) { munmap(host, alloc); return false; }
+    ggml_backend_buffer_set_usage(wrap, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    *out_buf   = wrap;
+    *out_host  = host;
+    *out_alloc = alloc;
+    return true;
+}
+
+// M7.0: free ONE slot buffer (dispatch). Release the buffer FIRST (Metal: unwire the wrap
+// while it still views the host; CUDA: cudaFreeHost the owned host), then munmap the mmap'd
+// host on Metal (alloc > 0). A CUDA buffer owns its host (alloc == 0) -> no munmap.
+void llama_context::uma_stream_free_slot_buf(size_t i) {
+    uma_stream->slot_buf[i].reset();
+    if (uma_stream->slot_host[i] && uma_stream->slot_alloc[i] > 0) {
+        munmap(uma_stream->slot_host[i], uma_stream->slot_alloc[i]);
+    }
+    uma_stream->slot_host[i]  = nullptr;
+    uma_stream->slot_alloc[i] = 0;
+}
+
 void llama_context::uma_stream_resize(uint32_t s_new) {
-    if (!uma_stream || !uma_stream->decouple || uma_stream_wrap_fn == nullptr) {
+    if (!uma_stream || !uma_stream->decouple ||
+        (uma_stream_wrap_fn == nullptr && !uma_stream_use_cuda_host)) {
         return;
     }
     const uint32_t smax = uma_stream->n_slots;
@@ -3189,20 +3236,14 @@ void llama_context::uma_stream_resize(uint32_t s_new) {
     const int64_t  t0_us       = ggml_time_us();
     const uint32_t n_layer     = model.hparams.n_layer();
 
-    // 1. free ALL slot buffers first (releases the Metal wraps that pin the pages, then
-    //    munmap returns the pages to the OS), dropping phys_footprint to the non-expert
-    //    baseline before any new alloc. Release the wrap BEFORE munmap (Metal still
-    //    views the pages until then).
+    // 1. free ALL slot buffers first (Metal: release wrap + munmap -> pages to the OS;
+    //    CUDA: cudaFreeHost the pinned host), dropping phys_footprint/VmRSS to the non-expert
+    //    baseline before any new alloc.
     for (uint32_t il = 0; il < n_layer; il++) {
         for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
             const size_t i = (size_t) il * LLAMA_UMA_STREAM_N_KIND + kind;
             if (uma_stream->slots[i] == nullptr) { continue; }
-            uma_stream->slot_buf[i].reset();          // release Metal buffer (unpin)
-            if (uma_stream->slot_host[i]) {
-                munmap(uma_stream->slot_host[i], uma_stream->slot_alloc[i]);
-                uma_stream->slot_host[i]  = nullptr;
-                uma_stream->slot_alloc[i] = 0;
-            }
+            uma_stream_free_slot_buf(i);
         }
     }
     // 2. reallocate every slot buffer at the new size, with an OOM fallback ladder so a
@@ -3243,21 +3284,9 @@ void llama_context::uma_stream_resize(uint32_t s_new) {
 // (slot_host == nullptr). Returns false + rolls back its own partial allocations on any
 // mmap/wrap failure, so the caller can retry at a smaller size (the OOM fallback ladder).
 bool llama_context::uma_stream_try_alloc_slots(uint32_t s_new) {
-    typedef ggml_backend_buffer_t (*wrap_fn_t)(ggml_backend_dev_t, void *, size_t, size_t);
-    const wrap_fn_t wrap_fn = (wrap_fn_t) uma_stream_wrap_fn;
-    const size_t    page    = 16384;
     const uint32_t  n_layer = model.hparams.n_layer();
     std::vector<size_t> done; // indices allocated in THIS call, for rollback
-    auto rollback = [&]() {
-        for (size_t i : done) {
-            uma_stream->slot_buf[i].reset();
-            if (uma_stream->slot_host[i]) {
-                munmap(uma_stream->slot_host[i], uma_stream->slot_alloc[i]);
-                uma_stream->slot_host[i]  = nullptr;
-                uma_stream->slot_alloc[i] = 0;
-            }
-        }
-    };
+    auto rollback = [&]() { for (size_t i : done) { uma_stream_free_slot_buf(i); } };
     for (uint32_t il = 0; il < n_layer; il++) {
         for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
             const size_t i = (size_t) il * LLAMA_UMA_STREAM_N_KIND + kind;
@@ -3265,26 +3294,18 @@ bool llama_context::uma_stream_try_alloc_slots(uint32_t s_new) {
             if (st == nullptr) { continue; }
             const size_t slab       = (size_t) st->nb[2];
             const size_t slot_bytes = (size_t) s_new * slab;
-            const size_t alloc      = ((slot_bytes + page - 1) / page) * page;
-            void * host = mmap(nullptr, alloc, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-            if (host == MAP_FAILED) {
+            ggml_backend_buffer_t buf; void * host; size_t alloc;
+            if (!uma_stream_alloc_slot_buf(slot_bytes, &buf, &host, &alloc)) {
                 rollback();
                 return false;
             }
-            ggml_backend_buffer_t wrap = wrap_fn(uma_stream_gpu_dev, host, alloc, slot_bytes);
-            if (wrap == nullptr) {
-                munmap(host, alloc);
-                rollback();
-                return false;
-            }
-            ggml_backend_buffer_set_usage(wrap, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             uma_stream->slot_host[i]  = host;
             uma_stream->slot_alloc[i] = alloc;
-            uma_stream->slot_buf[i].reset(wrap);
+            uma_stream->slot_buf[i].reset(buf);
             st->ne[2]  = (int64_t) s_new;   // shrink/grow the expert dim
             st->nb[3]  = st->nb[2] * (size_t) s_new;
             st->data   = host;
-            st->buffer = wrap;
+            st->buffer = buf;
             done.push_back(i);
         }
     }
@@ -3419,8 +3440,15 @@ void llama_context::uma_stream_setup() {
     typedef ggml_backend_buffer_t (*buffer_mapped_norset_t)(ggml_backend_dev_t, void *, size_t, size_t);
     buffer_mapped_norset_t wrap_fn = gpu_reg == nullptr ? nullptr :
         (buffer_mapped_norset_t) ggml_backend_reg_get_proc_address(gpu_reg, "ggml_backend_metal_device_buffer_mapped_norset");
+    // M7.0: Metal uses the no-rset wrap; CUDA/Spark uses the pinned host buffer type the GPU
+    // reads in place (the Task-C precedent, results/m2-spark.md; llama-uma.cpp:525 routes
+    // weights to exactly this buft). cudaFreeHost on resize drops VmRSS as munmap does on Metal.
     if (wrap_fn == nullptr) {
-        throw std::runtime_error("uma stream: no Metal no-rset wrap entry (S1.1.1 streaming is Metal-only)");
+        uma_stream_cuda_host_buft = ggml_backend_dev_host_buffer_type(gpu_dev);
+        if (uma_stream_cuda_host_buft == nullptr) {
+            throw std::runtime_error("uma stream: no Metal no-rset wrap AND no host buffer type (unsupported backend)");
+        }
+        uma_stream_use_cuda_host = true;
     }
     // M6: keep the device + wrap entry so a runtime resize can reallocate slot buffers
     uma_stream_gpu_dev = gpu_dev;
@@ -3480,25 +3508,17 @@ void llama_context::uma_stream_setup() {
                 // the slot buffer holds n_slots experts (not n_expert): the
                 // per-expert slab stride is src->nb[2], so S slots = S*nb[2]
                 const size_t slot_bytes = (size_t) n_slots * (size_t) src->nb[2];
-                const size_t alloc      = ((slot_bytes + page - 1) / page) * page;
-                void * host = mmap(nullptr, alloc, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-                if (host == MAP_FAILED) {
-                    throw std::runtime_error("uma stream: slot host mmap failed");
-                }
-                ggml_backend_buffer_t wrap = wrap_fn(gpu_dev, host, alloc, slot_bytes);
-                if (wrap == nullptr) {
-                    munmap(host, alloc);
-                    throw std::runtime_error(format("uma stream: Metal no-rset wrap failed for slot il=%u kind=%d", il, kind));
-                }
-                ggml_backend_buffer_set_usage(wrap, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-                // M6: own the slot host + wrap per (il,kind) so a resize can free +
-                // reallocate exactly this buffer. Owned immediately so any later throw
-                // releases them (dtor frees slot_buf before slot_host). wrap owns nothing
-                // of host (noCopy), so the raw ptr stays usable below.
                 const size_t i = (size_t) il * LLAMA_UMA_STREAM_N_KIND + kind;
+                // M7.0: platform-dispatched GPU-readable host slot buffer (Metal wrap / CUDA
+                // pinned host). Owned immediately per (il,kind) so any later throw releases it
+                // (dtor frees slot_buf before slot_host) and a resize can free + realloc it.
+                ggml_backend_buffer_t buf; void * host; size_t alloc;
+                if (!uma_stream_alloc_slot_buf(slot_bytes, &buf, &host, &alloc)) {
+                    throw std::runtime_error(format("uma stream: slot buffer alloc failed il=%u kind=%d", il, kind));
+                }
                 uma_stream->slot_host[i]  = host;
                 uma_stream->slot_alloc[i] = alloc;
-                uma_stream->slot_buf[i].reset(wrap);
+                uma_stream->slot_buf[i].reset(buf);
 
                 // slot tensor is [ne0, ne1, n_slots] (compressed expert dim)
                 const int64_t slot_ne[GGML_MAX_DIMS] = { src->ne[0], src->ne[1], (int64_t) n_slots, 1 };
@@ -3509,7 +3529,7 @@ void llama_context::uma_stream_setup() {
                 char name[64];
                 snprintf(name, sizeof(name), "uma.slot.%u.%d", il, kind);
                 ggml_set_name(st, name);
-                st->buffer = wrap;
+                st->buffer = buf;
                 st->data   = host;
                 if (st->nb[2] != src->nb[2]) {
                     throw std::runtime_error(format("uma stream: slot stride %zu != source %zu (il=%u kind=%d)", (size_t) st->nb[2], (size_t) src->nb[2], il, kind));
@@ -3534,19 +3554,31 @@ void llama_context::uma_stream_setup() {
                 // ggml_get_rows (no forced-CPU op). Warm-start seeds it; 0 = sentinel slot.
                 if (decouple) {
                     const size_t tbl_bytes = (size_t) n_expert * sizeof(int32_t);
-                    const size_t talloc    = ((tbl_bytes + page - 1) / page) * page;
                     void * thost = nullptr;
-                    if (posix_memalign(&thost, page, talloc) != 0 || thost == nullptr) {
-                        throw std::runtime_error("uma stream: table host allocation failed");
+                    ggml_backend_buffer_t twrap = nullptr;
+                    if (uma_stream_use_cuda_host) {
+                        // CUDA: the buffer owns thost (freed via wraps.clear(); NOT host_bases)
+                        twrap = ggml_backend_buft_alloc_buffer(uma_stream_cuda_host_buft, tbl_bytes);
+                        if (twrap == nullptr) {
+                            throw std::runtime_error(format("uma stream: table buffer alloc failed il=%u", il));
+                        }
+                        thost = ggml_backend_buffer_get_base(twrap);
+                        memset(thost, 0, tbl_bytes); // non-resident experts -> sentinel slot 0
+                        uma_stream->wraps.emplace_back(twrap);
+                    } else {
+                        const size_t talloc = ((tbl_bytes + page - 1) / page) * page;
+                        if (posix_memalign(&thost, page, talloc) != 0 || thost == nullptr) {
+                            throw std::runtime_error("uma stream: table host allocation failed");
+                        }
+                        twrap = ((buffer_mapped_norset_t) uma_stream_wrap_fn)(gpu_dev, thost, talloc, tbl_bytes);
+                        if (twrap == nullptr) {
+                            free(thost);
+                            throw std::runtime_error(format("uma stream: table wrap failed il=%u", il));
+                        }
+                        memset(thost, 0, talloc); // non-resident experts -> sentinel slot 0
+                        uma_stream->host_bases.push_back(thost); // Metal: posix_memalign'd (dtor free())
+                        uma_stream->wraps.emplace_back(twrap);
                     }
-                    ggml_backend_buffer_t twrap = wrap_fn(gpu_dev, thost, talloc, tbl_bytes);
-                    if (twrap == nullptr) {
-                        free(thost);
-                        throw std::runtime_error(format("uma stream: table wrap failed il=%u", il));
-                    }
-                    memset(thost, 0, talloc); // non-resident experts -> sentinel slot 0
-                    uma_stream->host_bases.push_back(thost);
-                    uma_stream->wraps.emplace_back(twrap);
                     const int64_t tbl_ne[GGML_MAX_DIMS] = { 1, (int64_t) n_expert, 1, 1 };
                     ggml_tensor * tbl = ggml_new_tensor(mctx, GGML_TYPE_I32, GGML_MAX_DIMS, tbl_ne);
                     if (tbl == nullptr) {
@@ -3561,8 +3593,9 @@ void llama_context::uma_stream_setup() {
                 }
             }
         }
-        fprintf(stderr, "uma: stream slot pool built: %zu slots x %u/%u experts (Metal StorageModeShared, no rset), layers [0,%u)\n",
-                uma_stream->wraps.size(), n_slots, n_expert, k);
+        fprintf(stderr, "uma: stream slot pool built: %zu tables x %u/%u experts (%s, GPU in-place), layers [0,%u)\n",
+                uma_stream->wraps.size(), n_slots, n_expert,
+                uma_stream_use_cuda_host ? "CUDA pinned host" : "Metal StorageModeShared no-rset", k);
 
         // the slot pool is resident; the streamed experts were loaded only to
         // validate offsets + shape the slots. Discard their RAM FIRST (before the

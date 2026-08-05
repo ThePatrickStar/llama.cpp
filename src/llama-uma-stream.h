@@ -115,10 +115,12 @@ struct llama_uma_stream_state {
     uint32_t pin_h = 0;   // warm-start hot-pin count; reseed reuses it, clamped to the new S
 
     ~llama_uma_stream_state() {
-        slot_buf.clear();  // release resizable slot Metal buffers before their hosts
-        wraps.clear();     // release the fixed table Metal buffers
+        slot_buf.clear();  // release resizable slot buffers before their hosts (Metal wrap / CUDA cudaFreeHost)
+        wraps.clear();     // release the fixed table buffers
         for (size_t i = 0; i < slot_host.size(); i++) {
-            if (slot_host[i]) {
+            // Metal: mmap'd host (alloc > 0) -> munmap. CUDA: the buffer owns the host
+            // (alloc == 0, freed via slot_buf.clear() above) -> nothing to munmap.
+            if (slot_host[i] && slot_alloc[i] > 0) {
                 munmap(slot_host[i], slot_alloc[i]);
             }
         }
