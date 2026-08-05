@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -436,6 +437,12 @@ private:
     int32_t uma_resize_lowmib  = 0;    // avail below this => shed one step
     int32_t uma_resize_highmib = 0;    // avail above this => grow one step
     int32_t uma_resize_step    = 16;   // slots per shed/grow step (CTRL)
+    // uma-moe fork M7.1 (arbiter actuator): external control-input + telemetry over
+    // per-context files. When uma_control_path is set the cross-tenant coordinator drives
+    // target S (the local CTRL watermark is bypassed); uma_telemetry_path exports the
+    // per-tenant state the arbiter reads (S, miss rate, distress). Empty => today's behavior.
+    std::string uma_control_path;
+    std::string uma_telemetry_path;
     // resize reallocates the slot buffers, so it needs the GPU device + no-rset wrap
     // entry (resolved once in setup) and forces one graph rebuild afterwards (the
     // reused graph would reference the freed slot tensors).
@@ -446,6 +453,8 @@ private:
     bool uma_stream_try_alloc_slots(uint32_t s_new); // (re)allocate all slot buffers at s_new; rolls back its partial allocations and returns false on OOM (precondition: slots freed)
     void uma_stream_reseed_resident(uint32_t s_new); // reseed [0,s_new) from the freq ranking
     void uma_stream_controller_tick();        // rate-limited decode-only driver
+    int32_t uma_read_control();               // M7.1: read a target S from the control file (-1 if none)
+    void    uma_write_telemetry();            // M7.1: atomic write of the per-tenant state
 
     std::set<ggml_backend_buffer_type_t> uma_bufts_logged;
 

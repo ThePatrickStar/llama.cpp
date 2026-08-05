@@ -3235,6 +3235,7 @@ void llama_context::uma_stream_resize(uint32_t s_new) {
     const size_t foot_after = llama_uma_phys_footprint_mib();
     fprintf(stderr, "uma: resize S %u -> %u: phys_footprint %zu -> %zu MiB (%.1f ms), avail %zu MiB\n",
             cur, eff, foot_before, foot_after, (ggml_time_us() - t0_us) / 1000.0, llama_uma_avail_reclaim_mib());
+    uma_write_telemetry(); // M7.1: publish the new state (incl. any distress) immediately
 }
 
 // uma-moe fork M6: (re)allocate every streaming slot buffer at S_new (mmap + no-rset wrap),
@@ -3302,21 +3303,77 @@ void llama_context::uma_stream_controller_tick() {
         uma_resize_sched_i++;
         uma_stream_resize((uint32_t) (target < 0 ? 0 : target));
     }
-    if (uma_resize_lowmib <= 0) {
-        return; // CTRL off (SCHED-only or armed-idle)
+    // M7.1: external control (the cross-tenant coordinator drives S) takes precedence over
+    // the local CTRL watermark; telemetry is exported whenever its path is set. Rate-limited.
+    const bool external  = !uma_control_path.empty();
+    const bool ctrl      = uma_resize_lowmib > 0;
+    const bool telemetry = !uma_telemetry_path.empty();
+    if (!external && !ctrl && !telemetry) {
+        return; // SCHED-only or armed-idle
     }
     if (++uma_resize_tick < uma_resize_period) {
         return;
     }
     uma_resize_tick = 0;
-    const size_t   avail = llama_uma_avail_reclaim_mib();
-    const uint32_t cur   = uma_stream->n_slots_active;
-    const uint32_t step  = (uint32_t) (uma_resize_step > 0 ? uma_resize_step : 1);
-    if ((int32_t) avail < uma_resize_lowmib && cur > (uint32_t) uma_resize_smin) {
-        uma_stream_resize(cur > step ? cur - step : 0); // pressure: shed toward the knee
-    } else if (uma_resize_highmib > 0 && (int32_t) avail > uma_resize_highmib && cur < uma_stream->n_slots) {
-        uma_stream_resize(cur + step); // eased: grow toward S_max
+    if (external) {
+        const int32_t target = uma_read_control();
+        if (target >= 0 && (uint32_t) target != uma_stream->n_slots_active) {
+            uma_stream_resize((uint32_t) target); // resize clamps a below-knee target -> distress
+        }
+    } else if (ctrl) {
+        const size_t   avail = llama_uma_avail_reclaim_mib();
+        const uint32_t cur   = uma_stream->n_slots_active;
+        const uint32_t step  = (uint32_t) (uma_resize_step > 0 ? uma_resize_step : 1);
+        if ((int32_t) avail < uma_resize_lowmib && cur > (uint32_t) uma_resize_smin) {
+            uma_stream_resize(cur > step ? cur - step : 0); // pressure: shed toward the knee
+        } else if (uma_resize_highmib > 0 && (int32_t) avail > uma_resize_highmib && cur < uma_stream->n_slots) {
+            uma_stream_resize(cur + step); // eased: grow toward S_max
+        }
     }
+    if (telemetry) {
+        uma_write_telemetry();
+    }
+}
+
+// M7.1: read a target S from the external control file (the cross-tenant coordinator
+// writes it). Returns the parsed slot count, or -1 if the file is absent/unreadable/
+// unparseable (the controller then holds the current S). uma_stream_resize clamps a
+// below-knee target and raises distress, so an external command cannot force incoherence.
+int32_t llama_context::uma_read_control() {
+    FILE * f = fopen(uma_control_path.c_str(), "r");
+    if (f == nullptr) {
+        return -1;
+    }
+    long v = -1;
+    if (fscanf(f, "%ld", &v) != 1 || v < 0 || v > 1000000) {
+        v = -1; // absent/garbage/overflow -> hold current S (resize clamps a valid target)
+    }
+    fclose(f);
+    return (int32_t) v;
+}
+
+// M7.1: atomically export the per-tenant state the arbiter consumes (write a temp file
+// then rename over the target, so the coordinator never reads a partial line). Flat KV,
+// matching the fork's profile-artifact style. phys_footprint + s_active let the arbiter
+// derive F (fixed) = footprint - S*slot_bytes.
+void llama_context::uma_write_telemetry() {
+    if (uma_telemetry_path.empty() || !uma_stream) {
+        return;
+    }
+    const std::string tmp = uma_telemetry_path + ".tmp";
+    FILE * f = fopen(tmp.c_str(), "w");
+    if (f == nullptr) {
+        return;
+    }
+    fprintf(f,
+            "s_active %u\ns_ceiling %u\nn_expert_used %u\nn_miss %llu\nn_read %llu\n"
+            "n_distress %llu\nn_resizes %llu\ns_min_reached %u\ns_max_reached %u\nphys_footprint_mib %zu\n",
+            uma_stream->n_slots_active, uma_stream->n_slots, model.hparams.n_expert_used,
+            (unsigned long long) uma_stream->n_miss, (unsigned long long) uma_stream->n_read,
+            (unsigned long long) uma_stream->n_distress, (unsigned long long) uma_stream->n_resizes,
+            uma_stream->s_min_active, uma_stream->s_max_active, llama_uma_phys_footprint_mib());
+    fclose(f);
+    rename(tmp.c_str(), uma_telemetry_path.c_str());
 }
 
 void llama_context::uma_stream_setup() {
@@ -3561,10 +3618,20 @@ void llama_context::uma_stream_setup() {
             const long st = strtol(env_step, nullptr, 10);
             if (st > 0) { uma_resize_step = (int32_t) st; }
         }
+        if (const char * env_ctl = getenv("LLAMA_UMA_STREAM_CONTROL")) {
+            uma_control_path = env_ctl;
+        }
+        if (const char * env_tel = getenv("LLAMA_UMA_STREAM_TELEMETRY")) {
+            uma_telemetry_path = env_tel;
+        }
         if (uma_resize_smin >= 0) {
             fprintf(stderr, "uma: M6 controller armed: S in [%d,%u], period %d tok, sched=%zu pts, CTRL lo/hi=%d/%d MiB step %d\n",
                     uma_resize_smin, n_slots, uma_resize_period, uma_resize_sched.size(),
                     uma_resize_lowmib, uma_resize_highmib, uma_resize_step);
+            if (!uma_control_path.empty() || !uma_telemetry_path.empty()) {
+                fprintf(stderr, "uma: M7.1 arbiter channel: control='%s' telemetry='%s'\n",
+                        uma_control_path.c_str(), uma_telemetry_path.c_str());
+            }
         } else if (!uma_resize_sched.empty() || uma_resize_lowmib > 0) {
             fprintf(stderr, "uma: WARNING M6 driver (SCHED/CTRL) set but LLAMA_UMA_STREAM_SMIN unset; controller disabled\n");
         }
