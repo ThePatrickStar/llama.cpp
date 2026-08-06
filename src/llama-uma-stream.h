@@ -79,6 +79,10 @@ struct llama_uma_stream_state {
     uint64_t n_distress   = 0;  // times a shed target below the knee was clamped (M7 signal)
     uint32_t s_min_active = 0;  // smallest n_slots_active reached (0 = unset)
     uint32_t s_max_active = 0;  // largest n_slots_active reached
+    bool     parked       = false; // M7 improvement (1): serving-state park. A provably-not-
+                                 // decoding tenant is resized to n_expert_used (KV-only, KV
+                                 // intact) LEGALLY below the coherence knee (no distress); the
+                                 // arbiter frees its sheddable budget. Any normal resize clears it.
     // per-streaming-layer expert ids ranked hottest-first (from the warm-start freq
     // dump); grow re-warms newly-active slots from this ranking. ranked[il] size n_expert.
     std::vector<std::vector<int32_t>> ranked;

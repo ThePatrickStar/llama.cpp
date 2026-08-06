@@ -3212,22 +3212,29 @@ void llama_context::uma_stream_free_slot_buf(size_t i) {
     uma_stream->slot_alloc[i] = 0;
 }
 
-void llama_context::uma_stream_resize(uint32_t s_new) {
+void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
     if (!uma_stream || !uma_stream->decouple ||
         (uma_stream_wrap_fn == nullptr && !uma_stream_use_cuda_host)) {
         return;
     }
     const uint32_t smax = uma_stream->n_slots;
     const uint32_t smin = uma_resize_smin >= 0 ? (uint32_t) uma_resize_smin : smax;
+    // M7 improvement (1): a park command may go LEGALLY below the coherence knee to the
+    // minimum viable resident set (n_expert_used) -- it is not decoding, so coherence does
+    // not apply and no distress is raised. Any normal (non-park) resize keeps the knee floor.
+    const uint32_t floor = park ? model.hparams.n_expert_used : smin;
     uint32_t target = s_new;
-    if (target < smin) {
-        uma_stream->n_distress++;
-        fprintf(stderr, "uma: DISTRESS: budget demands S=%u < knee=%u; holding at knee (admission signal for M7)\n", s_new, smin);
-        target = smin;
+    if (target < floor) {
+        if (!park) {
+            uma_stream->n_distress++;
+            fprintf(stderr, "uma: DISTRESS: budget demands S=%u < knee=%u; holding at knee (admission signal for M7)\n", s_new, smin);
+        }
+        target = floor;
     }
     if (target > smax) {
         target = smax;
     }
+    uma_stream->parked = park;   // record serving-state park (cleared by any normal resize)
     const uint32_t cur = uma_stream->n_slots_active;
     if (target == cur) {
         return;
@@ -3312,6 +3319,10 @@ bool llama_context::uma_stream_try_alloc_slots(uint32_t s_new) {
     return true;
 }
 
+// M7 improvement (1): control-file sentinel for a serving-state PARK command (distinct
+// from -1 "hold"). The coordinator writes the token "park" to KV-only a not-decoding tenant.
+static constexpr int32_t UMA_CTRL_PARK = -2;
+
 // uma-moe fork M6: rate-limited controller tick (decode-only, post-sync). Advances
 // the decode-token clock, then resolves a target S from the commanded schedule
 // (SCHED, fires at its exact token points) or the closed-loop budget signal (CTRL,
@@ -3338,8 +3349,13 @@ void llama_context::uma_stream_controller_tick() {
     uma_resize_tick = 0;
     if (external) {
         const int32_t target = uma_read_control();
-        if (target >= 0 && (uint32_t) target != uma_stream->n_slots_active) {
-            uma_stream_resize((uint32_t) target); // resize clamps a below-knee target -> distress
+        if (target == UMA_CTRL_PARK) {
+            if (!uma_stream->parked) {
+                // KV-only: resize to the min viable resident set, legally below the knee.
+                uma_stream_resize(model.hparams.n_expert_used, /*park=*/true);
+            }
+        } else if (target >= 0 && (uint32_t) target != uma_stream->n_slots_active) {
+            uma_stream_resize((uint32_t) target); // a normal target unparks + clamps below-knee -> distress
         }
     } else if (ctrl) {
         const size_t   avail = llama_uma_avail_reclaim_mib();
@@ -3365,12 +3381,21 @@ int32_t llama_context::uma_read_control() {
     if (f == nullptr) {
         return -1;
     }
-    long v = -1;
-    if (fscanf(f, "%ld", &v) != 1 || v < 0 || v > 1000000) {
-        v = -1; // absent/garbage/overflow -> hold current S (resize clamps a valid target)
+    char tok[32] = {0};
+    int32_t ret = -1;                       // absent/garbage -> hold current S
+    if (fscanf(f, "%31s", tok) == 1) {
+        if (strcmp(tok, "park") == 0) {
+            ret = UMA_CTRL_PARK;            // -2: serving-state park (KV-only, legal below-knee)
+        } else {
+            char * end = nullptr;
+            const long v = strtol(tok, &end, 10);
+            if (end != tok && *end == '\0' && v >= 0 && v <= 1000000) {
+                ret = (int32_t) v;         // a valid S target (resize clamps below-knee -> distress)
+            }
+        }
     }
     fclose(f);
-    return (int32_t) v;
+    return ret;
 }
 
 // M7.1: atomically export the per-tenant state the arbiter consumes (write a temp file
@@ -3388,11 +3413,13 @@ void llama_context::uma_write_telemetry() {
     }
     fprintf(f,
             "s_active %u\ns_ceiling %u\nn_expert_used %u\nn_miss %llu\nn_read %llu\n"
-            "n_distress %llu\nn_resizes %llu\ns_min_reached %u\ns_max_reached %u\nphys_footprint_mib %zu\n",
+            "n_distress %llu\nn_resizes %llu\ns_min_reached %u\ns_max_reached %u\nphys_footprint_mib %zu\n"
+            "parked %u\n",
             uma_stream->n_slots_active, uma_stream->n_slots, model.hparams.n_expert_used,
             (unsigned long long) uma_stream->n_miss, (unsigned long long) uma_stream->n_read,
             (unsigned long long) uma_stream->n_distress, (unsigned long long) uma_stream->n_resizes,
-            uma_stream->s_min_active, uma_stream->s_max_active, llama_uma_phys_footprint_mib());
+            uma_stream->s_min_active, uma_stream->s_max_active, llama_uma_phys_footprint_mib(),
+            (unsigned) (uma_stream->parked ? 1 : 0));
     fclose(f);
     rename(tmp.c_str(), uma_telemetry_path.c_str());
 }

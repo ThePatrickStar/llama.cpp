@@ -457,11 +457,11 @@ private:
     // out_alloc = mmap length (Metal, munmap on free) or 0 (CUDA, the buffer owns the host).
     bool uma_stream_alloc_slot_buf(size_t bytes, ggml_backend_buffer_t * out_buf, void ** out_host, size_t * out_alloc);
     void uma_stream_free_slot_buf(size_t i);
-    void uma_stream_resize(uint32_t s_new);   // free+realloc the slot buffers to s_new (clamped)
+    void uma_stream_resize(uint32_t s_new, bool park = false); // free+realloc the slot buffers to s_new (clamped to the knee unless park: then to n_expert_used, KV-only, no distress)
     bool uma_stream_try_alloc_slots(uint32_t s_new); // (re)allocate all slot buffers at s_new; rolls back its partial allocations and returns false on OOM (precondition: slots freed)
     void uma_stream_reseed_resident(uint32_t s_new); // reseed [0,s_new) from the freq ranking
     void uma_stream_controller_tick();        // rate-limited decode-only driver
-    int32_t uma_read_control();               // M7.1: read a target S from the control file (-1 if none)
+    int32_t uma_read_control();               // M7.1: read a target S from the control file (-1 hold, -2 park)
     void    uma_write_telemetry();            // M7.1: atomic write of the per-tenant state
 
     std::set<ggml_backend_buffer_type_t> uma_bufts_logged;
