@@ -1006,6 +1006,20 @@ void llama_context::synchronize() {
         }
     }
 
+    // M7.0 continuous-batching: the give-back controller tick above fires only for single-token
+    // decode (the n_queued_tokens == 1 branch). Under CONTINUOUS BATCHING a decode step is N
+    // sequences x 1 token -> n_queued_tokens == N > 1 with every token an output
+    // (n_outputs == n_queued_tokens), whereas prefill outputs fewer. Fire the tick for a BATCHED
+    // decode step too, so runtime resize + the M7.1 control channel work under continuous batching
+    // (the Spark throughput-bound regime; llama-server -np N). GUARDED to PURE-decode batches so a
+    // commanded shed never lands mid-prefill (which would violate "a prefill ubatch needs
+    // S >= its distinct experts"). The tick reseeds the slot table on resize, so no per-decode
+    // decouple maintenance is required here.
+    if (uma_stream && uma_stream->decouple && uma_resize_smin >= 0 && t_compute_start_us != 0
+            && n_queued_tokens > 1 && (int64_t) n_outputs == n_queued_tokens) {
+        uma_stream_controller_tick();
+    }
+
     // get a more accurate load time, upon first eval
     if (n_queued_tokens > 0 && !has_evaluated_once) {
         t_load_us = ggml_time_us() - t_start_us;
