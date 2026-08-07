@@ -2934,6 +2934,16 @@ void llama_uma_stream_admit(ggml_tensor * dst, int ith, int /*nth*/, void * user
     const uint32_t Sn     = S->n_slots;
     L.pass++;
     L.n_newly = 0;
+    // GIVE-BACK ROUTER INVARIANT (ZEDA, arXiv:2605.18643, verified on Qwen3-30B-A3B): the give-back
+    // is a pure DATA-PLANE indirection (expert id -> resident slot); it NEVER touches the router's
+    // gating softmax and NEVER renormalizes it, so the pretrained top-K weight-sum magnitude is
+    // preserved. ZEDA shows renormalizing surviving router weights after dropping an expert HURTS
+    // accuracy (73.3 -> 71.6) by inflating the MoE residual scale -> leaving routing untouched is
+    // the correct choice, and the coverage knee must be MEASURED on this un-renormalized path
+    // (scripts/coverage_curve.py). A non-resident expert falls back to sentinel slot 0 (an
+    // approximation carried by its ORIGINAL gating weight); this only fires BELOW the coverage knee
+    // (above it coverage ~100% -> misses ~0%). If a below-knee graceful-miss (the dropped idea (3))
+    // is ever added, it must SKIP (zero the expert's contribution) and MUST NOT renormalize.
     for (int64_t t = 0; t < n_tok; t++) {
         const int32_t * sp = (const int32_t *)((const char *) sel->data + t * sel->nb[1]);
         for (int64_t j = 0; j < n_used; j++) {
