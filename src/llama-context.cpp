@@ -265,6 +265,32 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    // uma-moe give-back (B): cap the prefill ubatch so a single ubatch can never select MORE distinct
+    // experts than the resident slot floor S. A ubatch of U tokens selects <= U*n_expert_used distinct
+    // experts; capping U <= S_floor/n_expert_used guarantees <= S_floor <= S, so the admit never
+    // overflows to sentinel slot 0 -> no skewed slot distribution -> the stock mmq activation-scatter
+    // (quantize_scatter_mmq_q8_1) never IMAs (verified on cd-vm: overflow crashes, no-overflow is clean).
+    // S_floor = SMIN (M6 give-back floor) else S (fixed) else n_expert (no effective cap). Prefill-only
+    // cost (decode is single-token); the deeper mmq-scatter fix would restore full prefill throughput.
+    if (const char * env_k = getenv("LLAMA_UMA_STREAM_K"); env_k != nullptr && env_k[0] != '\0') {
+        const uint32_t nu = model.hparams.n_expert_used ? model.hparams.n_expert_used : 1;
+        long s_floor = (long) model.hparams.n_expert;
+        if (const char * e = getenv("LLAMA_UMA_STREAM_SMIN"); e != nullptr && e[0] != '\0') {
+            s_floor = strtol(e, nullptr, 10);
+        } else if (const char * e2 = getenv("LLAMA_UMA_STREAM_S"); e2 != nullptr && e2[0] != '\0') {
+            s_floor = strtol(e2, nullptr, 10);
+        }
+        if (s_floor > 0) {
+            const uint32_t ub_cap = std::max<uint32_t>(1, (uint32_t) (s_floor / (long) nu));
+            if (cparams.n_ubatch > ub_cap) {
+                LLAMA_LOG_INFO("%s: uma give-back: capping n_ubatch %u -> %u (S_floor=%ld / n_expert_used=%u) "
+                        "so a prefill ubatch never overflows the resident slots\n",
+                        __func__, cparams.n_ubatch, ub_cap, s_floor, nu);
+                cparams.n_ubatch = ub_cap;
+            }
+        }
+    }
+
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
 
     cparams.op_offload = params.op_offload;
