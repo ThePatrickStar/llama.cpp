@@ -410,6 +410,15 @@ bool llama_uma_inject_load_overrides(const char * path_model, llama_model_params
         overrides.push_back({ nullptr, nullptr });
         params.tensor_buft_overrides = overrides.data();
         params.use_extra_bufts = false; // plain CPU std layout (not repacked)
+        // no_host: keep the excluded experts on PLAIN CPU, NOT the CUDA pinned-host buffer type.
+        // The loader's CPU override "considers extra buffer types" (make_cpu_buft_list) and would
+        // otherwise upgrade MXFP4 experts to CUDA_Host (cudaHostAlloc), which COMMITS pinned memory
+        // at allocation (unlike lazy malloc) - so even under LAZYLOAD the full ~58 GB expert buffer
+        // stays resident alongside the pinned slot pool = the double-allocation. Plain CPU pages are
+        // lazy (unread -> 0 resident) and madvise-freeable. The GPU-read copy is the slot pool, so
+        // these excluded expert tensors are never computed here. (Slot pool buft is set separately in
+        // the context via uma_stream_cuda_host_buft and is unaffected by no_host.)
+        params.no_host = true;
         if (params.load_mode == LLAMA_LOAD_MODE_MMAP || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
             params.load_mode = params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ? LLAMA_LOAD_MODE_MLOCK : LLAMA_LOAD_MODE_NONE;
         }
