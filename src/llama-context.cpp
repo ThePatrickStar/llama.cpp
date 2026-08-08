@@ -2985,7 +2985,17 @@ void llama_uma_stream_admit(ggml_tensor * dst, int ith, int /*nth*/, void * user
                     }
                 }
                 if (slot < 0) {
-                    GGML_ABORT("uma stream admit: (il=%d) batch needs > S=%u distinct experts (all in-batch-pinned); raise LLAMA_UMA_STREAM_S", ud->il, Sn);
+                    // OVERFLOW: this batch (a large / prefill ubatch) needs > S distinct experts, and
+                    // every slot is already pinned by an expert it still needs this pass. Rather than
+                    // ABORT, route the overflow expert to sentinel slot 0 (a graceful MISS / approximation)
+                    // so the give-back runs at S < n_expert through prefill. Coherence-bounded: at S >= the
+                    // coverage knee the overflow is the cold tail (a small perturbation, small gating
+                    // weight); below the knee it degrades but never crashes. Not admitted, not preaded;
+                    // counted as a miss + overflow (the arbiter uses n_overflow as a raise-S signal).
+                    out[oi] = 0;
+                    S->n_miss++;
+                    S->n_overflow++;
+                    continue;
                 }
                 const int32_t old = L.expert_in_slot[slot];
                 if (old >= 0) {
@@ -3455,11 +3465,11 @@ void llama_context::uma_write_telemetry() {
     }
     fprintf(f,
             "s_active %u\ns_ceiling %u\nn_expert_used %u\nn_miss %llu\nn_read %llu\n"
-            "n_distress %llu\nn_resizes %llu\ns_min_reached %u\ns_max_reached %u\nphys_footprint_mib %zu\n"
+            "n_distress %llu\nn_overflow %llu\nn_resizes %llu\ns_min_reached %u\ns_max_reached %u\nphys_footprint_mib %zu\n"
             "parked %u\n",
             uma_stream->n_slots_active, uma_stream->n_slots, model.hparams.n_expert_used,
             (unsigned long long) uma_stream->n_miss, (unsigned long long) uma_stream->n_read,
-            (unsigned long long) uma_stream->n_distress, (unsigned long long) uma_stream->n_resizes,
+            (unsigned long long) uma_stream->n_distress, (unsigned long long) uma_stream->n_overflow, (unsigned long long) uma_stream->n_resizes,
             uma_stream->s_min_active, uma_stream->s_max_active, llama_uma_phys_footprint_mib(),
             (unsigned) (uma_stream->parked ? 1 : 0));
     fclose(f);
