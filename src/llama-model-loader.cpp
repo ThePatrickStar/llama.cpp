@@ -1219,16 +1219,19 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             n_tensors_moved++;
         }
 
-        // uma-moe DEBUG: show exactly where give-back expert weights resolve (device vs host).
+        // uma-moe DEBUG: raw stderr (LLAMA_LOG_* is filtered / lost early in model load, unlike the
+        // give-back's own fprintf messages). Log the first few non-expert tensors (proves this path
+        // runs) AND the expert weights (shows their resolved buft: CUDA0/device vs CPU/host).
         {
             const std::string uma_nm = tn.str();
-            if (uma_nm.find("_exps.weight") != std::string::npos) {
-                static int uma_dbg_n = 0;
-                if (uma_dbg_n++ < 4) {
-                    LLAMA_LOG_WARN("uma-DBG: expert %s -> buft %s (is_host=%d)\n",
-                            uma_nm.c_str(), ggml_backend_buft_name(buft),
-                            (int) ggml_backend_buft_is_host(buft));
-                }
+            const bool is_exp = uma_nm.find("_exps.weight") != std::string::npos;
+            static int uma_any = 0, uma_exp = 0;
+            if (is_exp && uma_exp++ < 6) {
+                fprintf(stderr, "uma-DBG: EXPERT %s -> buft %s (is_host=%d)\n",
+                        uma_nm.c_str(), ggml_backend_buft_name(buft), (int) ggml_backend_buft_is_host(buft));
+            } else if (!is_exp && uma_any++ < 3) {
+                fprintf(stderr, "uma-DBG: tensor %s -> buft %s (is_host=%d)\n",
+                        uma_nm.c_str(), ggml_backend_buft_name(buft), (int) ggml_backend_buft_is_host(buft));
             }
         }
         return buft;
