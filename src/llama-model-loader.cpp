@@ -1158,6 +1158,21 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
                         buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        if (!buft) {
+                            // uma-moe fork: a CPU override MUST keep the tensor OFF the device. If no CPU
+                            // buffer type in the list supports this op (observed: MXFP4 mul_mat_id experts
+                            // on gpt-oss-120b), buft stays null and falls through to the DEVICE buft below
+                            // (the `if (!buft)` at ~line 1187), SILENTLY defeating the give-back's expert
+                            // exclusion (~58 GB of experts doubled onto the CUDA device; Q4_K_M was fine
+                            // because the CPU buft supports it). The plain CPU host buffer is correct for
+                            // STORAGE - the scheduler copies for compute, and the give-back slot pool is
+                            // the GPU-read copy anyway, so these expert tensors are never computed here.
+                            buft = ggml_backend_cpu_buffer_type();
+                            static std::once_flag once_cpu_force;
+                            std::call_once(once_cpu_force, [&] {
+                                LLAMA_LOG_WARN("llama_model_loader: CPU override for %s: no CPU buft in the list supports its op (e.g. MXFP4 mul_mat_id with extra bufts off); forcing plain CPU host so these tensors do NOT fall through to the device buffer (uma-moe give-back exclusion)\n", tensor_name.c_str());
+                            });
+                        }
                         if (use_mmap) {
                             static std::once_flag once;
                             std::call_once(once, [] {
