@@ -1219,6 +1219,18 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             n_tensors_moved++;
         }
 
+        // uma-moe DEBUG: show exactly where give-back expert weights resolve (device vs host).
+        {
+            const std::string uma_nm = tn.str();
+            if (uma_nm.find("_exps.weight") != std::string::npos) {
+                static int uma_dbg_n = 0;
+                if (uma_dbg_n++ < 4) {
+                    LLAMA_LOG_WARN("uma-DBG: expert %s -> buft %s (is_host=%d)\n",
+                            uma_nm.c_str(), ggml_backend_buft_name(buft),
+                            (int) ggml_backend_buft_is_host(buft));
+                }
+            }
+        }
         return buft;
     };
 
