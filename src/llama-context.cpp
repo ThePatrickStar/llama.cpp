@@ -3190,16 +3190,33 @@ void llama_context::uma_stream_reseed_resident(uint32_t s_new) {
 // set from the freq ranking, and forces one graph rebuild (the reused decode graph
 // references the old, freed slot tensors). Runs decode-only in the post-sync GPU-idle
 // window. Frees-before-allocs so the peak footprint is max(old, new), never the sum.
-// M7.0: allocate ONE GPU-readable host slot buffer of `bytes`, dispatching by platform.
-// Metal: mmap(MAP_ANON) + the no-rset wrap (GPU reads in place, unwired/reclaimable),
-// out_alloc = page-aligned mmap length (munmap on free). CUDA/Spark: the pinned host buffer
-// type the GPU reads in place (cudaHostAlloc under the hood, UVA; the Task-C precedent -
-// host-pinned expert weights read in place on GB10, results/m2-spark.md), out_alloc = 0
-// (the ggml buffer owns the host memory; cudaFreeHost runs on reset). Both mark WEIGHTS so
-// the sched allows the GPU to read the slots in place (allow_weights_buft, registered below).
-bool llama_context::uma_stream_alloc_slot_buf(size_t bytes, ggml_backend_buffer_t * out_buf,
+// The CUDA device buffer over-allocates each quantized weight tensor's last row to MATRIX_ROW_PADDING
+// (=512 elems) and zero-fills that tail (ggml-cuda get_alloc_size + init_tensor), because the mmvq/mmq
+// mul_mat_id kernels deliberately over-read a quant row past ne0 up to that boundary (common.cuh:176
+// "to avoid out-of-bounds memory accesses"). Our CUDA HOST (pinned) slot buffer uses the CPU
+// get_alloc_size (no such padding); on an INTEGRATED GPU (GB10) the page-tight pinned allocation faults
+// on that over-read -> illegal memory access on the first decode (seen on gpt-oss-120b MXFP4, but NOT on
+// discrete-L4 Q4_K_M whose looser UVA mapping absorbed it). Return the bytes to mirror the device
+// padding for the CUDA-host path (0 otherwise); only bites quant models whose expert ne0 % 512 != 0.
+static size_t uma_stream_cuda_row_pad(bool cuda_host, ggml_type type, int64_t ne0) {
+    if (!cuda_host || !ggml_is_quantized(type)) { return 0; }
+    const int64_t rem = ne0 % 512; // MATRIX_ROW_PADDING (ggml-cuda/common.cuh, not includable here)
+    return rem == 0 ? 0 : ggml_row_size(type, 512 - rem);
+}
+
+// M7.0: allocate ONE GPU-readable host slot buffer holding `data_bytes` of expert data, dispatching by
+// platform. Metal: mmap(MAP_ANON) + the no-rset wrap (GPU reads in place, unwired/reclaimable), out_alloc
+// = page-aligned mmap length (munmap on free). CUDA/Spark: the pinned host buffer type the GPU reads in
+// place (cudaHostAlloc, UVA; Task-C precedent, results/m2-spark.md), out_alloc = 0 (buffer owns the host
+// memory; cudaFreeHost on reset). For the CUDA-host path the buffer is over-allocated + tail-zeroed by
+// MATRIX_ROW_PADDING (uma_stream_cuda_row_pad) so the mul_mat_id over-read stays in-bounds. Both mark
+// WEIGHTS so the sched lets the GPU read the slots in place (allow_weights_buft, registered below).
+bool llama_context::uma_stream_alloc_slot_buf(size_t data_bytes, ggml_type type, int64_t ne0,
+                                              ggml_backend_buffer_t * out_buf,
                                               void ** out_host, size_t * out_alloc) {
     *out_buf = nullptr; *out_host = nullptr; *out_alloc = 0;
+    const size_t pad   = uma_stream_cuda_row_pad(uma_stream_use_cuda_host, type, ne0);
+    const size_t bytes = data_bytes + pad; // == data_bytes on Metal (pad=0 when !cuda_host)
     if (uma_stream_use_cuda_host) {
         ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(uma_stream_cuda_host_buft, bytes);
         if (buf == nullptr) { return false; }
@@ -3207,6 +3224,7 @@ bool llama_context::uma_stream_alloc_slot_buf(size_t bytes, ggml_backend_buffer_
         *out_buf   = buf;
         *out_host  = ggml_backend_buffer_get_base(buf);
         *out_alloc = 0; // buffer-owned host memory (freed via reset); no munmap
+        if (pad) { memset((char *) *out_host + data_bytes, 0, pad); } // zero the kernel over-read tail
         return true;
     }
     typedef ggml_backend_buffer_t (*wrap_fn_t)(ggml_backend_dev_t, void *, size_t, size_t);
@@ -3326,7 +3344,7 @@ bool llama_context::uma_stream_try_alloc_slots(uint32_t s_new) {
             const size_t slab       = (size_t) st->nb[2];
             const size_t slot_bytes = (size_t) s_new * slab;
             ggml_backend_buffer_t buf; void * host; size_t alloc;
-            if (!uma_stream_alloc_slot_buf(slot_bytes, &buf, &host, &alloc)) {
+            if (!uma_stream_alloc_slot_buf(slot_bytes, st->type, st->ne[0], &buf, &host, &alloc)) {
                 rollback();
                 return false;
             }
@@ -3564,7 +3582,7 @@ void llama_context::uma_stream_setup() {
                 // pinned host). Owned immediately per (il,kind) so any later throw releases it
                 // (dtor frees slot_buf before slot_host) and a resize can free + realloc it.
                 ggml_backend_buffer_t buf; void * host; size_t alloc;
-                if (!uma_stream_alloc_slot_buf(slot_bytes, &buf, &host, &alloc)) {
+                if (!uma_stream_alloc_slot_buf(slot_bytes, src->type, src->ne[0], &buf, &host, &alloc)) {
                     throw std::runtime_error(format("uma stream: slot buffer alloc failed il=%u kind=%d", il, kind));
                 }
                 uma_stream->slot_host[i]  = host;
