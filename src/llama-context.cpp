@@ -283,9 +283,9 @@ llama_context::llama_context(
         if (s_floor > 0) {
             const uint32_t ub_cap = std::max<uint32_t>(1, (uint32_t) (s_floor / (long) nu));
             if (cparams.n_ubatch > ub_cap) {
-                LLAMA_LOG_INFO("%s: uma give-back: capping n_ubatch %u -> %u (S_floor=%ld / n_expert_used=%u) "
-                        "so a prefill ubatch never overflows the resident slots\n",
-                        __func__, cparams.n_ubatch, ub_cap, s_floor, nu);
+                fprintf(stderr, "uma: give-back capping n_ubatch %u -> %u (S_floor=%ld / n_expert_used=%u) "
+                        "so a prefill ubatch never overflows the resident slots (mmq-scatter overflow guard)\n",
+                        cparams.n_ubatch, ub_cap, s_floor, nu);
                 cparams.n_ubatch = ub_cap;
             }
         }
