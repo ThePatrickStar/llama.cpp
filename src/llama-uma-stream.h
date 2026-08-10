@@ -73,6 +73,8 @@ struct llama_uma_stream_state {
     uint32_t n_expert     = 0;
     uint64_t n_miss       = 0;  // expert preads (slot misses) over the context lifetime
     uint64_t n_read       = 0;  // total expert-reads (admits) over the context lifetime
+    uint64_t n_h2d_miss   = 0;  // device-slot misses whose staged expert reached CUDA
+    uint64_t n_h2d_bytes  = 0;  // bytes uploaded for those successful miss admissions
     bool     decouple     = false; // LLAMA_UMA_STREAM_DECOUPLE: GPU-gather decode routing (Part 1)
     bool     adapt        = false; // LLAMA_UMA_STREAM_ADAPT: online resident-set maintenance (Part 2 Step 3)
 
@@ -121,13 +123,16 @@ struct llama_uma_stream_state {
 
     // M6: per-(il,kind) resizable slot buffers. mmap'd (not posix_memalign) on
     // Metal so a resize's munmap returns pages to the OS UNCONDITIONALLY; CUDA
-    // normally uses cudaHostAlloc-backed buffers. Stage-1 device_slots instead
-    // owns cudaMalloc-backed buffers and is deliberately restricted to fixed,
-    // fully-resident S=n_expert until its miss path is plumbed.
+    // normally uses cudaHostAlloc-backed buffers. device_slots instead owns
+    // cudaMalloc-backed slot buffers. Misses use one reusable pinned-host staging
+    // slab per kind, then an H2D upload completed before the table is published.
     std::vector<ggml_backend_buffer_ptr> slot_buf;   // release before slot_host is unmapped
     std::vector<void *>                  slot_host;  // host base normally; device base in device_slots mode
     std::vector<size_t>                  slot_alloc;  // mmap length per (il,kind), for munmap
     bool                                 device_slots = false;
+    std::vector<ggml_backend_buffer_ptr> device_stage_buf;  // pinned-host pread staging, per kind
+    std::vector<void *>                  device_stage_host; // owned by device_stage_buf
+    std::vector<size_t>                  device_stage_bytes;
     uint32_t pin_h = 0;   // warm-start hot-pin count; reseed reuses it, clamped to the new S
 
     ~llama_uma_stream_state() {

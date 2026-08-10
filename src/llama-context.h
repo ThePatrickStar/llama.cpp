@@ -451,12 +451,13 @@ private:
     void *  uma_stream_wrap_fn        = nullptr; // buffer_mapped_norset_t, cast in the .cpp
     bool    uma_stream_force_rebuild  = false;   // set by resize; consumed in process_ubatch
     // M7.0 (CUDA/Spark port): the slot pool is Metal (no-rset wrap over mmap) OR CUDA (the
-    // pinned host buffer type the GPU reads in place - Task C precedent). Stage-1 can select
-    // the CUDA device buft for a fixed, fully-resident proof. Picked once in setup.
+    // pinned host buffer type the GPU reads in place - Task C precedent). Device slots select
+    // the CUDA device buft and stage misses through the CUDA host buft. Picked once in setup.
     bool    uma_stream_use_cuda_host  = false;
     ggml_backend_buffer_type_t uma_stream_cuda_host_buft = nullptr;
     bool    uma_stream_use_cuda_device = false;
     ggml_backend_buffer_type_t uma_stream_cuda_device_buft = nullptr;
+    ggml_backend_t uma_stream_cuda_backend = nullptr; // async H2D stream; backend not owned here
     // Allocate/free ONE GPU-readable slot tensor. out_alloc = mmap length (Metal,
     // munmap on free) or 0 (CUDA, the buffer owns the pinned-host/device allocation).
     // Both CUDA paths retain MATRIX_ROW_PADDING; device buffers use the backend's
