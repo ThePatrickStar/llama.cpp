@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-uma.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -2029,12 +2030,41 @@ size_t llama_model::uma_stream_free_excluded() const {
 void llama_model::uma_stream_build_manifest(const struct llama_model_loader & ml) {
     const char * env = getenv("LLAMA_UMA_STREAM_K");
     if (env == nullptr || env[0] == '\0') {
+        if (llama_uma_stream_static_full_enabled()) {
+            throw std::runtime_error("LLAMA_UMA_STREAM_STATIC_FULL requires LLAMA_UMA_STREAM_K");
+        }
         return;
     }
     char * end = nullptr;
     const long k = strtol(env, &end, 10);
     if (end == env || *end != '\0' || k <= 0) {
         throw std::runtime_error(format("invalid LLAMA_UMA_STREAM_K '%s' (want a positive integer)", env));
+    }
+    if (llama_uma_stream_static_full_enabled()) {
+        auto parse_s = [&](const char * name, long fallback) {
+            const char * value = getenv(name);
+            if (value == nullptr || value[0] == '\0') {
+                return fallback;
+            }
+            char * value_end = nullptr;
+            const long parsed = strtol(value, &value_end, 10);
+            if (value_end == value || *value_end != '\0') {
+                throw std::runtime_error(format("invalid %s '%s' (want an integer)", name, value));
+            }
+            return parsed;
+        };
+        const long initial = parse_s("LLAMA_UMA_STREAM_S", hparams.n_expert);
+        const long ceiling = parse_s("LLAMA_UMA_STREAM_SMAX", initial);
+        if (initial != (long) hparams.n_expert || ceiling != (long) hparams.n_expert) {
+            throw std::runtime_error(format(
+                    "LLAMA_UMA_STREAM_STATIC_FULL requires initial S=%u and SMAX=%u (got %ld/%ld)",
+                    hparams.n_expert, hparams.n_expert, initial, ceiling));
+        }
+        fprintf(stderr,
+                "uma: stream static-full fallback active: S active/ceiling/expert %ld/%ld/%u; "
+                "stock contiguous tensors, no slot pool, misses, or live resize\n",
+                initial, ceiling, hparams.n_expert);
+        return;
     }
     const uint32_t n_layer = hparams.n_layer();
     pimpl->uma_stream_k_val = std::min<uint32_t>((uint32_t) k, n_layer);

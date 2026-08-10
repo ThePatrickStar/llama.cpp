@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
+#include "llama-uma.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -1422,6 +1423,9 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
 // ~the slot-pool size, so two large MoE co-fit the 36 GB Mac (and loads are faster
 // on every platform). Default (flag unset) leaves the load path byte-identical.
 static bool uma_stream_lazyload_k(long & k_out) {
+    if (llama_uma_stream_static_full_enabled()) {
+        return false;
+    }
     const char * lz = getenv("LLAMA_UMA_STREAM_LAZYLOAD");
     if (lz == nullptr || lz[0] == '\0' || lz[0] == '0') {
         return false;

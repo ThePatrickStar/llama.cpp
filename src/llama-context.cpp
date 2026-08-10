@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-uma.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -310,7 +311,8 @@ llama_context::llama_context(
     // (quantize_scatter_mmq_q8_1) never IMAs (verified on cd-vm: overflow crashes, no-overflow is clean).
     // S_floor = SMIN (M6 give-back floor) else initial S. Prefill-only
     // cost (decode is single-token); the deeper mmq-scatter fix would restore full prefill throughput.
-    if (const char * env_k = getenv("LLAMA_UMA_STREAM_K"); env_k != nullptr && env_k[0] != '\0') {
+    if (const char * env_k = getenv("LLAMA_UMA_STREAM_K");
+            env_k != nullptr && env_k[0] != '\0' && !llama_uma_stream_static_full_enabled()) {
         const uint32_t nu = model.hparams.n_expert_used ? model.hparams.n_expert_used : 1;
         const llama_uma_stream_s_config s_cfg = llama_uma_stream_parse_s(nu, model.hparams.n_expert);
         long s_floor = llama_uma_stream_env_long("LLAMA_UMA_STREAM_SMIN", s_cfg.initial);

@@ -188,6 +188,14 @@ struct llama_uma_plan {
 // Pure function of (profile, wire budget) - deterministic, us-scale.
 llama_uma_plan llama_uma_plan_compute(const llama_uma_profile & prof, int64_t wire_budget_bytes);
 
+// Explicit all-resident escape hatch for the streaming experiments. When
+// LLAMA_UMA_STREAM_STATIC_FULL is nonzero, load-time code preserves the stock
+// contiguous tensor placement; llama_model later validates that initial S and
+// SMAX both resolve to n_expert before accepting the fallback. Keeping this
+// explicit lets the loader decide before model hparams are available, while the
+// later validation makes a mistaken compressed request fail closed.
+bool llama_uma_stream_static_full_enabled();
+
 // policy=auto entry: loads LLAMA_UMA_PROFILE, checks identity vs the model
 // file (skipped when path_model is null - the context ctor re-plans and
 // checks hparams instead), probes the GPU device wire budget (on Metal this

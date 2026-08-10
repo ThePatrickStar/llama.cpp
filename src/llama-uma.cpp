@@ -13,6 +13,11 @@
 #include <cstring>
 #include <map>
 
+bool llama_uma_stream_static_full_enabled() {
+    const char * value = getenv("LLAMA_UMA_STREAM_STATIC_FULL");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
 llama_uma_router::llama_uma_router(llama_uma_policy policy, uint32_t n_cpu_layers, uint32_t n_layer, uint32_t n_expert, uint32_t n_expert_used) :
         policy(policy), n_cpu_layers(n_cpu_layers), n_layer(n_layer), n_expert(n_expert), n_expert_used(n_expert_used) {
     const uint32_t words = (n_expert + 63)/64;
@@ -397,6 +402,13 @@ bool llama_uma_inject_load_overrides(const char * path_model, llama_model_params
         if (params.tensor_buft_overrides != nullptr && params.tensor_buft_overrides[0].pattern != nullptr) {
             fprintf(stderr, "uma: refusing to mix tensor overrides with LLAMA_UMA_STREAM_K\n");
             return false;
+        }
+        if (llama_uma_stream_static_full_enabled()) {
+            // The loader does not have model hparams yet. Preserve the exact stock
+            // placement here; uma_stream_build_manifest validates S==SMAX==n_expert
+            // once hparams are known, before a context can be created.
+            fprintf(stderr, "uma: stream static-full requested: preserving stock contiguous load path (pending n_expert validation)\n");
+            return true;
         }
         ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
         patterns.reserve((size_t) k);
