@@ -649,10 +649,10 @@ llama_context::~llama_context() {
     // free-excluded value reflects lazy fill) + the realized slot miss rate.
     if (uma_stream) {
         const double miss_pct = uma_stream->n_read > 0 ? 100.0 * (double) uma_stream->n_miss / (double) uma_stream->n_read : 0.0;
-        fprintf(stderr, "uma: stream teardown: phys_footprint %zu MiB (steady-state), misses %llu / %llu reads (%.2f%%), S active/ceiling/expert=%u/%u/%u\n",
+        fprintf(stderr, "uma: stream teardown: phys_footprint %zu MiB (steady-state), misses %llu / %llu reads (%.2f%%), S=%u/%u, ceiling=%u\n",
                 llama_uma_phys_footprint_mib(),
                 (unsigned long long) uma_stream->n_miss, (unsigned long long) uma_stream->n_read,
-                miss_pct, uma_stream->n_slots_active, uma_stream->n_slots, uma_stream->n_expert);
+                miss_pct, uma_stream->n_slots_active, uma_stream->n_expert, uma_stream->n_slots);
         if (uma_stream->n_resizes > 0 || uma_stream->n_distress > 0) {
             fprintf(stderr, "uma: M6 controller teardown: %llu resizes, %llu distress clamps, S reached [%u,%u] of max %u\n",
                     (unsigned long long) uma_stream->n_resizes, (unsigned long long) uma_stream->n_distress,
