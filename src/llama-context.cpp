@@ -973,6 +973,9 @@ void llama_context::synchronize() {
             const uint32_t n_used = model.hparams.n_expert_used;
             const uint32_t Sn     = uma_stream->n_slots_active; // M6: online admits stay in the active window
             const bool     adapt  = uma_stream->adapt;
+            if (uma_stream->device_slots && Sn != uma_stream->n_expert) {
+                throw std::runtime_error("uma stream: Stage-1 CUDA device-slot residency invariant violated");
+            }
             if (Sn == uma_stream->n_expert) {
                 // Every expert is resident: misses and admissions are impossible, and
                 // recency will be rebuilt if a later resize compresses the window. Avoid
@@ -3000,6 +3003,9 @@ void llama_uma_stream_admit(ggml_tensor * dst, int ith, int /*nth*/, void * user
     }
     const auto * ud = (const llama_uma_stream_admit_ud *) userdata;
     llama_uma_stream_state * S = ud->state;
+    if (S->device_slots) {
+        GGML_ABORT("uma stream admit: Stage-1 device slots must use the full-resident table path");
+    }
     llama_uma_stream_layer_lru & L = S->lru[ud->il];
     const ggml_tensor * sel = dst->src[0]; // selected_experts, I32 [n_expert_used, n_tokens]
     if (sel == nullptr || sel->type != GGML_TYPE_I32 || sel->data == nullptr) {
@@ -3112,6 +3118,9 @@ void llama_uma_stream_fill(ggml_tensor * dst, int ith, int /*nth*/, void * userd
     }
     const auto * ud = (const llama_uma_stream_fill_ud *) userdata;
     llama_uma_stream_state * S = ud->state;
+    if (S->device_slots) {
+        GGML_ABORT("uma stream fill: refusing host pread into a CUDA device slot");
+    }
     const llama_uma_stream_layer_lru & L = S->lru[ud->il];
     const size_t slab = S->model->uma_stream_slab_bytes(ud->il, ud->kind);
     if (slab == 0 || dst->data == nullptr) {
@@ -3195,6 +3204,9 @@ static void uma_stream_warm_start(llama_uma_stream_state * S, const llama_model 
     }
 
     // per streaming layer: rank experts by count desc (tie-break by id), seed the top-S.
+    // A cudaMalloc-backed slot cannot be a pread destination: Stage-1 reads one
+    // expert slab into host scratch and uploads it with the tensor backend API.
+    std::vector<uint8_t> staging;
     uint32_t seeded = 0;
     for (uint32_t il = 0; il < k; il++) {
         if (!S->streams_layer((int) il)) {
@@ -3220,9 +3232,18 @@ static void uma_stream_warm_start(llama_uma_stream_state * S, const llama_model 
             for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
                 if (!S->streams((int) il, kind)) { continue; }
                 const size_t slab = model.uma_stream_slab_bytes((int) il, kind);
-                char * base = (char *) S->slot((int) il, kind)->data;
-                if (!model.uma_stream_pread_expert((int) il, kind, (int) e, base + (size_t) r * slab)) {
-                    throw std::runtime_error(format("uma stream warm-start: pread failed (il=%u kind=%d e=%u)", il, kind, e));
+                ggml_tensor * slot = S->slot((int) il, kind);
+                if (S->device_slots) {
+                    staging.resize(slab);
+                    if (!model.uma_stream_pread_expert((int) il, kind, (int) e, staging.data())) {
+                        throw std::runtime_error(format("uma stream warm-start: pread failed (il=%u kind=%d e=%u)", il, kind, e));
+                    }
+                    ggml_backend_tensor_set(slot, staging.data(), (size_t) r * slab, slab);
+                } else {
+                    char * base = (char *) slot->data;
+                    if (!model.uma_stream_pread_expert((int) il, kind, (int) e, base + (size_t) r * slab)) {
+                        throw std::runtime_error(format("uma stream warm-start: pread failed (il=%u kind=%d e=%u)", il, kind, e));
+                    }
                 }
             }
         }
@@ -3239,6 +3260,9 @@ static void uma_stream_warm_start(llama_uma_stream_state * S, const llama_model 
 // this is the single "rebuild the resident set at size s_new" primitive shared by
 // warm-start's runtime equivalent and every resize.
 void llama_context::uma_stream_reseed_resident(uint32_t s_new) {
+    if (uma_stream && uma_stream->device_slots) {
+        throw std::runtime_error("uma stream reseed: Stage-1 CUDA device slots have no miss/resize plumbing");
+    }
     const uint32_t n_layer  = model.hparams.n_layer();
     const uint32_t n_expert = uma_stream->n_expert;
     const uint32_t n_used   = model.hparams.n_expert_used;
@@ -3309,18 +3333,39 @@ static size_t uma_stream_cuda_row_pad(bool cuda_host, ggml_type type, int64_t ne
     return rem == 0 ? 0 : ggml_row_size(type, 512 - rem);
 }
 
-// M7.0: allocate ONE GPU-readable host slot buffer holding `data_bytes` of expert data, dispatching by
+// M7.0: allocate ONE GPU-readable slot buffer holding `data_bytes` of expert data, dispatching by
 // platform. Metal: mmap(MAP_ANON) + the no-rset wrap (GPU reads in place, unwired/reclaimable), out_alloc
 // = page-aligned mmap length (munmap on free). CUDA/Spark: the pinned host buffer type the GPU reads in
 // place (cudaHostAlloc, UVA; Task-C precedent, results/m2-spark.md), out_alloc = 0 (buffer owns the host
-// memory; cudaFreeHost on reset). For the CUDA-host path the buffer is over-allocated + tail-zeroed by
-// MATRIX_ROW_PADDING (uma_stream_cuda_row_pad) so the mul_mat_id over-read stays in-bounds. Both mark
-// WEIGHTS so the sched lets the GPU read the slots in place (allow_weights_buft, registered below).
-bool llama_context::uma_stream_alloc_slot_buf(size_t data_bytes, ggml_type type, int64_t ne0,
+// memory; cudaFreeHost on reset). Stage-1 CUDA device slots use the device buft's tensor-aware allocation
+// size and init hook, which add and zero MATRIX_ROW_PADDING exactly as stock CUDA tensors do. All paths
+// mark WEIGHTS.
+bool llama_context::uma_stream_alloc_slot_buf(ggml_tensor * slot, size_t data_bytes,
                                               ggml_backend_buffer_t * out_buf,
                                               void ** out_host, size_t * out_alloc) {
     *out_buf = nullptr; *out_host = nullptr; *out_alloc = 0;
-    const size_t pad   = uma_stream_cuda_row_pad(uma_stream_use_cuda_host, type, ne0);
+    if (slot == nullptr || ggml_nbytes(slot) != data_bytes) {
+        return false;
+    }
+    if (uma_stream_use_cuda_device) {
+        const size_t bytes = ggml_backend_buft_get_alloc_size(uma_stream_cuda_device_buft, slot);
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(uma_stream_cuda_device_buft, bytes);
+        if (buf == nullptr) { return false; }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        slot->buffer = buf;
+        slot->data   = ggml_backend_buffer_get_base(buf);
+        if (ggml_backend_buffer_init_tensor(buf, slot) != GGML_STATUS_SUCCESS) {
+            slot->buffer = nullptr;
+            slot->data   = nullptr;
+            ggml_backend_buffer_free(buf);
+            return false;
+        }
+        *out_buf   = buf;
+        *out_host  = slot->data; // device base; never host-dereferenced in Stage 1
+        *out_alloc = 0;
+        return true;
+    }
+    const size_t pad   = uma_stream_cuda_row_pad(uma_stream_use_cuda_host, slot->type, slot->ne[0]);
     const size_t bytes = data_bytes + pad; // == data_bytes on Metal (pad=0 when !cuda_host)
     if (uma_stream_use_cuda_host) {
         ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(uma_stream_cuda_host_buft, bytes);
@@ -3330,6 +3375,8 @@ bool llama_context::uma_stream_alloc_slot_buf(size_t data_bytes, ggml_type type,
         *out_host  = ggml_backend_buffer_get_base(buf);
         *out_alloc = 0; // buffer-owned host memory (freed via reset); no munmap
         if (pad) { memset((char *) *out_host + data_bytes, 0, pad); } // zero the kernel over-read tail
+        slot->buffer = buf;
+        slot->data   = *out_host;
         return true;
     }
     typedef ggml_backend_buffer_t (*wrap_fn_t)(ggml_backend_dev_t, void *, size_t, size_t);
@@ -3344,6 +3391,8 @@ bool llama_context::uma_stream_alloc_slot_buf(size_t data_bytes, ggml_type type,
     *out_buf   = wrap;
     *out_host  = host;
     *out_alloc = alloc;
+    slot->buffer = wrap;
+    slot->data   = host;
     return true;
 }
 
@@ -3366,6 +3415,12 @@ void llama_context::uma_stream_free_slot_buf(size_t i) {
 void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
     if (!uma_stream || !uma_stream->decouple ||
         (uma_stream_wrap_fn == nullptr && !uma_stream_use_cuda_host)) {
+        return;
+    }
+    if (uma_stream->device_slots) {
+        if (park || s_new != uma_stream->n_slots_active) {
+            throw std::runtime_error("uma stream: Stage-1 CUDA device slots are fixed at S=n_expert; resize/miss plumbing is not enabled");
+        }
         return;
     }
     const uint32_t smax = uma_stream->n_slots;
@@ -3459,6 +3514,9 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
 // (slot_host == nullptr). Returns false + rolls back its own partial allocations on any
 // mmap/wrap failure, so the caller can retry at a smaller size (the OOM fallback ladder).
 bool llama_context::uma_stream_try_alloc_slots(uint32_t s_new) {
+    if (uma_stream && uma_stream->device_slots) {
+        return false;
+    }
     if (s_new < model.hparams.n_expert_used || s_new > uma_stream->n_slots) {
         return false;
     }
@@ -3472,18 +3530,16 @@ bool llama_context::uma_stream_try_alloc_slots(uint32_t s_new) {
             if (st == nullptr) { continue; }
             const size_t slab       = (size_t) st->nb[2];
             const size_t slot_bytes = (size_t) s_new * slab;
+            st->ne[2] = (int64_t) s_new;
+            st->nb[3] = st->nb[2] * (size_t) s_new;
             ggml_backend_buffer_t buf; void * host; size_t alloc;
-            if (!uma_stream_alloc_slot_buf(slot_bytes, st->type, st->ne[0], &buf, &host, &alloc)) {
+            if (!uma_stream_alloc_slot_buf(st, slot_bytes, &buf, &host, &alloc)) {
                 rollback();
                 return false;
             }
             uma_stream->slot_host[i]  = host;
             uma_stream->slot_alloc[i] = alloc;
             uma_stream->slot_buf[i].reset(buf);
-            st->ne[2]  = (int64_t) s_new;   // shrink/grow the expert dim
-            st->nb[3]  = st->nb[2] * (size_t) s_new;
-            st->data   = host;
-            st->buffer = buf;
             done.push_back(i);
         }
     }
@@ -3603,6 +3659,9 @@ void llama_context::uma_write_telemetry() {
 void llama_context::uma_stream_setup() {
     const uint32_t k = model.uma_stream_k();
     if (k == 0) {
+        if (llama_uma_stream_device_slots_enabled()) {
+            throw std::runtime_error("LLAMA_UMA_STREAM_DEVICE_SLOTS requested but streaming manifest is inactive");
+        }
         return; // streaming off (default runs)
     }
     const uint32_t n_expert      = model.hparams.n_expert;
@@ -3613,6 +3672,12 @@ void llama_context::uma_stream_setup() {
     const llama_uma_stream_s_config s_cfg = llama_uma_stream_parse_s(n_expert_used, n_expert);
     const uint32_t n_slots_initial = s_cfg.initial;
     const uint32_t n_slots         = s_cfg.ceiling;
+    const bool device_slots_requested = llama_uma_stream_device_slots_enabled();
+    if (device_slots_requested && (n_slots_initial != n_expert || n_slots != n_expert)) {
+        throw std::runtime_error(format(
+            "LLAMA_UMA_STREAM_DEVICE_SLOTS Stage-1 requires initial S=ceiling=n_expert=%u (got %u/%u)",
+            n_expert, n_slots_initial, n_slots));
+    }
 
     // GPU backend + the fork's no-rset Metal wrap entry (the WO-C zero-copy path)
     ggml_backend_t gpu_backend = nullptr;
@@ -3645,6 +3710,25 @@ void llama_context::uma_stream_setup() {
         }
         uma_stream_use_cuda_host = true;
     }
+    if (device_slots_requested) {
+        if (wrap_fn != nullptr || !uma_stream_use_cuda_host) {
+            throw std::runtime_error("LLAMA_UMA_STREAM_DEVICE_SLOTS Stage-1 is CUDA-only");
+        }
+        uma_stream_cuda_device_buft = ggml_backend_dev_buffer_type(gpu_dev);
+        if (uma_stream_cuda_device_buft == nullptr ||
+            strncmp(ggml_backend_buft_name(uma_stream_cuda_device_buft), "CUDA", 4) != 0) {
+            throw std::runtime_error("LLAMA_UMA_STREAM_DEVICE_SLOTS requires the CUDA device buffer type");
+        }
+        uma_stream_use_cuda_device = true;
+        for (const char * name : { "LLAMA_UMA_STREAM_SCHED", "LLAMA_UMA_STREAM_LOWMIB",
+                                   "LLAMA_UMA_STREAM_HIGHMIB", "LLAMA_UMA_STREAM_CONTROL" }) {
+            const char * value = getenv(name);
+            if (value != nullptr && value[0] != '\0') {
+                throw std::runtime_error(format(
+                    "LLAMA_UMA_STREAM_DEVICE_SLOTS Stage-1 forbids resize driver %s", name));
+            }
+        }
+    }
     // M6: keep the device + wrap entry so a runtime resize can reallocate slot buffers
     uma_stream_gpu_dev = gpu_dev;
     uma_stream_wrap_fn = (void *) wrap_fn;
@@ -3662,8 +3746,12 @@ void llama_context::uma_stream_setup() {
         // resident set (the slots do not change during decode), so HOTFREQ is required.
         const bool adapt    = getenv("LLAMA_UMA_STREAM_ADAPT") != nullptr; // Step 3: online maintenance
         const bool decouple = adapt || getenv("LLAMA_UMA_STREAM_DECOUPLE") != nullptr; // adapt needs the table
+        if (device_slots_requested && !decouple) {
+            throw std::runtime_error("LLAMA_UMA_STREAM_DEVICE_SLOTS Stage-1 requires DECOUPLE/ADAPT");
+        }
         uma_stream->decouple = decouple;
         uma_stream->adapt    = adapt;
+        uma_stream->device_slots = device_slots_requested;
         if (decouple && getenv("LLAMA_UMA_STREAM_HOTFREQ") == nullptr) {
             throw std::runtime_error("uma stream: LLAMA_UMA_STREAM_DECOUPLE/ADAPT requires LLAMA_UMA_STREAM_HOTFREQ (initial slot seed)");
         }
@@ -3701,21 +3789,7 @@ void llama_context::uma_stream_setup() {
                 if (src == nullptr || model.uma_stream_slab_bytes(il, kind) == 0) {
                     continue;
                 }
-                // Allocate only the initial active window, not the controller ceiling.
-                // A later grow releases this buffer and reallocates at the target S.
-                const size_t slot_bytes = (size_t) n_slots_initial * (size_t) src->nb[2];
                 const size_t i = (size_t) il * LLAMA_UMA_STREAM_N_KIND + kind;
-                // M7.0: platform-dispatched GPU-readable host slot buffer (Metal wrap / CUDA
-                // pinned host). Owned immediately per (il,kind) so any later throw releases it
-                // (dtor frees slot_buf before slot_host) and a resize can free + realloc it.
-                ggml_backend_buffer_t buf; void * host; size_t alloc;
-                if (!uma_stream_alloc_slot_buf(slot_bytes, src->type, src->ne[0], &buf, &host, &alloc)) {
-                    throw std::runtime_error(format("uma stream: slot buffer alloc failed il=%u kind=%d", il, kind));
-                }
-                uma_stream->slot_host[i]  = host;
-                uma_stream->slot_alloc[i] = alloc;
-                uma_stream->slot_buf[i].reset(buf);
-
                 // slot tensor is [ne0, ne1, active S] (compressed expert dim)
                 const int64_t slot_ne[GGML_MAX_DIMS] = { src->ne[0], src->ne[1], (int64_t) n_slots_initial, 1 };
                 ggml_tensor * st = ggml_new_tensor(mctx, src->type, GGML_MAX_DIMS, slot_ne);
@@ -3725,11 +3799,20 @@ void llama_context::uma_stream_setup() {
                 char name[64];
                 snprintf(name, sizeof(name), "uma.slot.%u.%d", il, kind);
                 ggml_set_name(st, name);
-                st->buffer = buf;
-                st->data   = host;
                 if (st->nb[2] != src->nb[2]) {
                     throw std::runtime_error(format("uma stream: slot stride %zu != source %zu (il=%u kind=%d)", (size_t) st->nb[2], (size_t) src->nb[2], il, kind));
                 }
+
+                // Allocate only the initial active window, not the controller ceiling.
+                // A later grow releases this buffer and reallocates at the target S.
+                const size_t slot_bytes = (size_t) n_slots_initial * (size_t) src->nb[2];
+                ggml_backend_buffer_t buf; void * host; size_t alloc;
+                if (!uma_stream_alloc_slot_buf(st, slot_bytes, &buf, &host, &alloc)) {
+                    throw std::runtime_error(format("uma stream: slot buffer alloc failed il=%u kind=%d", il, kind));
+                }
+                uma_stream->slot_host[i]  = host;
+                uma_stream->slot_alloc[i] = alloc;
+                uma_stream->slot_buf[i].reset(buf);
 
                 uma_stream->slots[i] = st;
                 uma_stream->uds[i]   = { uma_stream.get(), (int) il, kind };
@@ -3793,7 +3876,8 @@ void llama_context::uma_stream_setup() {
         }
         fprintf(stderr, "uma: stream slot pool built: %zu tables, S active/ceiling/expert %u/%u/%u (%s, GPU in-place), layers [0,%u)\n",
                 uma_stream->wraps.size(), n_slots_initial, n_slots, n_expert,
-                uma_stream_use_cuda_host ? "CUDA pinned host" : "Metal StorageModeShared no-rset", k);
+                uma_stream_use_cuda_device ? "CUDA device" :
+                (uma_stream_use_cuda_host ? "CUDA pinned host" : "Metal StorageModeShared no-rset"), k);
 
         // the slot pool is resident; the streamed experts were loaded only to
         // validate offsets + shape the slots. Discard their RAM FIRST (before the
@@ -3885,7 +3969,9 @@ void llama_context::uma_stream_setup() {
         if (!buf) { continue; }
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
         ggml_backend_sched_allow_weights_buft(sched.get(), gpu_backend, buft);
-        ggml_backend_sched_allow_weights_buft(sched.get(), backend_cpu, buft);
+        if (!uma_stream->device_slots) {
+            ggml_backend_sched_allow_weights_buft(sched.get(), backend_cpu, buft);
+        }
     }
     for (const auto & wrap : uma_stream->wraps) {
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(wrap.get());

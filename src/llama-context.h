@@ -451,14 +451,17 @@ private:
     void *  uma_stream_wrap_fn        = nullptr; // buffer_mapped_norset_t, cast in the .cpp
     bool    uma_stream_force_rebuild  = false;   // set by resize; consumed in process_ubatch
     // M7.0 (CUDA/Spark port): the slot pool is Metal (no-rset wrap over mmap) OR CUDA (the
-    // pinned host buffer type the GPU reads in place - Task C precedent). Picked once in setup.
+    // pinned host buffer type the GPU reads in place - Task C precedent). Stage-1 can select
+    // the CUDA device buft for a fixed, fully-resident proof. Picked once in setup.
     bool    uma_stream_use_cuda_host  = false;
     ggml_backend_buffer_type_t uma_stream_cuda_host_buft = nullptr;
-    // allocate/free ONE GPU-readable host slot buffer holding `data_bytes` of expert data, dispatching
-    // Metal vs CUDA. out_alloc = mmap length (Metal, munmap on free) or 0 (CUDA, the buffer owns the
-    // host). CUDA-host allocs are over-allocated + tail-zeroed by MATRIX_ROW_PADDING (type/ne0 needed)
-    // so the mul_mat_id kernels' quant-row over-read stays in-bounds on integrated GPUs.
-    bool uma_stream_alloc_slot_buf(size_t data_bytes, ggml_type type, int64_t ne0, ggml_backend_buffer_t * out_buf, void ** out_host, size_t * out_alloc);
+    bool    uma_stream_use_cuda_device = false;
+    ggml_backend_buffer_type_t uma_stream_cuda_device_buft = nullptr;
+    // Allocate/free ONE GPU-readable slot tensor. out_alloc = mmap length (Metal,
+    // munmap on free) or 0 (CUDA, the buffer owns the pinned-host/device allocation).
+    // Both CUDA paths retain MATRIX_ROW_PADDING; device buffers use the backend's
+    // tensor-aware alloc size + init hook.
+    bool uma_stream_alloc_slot_buf(ggml_tensor * slot, size_t data_bytes, ggml_backend_buffer_t * out_buf, void ** out_host, size_t * out_alloc);
     void uma_stream_free_slot_buf(size_t i);
     void uma_stream_resize(uint32_t s_new, bool park = false); // free+realloc the slot buffers to s_new (clamped to the knee unless park: then to n_expert_used, KV-only, no distress)
     bool uma_stream_try_alloc_slots(uint32_t s_new); // (re)allocate all slot buffers at s_new; rolls back its partial allocations and returns false on OOM (precondition: slots freed)

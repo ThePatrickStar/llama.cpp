@@ -119,20 +119,23 @@ struct llama_uma_stream_state {
     std::vector<ggml_backend_buffer_ptr> wraps;
     std::vector<void *>                  host_bases;
 
-    // M6: per-(il,kind) resizable slot buffers. mmap'd (not posix_memalign) so a
-    // resize's munmap returns pages to the OS UNCONDITIONALLY - no malloc large-cache
-    // retention, no reusable-page under-charge - giving a clean phys_footprint.
+    // M6: per-(il,kind) resizable slot buffers. mmap'd (not posix_memalign) on
+    // Metal so a resize's munmap returns pages to the OS UNCONDITIONALLY; CUDA
+    // normally uses cudaHostAlloc-backed buffers. Stage-1 device_slots instead
+    // owns cudaMalloc-backed buffers and is deliberately restricted to fixed,
+    // fully-resident S=n_expert until its miss path is plumbed.
     std::vector<ggml_backend_buffer_ptr> slot_buf;   // release before slot_host is unmapped
-    std::vector<void *>                  slot_host;
+    std::vector<void *>                  slot_host;  // host base normally; device base in device_slots mode
     std::vector<size_t>                  slot_alloc;  // mmap length per (il,kind), for munmap
+    bool                                 device_slots = false;
     uint32_t pin_h = 0;   // warm-start hot-pin count; reseed reuses it, clamped to the new S
 
     ~llama_uma_stream_state() {
-        slot_buf.clear();  // release resizable slot buffers before their hosts (Metal wrap / CUDA cudaFreeHost)
+        slot_buf.clear();  // release resizable slot buffers before their hosts (Metal wrap / CUDA free)
         wraps.clear();     // release the fixed table buffers
         for (size_t i = 0; i < slot_host.size(); i++) {
-            // Metal: mmap'd host (alloc > 0) -> munmap. CUDA: the buffer owns the host
-            // (alloc == 0, freed via slot_buf.clear() above) -> nothing to munmap.
+            // Metal: mmap'd host (alloc > 0) -> munmap. CUDA: the buffer owns its
+            // pinned-host or device allocation (alloc == 0) -> nothing to munmap.
             if (slot_host[i] && slot_alloc[i] > 0) {
                 munmap(slot_host[i], slot_alloc[i]);
             }

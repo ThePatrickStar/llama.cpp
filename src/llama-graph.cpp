@@ -1995,12 +1995,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // is discarded anyway); the original expert tensors stay resident for it.
     ggml_tensor * route_ids = selected_experts;
     if (uma_stream && uma_stream->streams_layer(il) && !cparams.warmup &&
-        uma_stream->decouple && uma_stream->expert_table(il) && selected_experts->ne[1] == 1) {
-        // decode decouple (Part 1): the GPU gathers slot_ids from the static expert->slot
-        // table via ggml_get_rows - NO forced-CPU admit op. The slots are static (warm-
-        // start), so NO fill op either. This removes the per-layer CPU->GPU sync round-trip
-        // that dominates the serial tax; the matmuls read the slot tensors via slot_ids.
-        ggml_tensor * g = ggml_get_rows(ctx0, uma_stream->expert_table(il), selected_experts); // [1,n_used,1,1] I32
+        uma_stream->decouple && uma_stream->expert_table(il) &&
+        (selected_experts->ne[1] == 1 || uma_stream->device_slots)) {
+        // Decoupled routing: the GPU gathers slot_ids from the static expert->slot
+        // table via ggml_get_rows - NO forced-CPU admit/fill op. The ordinary
+        // compressed path uses this for one-token decode. Stage-1 device slots are
+        // fully resident, so the same table path is valid for every prompt ubatch
+        // and prevents any CPU node from reading or copying the cudaMalloc slots.
+        ggml_tensor * table = uma_stream->expert_table(il);
+        if (selected_experts->ne[1] > 1) {
+            table = ggml_repeat_4d(ctx0, table, 1, uma_stream->n_expert, selected_experts->ne[1], 1);
+        }
+        ggml_tensor * g = ggml_get_rows(ctx0, table, selected_experts); // [1,n_used,n_tokens,1] I32
         cb(g, "ffn_moe_decouple_gather", il);
         ggml_tensor * slot_ids = ggml_reshape_2d(ctx0, g, selected_experts->ne[0], selected_experts->ne[1]);
         cb(slot_ids, "ffn_moe_decouple_route", il);

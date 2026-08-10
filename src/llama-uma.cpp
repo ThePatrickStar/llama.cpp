@@ -18,6 +18,11 @@ bool llama_uma_stream_static_full_enabled() {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+bool llama_uma_stream_device_slots_enabled() {
+    const char * value = getenv("LLAMA_UMA_STREAM_DEVICE_SLOTS");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
 llama_uma_router::llama_uma_router(llama_uma_policy policy, uint32_t n_cpu_layers, uint32_t n_layer, uint32_t n_expert, uint32_t n_expert_used) :
         policy(policy), n_cpu_layers(n_cpu_layers), n_layer(n_layer), n_expert(n_expert), n_expert_used(n_expert_used) {
     const uint32_t words = (n_expert + 63)/64;
@@ -388,6 +393,22 @@ bool llama_uma_inject_load_overrides(const char * path_model, llama_model_params
     // pool, uma_stream_free_excluded() frees this buffer, so only the S slots stay
     // resident and the cold experts stream from the fd on demand.
     const char * env_stream = getenv("LLAMA_UMA_STREAM_K");
+    const bool device_slots = llama_uma_stream_device_slots_enabled();
+    if (device_slots) {
+        const char * lazy = getenv("LLAMA_UMA_STREAM_LAZYLOAD");
+        if (env_stream == nullptr || env_stream[0] == '\0') {
+            fprintf(stderr, "uma: LLAMA_UMA_STREAM_DEVICE_SLOTS requires LLAMA_UMA_STREAM_K\n");
+            return false;
+        }
+        if (llama_uma_stream_static_full_enabled()) {
+            fprintf(stderr, "uma: LLAMA_UMA_STREAM_DEVICE_SLOTS and LLAMA_UMA_STREAM_STATIC_FULL are mutually exclusive\n");
+            return false;
+        }
+        if (lazy == nullptr || lazy[0] == '\0' || lazy[0] == '0') {
+            fprintf(stderr, "uma: LLAMA_UMA_STREAM_DEVICE_SLOTS requires LLAMA_UMA_STREAM_LAZYLOAD=1 (refusing full-expert + device-pool load transient)\n");
+            return false;
+        }
+    }
     if (env_stream != nullptr && env_stream[0] != '\0' && !params.vocab_only) {
         char * end = nullptr;
         const long k = strtol(env_stream, &end, 10);

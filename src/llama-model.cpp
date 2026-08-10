@@ -2030,6 +2030,9 @@ size_t llama_model::uma_stream_free_excluded() const {
 void llama_model::uma_stream_build_manifest(const struct llama_model_loader & ml) {
     const char * env = getenv("LLAMA_UMA_STREAM_K");
     if (env == nullptr || env[0] == '\0') {
+        if (llama_uma_stream_device_slots_enabled()) {
+            throw std::runtime_error("LLAMA_UMA_STREAM_DEVICE_SLOTS requires LLAMA_UMA_STREAM_K");
+        }
         if (llama_uma_stream_static_full_enabled()) {
             throw std::runtime_error("LLAMA_UMA_STREAM_STATIC_FULL requires LLAMA_UMA_STREAM_K");
         }
@@ -2039,6 +2042,15 @@ void llama_model::uma_stream_build_manifest(const struct llama_model_loader & ml
     const long k = strtol(env, &end, 10);
     if (end == env || *end != '\0' || k <= 0) {
         throw std::runtime_error(format("invalid LLAMA_UMA_STREAM_K '%s' (want a positive integer)", env));
+    }
+    if (llama_uma_stream_device_slots_enabled() && llama_uma_stream_static_full_enabled()) {
+        throw std::runtime_error("LLAMA_UMA_STREAM_DEVICE_SLOTS and LLAMA_UMA_STREAM_STATIC_FULL are mutually exclusive");
+    }
+    if (llama_uma_stream_device_slots_enabled()) {
+        const char * lazy = getenv("LLAMA_UMA_STREAM_LAZYLOAD");
+        if (lazy == nullptr || lazy[0] == '\0' || lazy[0] == '0') {
+            throw std::runtime_error("LLAMA_UMA_STREAM_DEVICE_SLOTS requires LLAMA_UMA_STREAM_LAZYLOAD=1");
+        }
     }
     if (llama_uma_stream_static_full_enabled()) {
         auto parse_s = [&](const char * name, long fallback) {

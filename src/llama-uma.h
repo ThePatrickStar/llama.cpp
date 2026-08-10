@@ -196,6 +196,10 @@ llama_uma_plan llama_uma_plan_compute(const llama_uma_profile & prof, int64_t wi
 // later validation makes a mistaken compressed request fail closed.
 bool llama_uma_stream_static_full_enabled();
 
+// Stage-1 CUDA device-resident slot proof. Kept as an explicit opt-in so the
+// established pinned-host streaming path and STATIC_FULL fallback are unchanged.
+bool llama_uma_stream_device_slots_enabled();
+
 // policy=auto entry: loads LLAMA_UMA_PROFILE, checks identity vs the model
 // file (skipped when path_model is null - the context ctor re-plans and
 // checks hparams instead), probes the GPU device wire budget (on Metal this
