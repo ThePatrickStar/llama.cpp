@@ -2003,7 +2003,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // fully resident, so the same table path is valid for every prompt ubatch
         // and prevents any CPU node from reading or copying the cudaMalloc slots.
         ggml_tensor * table = uma_stream->expert_table(il);
-        if (selected_experts->ne[1] > 1) {
+        if (selected_experts->ne[1] != 1) {
             table = ggml_repeat_4d(ctx0, table, 1, uma_stream->n_expert, selected_experts->ne[1], 1);
         }
         if (table->ne[2] != selected_experts->ne[1] ||
