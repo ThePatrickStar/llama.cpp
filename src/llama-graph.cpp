@@ -2006,6 +2006,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (selected_experts->ne[1] > 1) {
             table = ggml_repeat_4d(ctx0, table, 1, uma_stream->n_expert, selected_experts->ne[1], 1);
         }
+        if (table->ne[2] != selected_experts->ne[1] ||
+            table->ne[3] != selected_experts->ne[2] || selected_experts->ne[3] != 1) {
+            throw std::runtime_error(format(
+                "uma device-slot route shape mismatch: table=[%lld,%lld,%lld,%lld] selected=[%lld,%lld,%lld,%lld]",
+                (long long) table->ne[0], (long long) table->ne[1],
+                (long long) table->ne[2], (long long) table->ne[3],
+                (long long) selected_experts->ne[0], (long long) selected_experts->ne[1],
+                (long long) selected_experts->ne[2], (long long) selected_experts->ne[3]));
+        }
         ggml_tensor * g = ggml_get_rows(ctx0, table, selected_experts); // [1,n_used,n_tokens,1] I32
         cb(g, "ffn_moe_decouple_gather", il);
         ggml_tensor * slot_ids = ggml_reshape_2d(ctx0, g, selected_experts->ne[0], selected_experts->ne[1]);
