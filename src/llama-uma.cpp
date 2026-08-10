@@ -435,8 +435,8 @@ bool llama_uma_inject_load_overrides(const char * path_model, llama_model_params
         patterns.reserve((size_t) k);
         overrides.reserve((size_t) k + 1);
         for (long il = 0; il < k; il++) {
-            char pat[64];
-            snprintf(pat, sizeof(pat), "blk\\.%ld\\.ffn_(up|down|gate|gate_up)_(ch|)exps", il);
+            char pat[96];
+            snprintf(pat, sizeof(pat), "blk\\.%ld\\.ffn_(up|down|gate|gate_up)_(ch|)exps\\.weight$", il);
             patterns.push_back(pat);
             overrides.push_back({ patterns.back().c_str(), cpu_buft });
         }
