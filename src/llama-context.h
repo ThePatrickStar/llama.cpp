@@ -421,7 +421,8 @@ private:
     std::unique_ptr<llama_uma_stream_state> uma_stream;
 
     // uma-moe fork M6 (give-back controller): elastic runtime resize of the
-    // stream slot window n_slots_active in [smin, n_slots], driven decode-only
+    // stream slot window n_slots_active in [smin, n_slots ceiling], driven decode-only;
+    // PARK alone may set active=n_expert_used below smin.
     // from the post-sync GPU-idle window. Shed = clear the LRU/table entries of
     // the shed slots then MADV_FREE_REUSABLE their pages (drops phys_footprint);
     // grow = re-warm the re-activated slots from the freq ranking. smin is the

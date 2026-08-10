@@ -2001,6 +2001,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // start), so NO fill op either. This removes the per-layer CPU->GPU sync round-trip
         // that dominates the serial tax; the matmuls read the slot tensors via slot_ids.
         ggml_tensor * g = ggml_get_rows(ctx0, uma_stream->expert_table(il), selected_experts); // [1,n_used,1,1] I32
+        cb(g, "ffn_moe_decouple_gather", il);
         ggml_tensor * slot_ids = ggml_reshape_2d(ctx0, g, selected_experts->ne[0], selected_experts->ne[1]);
         cb(slot_ids, "ffn_moe_decouple_route", il);
         route_ids = slot_ids;

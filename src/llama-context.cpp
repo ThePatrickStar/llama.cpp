@@ -81,6 +81,44 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+struct llama_uma_stream_s_config {
+    uint32_t initial;
+    uint32_t ceiling;
+};
+
+static long llama_uma_stream_env_long(const char * name, long fallback) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    char * end = nullptr;
+    const long parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0') {
+        throw std::runtime_error(format("invalid %s '%s' (want an integer)", name, value));
+    }
+    return parsed;
+}
+
+static llama_uma_stream_s_config llama_uma_stream_parse_s(uint32_t n_expert_used, uint32_t n_expert) {
+    const bool have_initial = []() {
+        const char * v = getenv("LLAMA_UMA_STREAM_S");
+        return v != nullptr && v[0] != '\0';
+    }();
+    const bool have_ceiling = []() {
+        const char * v = getenv("LLAMA_UMA_STREAM_SMAX");
+        return v != nullptr && v[0] != '\0';
+    }();
+    const long ceiling_env = llama_uma_stream_env_long("LLAMA_UMA_STREAM_SMAX", n_expert);
+    const long initial = have_initial ? llama_uma_stream_env_long("LLAMA_UMA_STREAM_S", n_expert)
+                                      : (have_ceiling ? ceiling_env : (long) n_expert);
+    const long ceiling = have_ceiling ? ceiling_env : initial;
+    if (initial < (long) n_expert_used || initial > ceiling || ceiling > (long) n_expert) {
+        throw std::runtime_error(format("invalid UMA stream S range: require %u <= initial %ld <= ceiling %ld <= %u",
+                                        n_expert_used, initial, ceiling, n_expert));
+    }
+    return { (uint32_t) initial, (uint32_t) ceiling };
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -270,15 +308,15 @@ llama_context::llama_context(
     // experts; capping U <= S_floor/n_expert_used guarantees <= S_floor <= S, so the admit never
     // overflows to sentinel slot 0 -> no skewed slot distribution -> the stock mmq activation-scatter
     // (quantize_scatter_mmq_q8_1) never IMAs (verified on cd-vm: overflow crashes, no-overflow is clean).
-    // S_floor = SMIN (M6 give-back floor) else S (fixed) else n_expert (no effective cap). Prefill-only
+    // S_floor = SMIN (M6 give-back floor) else initial S. Prefill-only
     // cost (decode is single-token); the deeper mmq-scatter fix would restore full prefill throughput.
     if (const char * env_k = getenv("LLAMA_UMA_STREAM_K"); env_k != nullptr && env_k[0] != '\0') {
         const uint32_t nu = model.hparams.n_expert_used ? model.hparams.n_expert_used : 1;
-        long s_floor = (long) model.hparams.n_expert;
-        if (const char * e = getenv("LLAMA_UMA_STREAM_SMIN"); e != nullptr && e[0] != '\0') {
-            s_floor = strtol(e, nullptr, 10);
-        } else if (const char * e2 = getenv("LLAMA_UMA_STREAM_S"); e2 != nullptr && e2[0] != '\0') {
-            s_floor = strtol(e2, nullptr, 10);
+        const llama_uma_stream_s_config s_cfg = llama_uma_stream_parse_s(nu, model.hparams.n_expert);
+        long s_floor = llama_uma_stream_env_long("LLAMA_UMA_STREAM_SMIN", s_cfg.initial);
+        if (s_floor < (long) nu || s_floor > (long) s_cfg.initial) {
+            throw std::runtime_error(format("invalid LLAMA_UMA_STREAM_SMIN %ld (want %u..initial S=%u)",
+                                            s_floor, nu, s_cfg.initial));
         }
         if (s_floor > 0) {
             const uint32_t ub_cap = std::max<uint32_t>(1, (uint32_t) (s_floor / (long) nu));
@@ -611,10 +649,10 @@ llama_context::~llama_context() {
     // free-excluded value reflects lazy fill) + the realized slot miss rate.
     if (uma_stream) {
         const double miss_pct = uma_stream->n_read > 0 ? 100.0 * (double) uma_stream->n_miss / (double) uma_stream->n_read : 0.0;
-        fprintf(stderr, "uma: stream teardown: phys_footprint %zu MiB (steady-state), misses %llu / %llu reads (%.2f%%), S=%u/%u\n",
+        fprintf(stderr, "uma: stream teardown: phys_footprint %zu MiB (steady-state), misses %llu / %llu reads (%.2f%%), S active/ceiling/expert=%u/%u/%u\n",
                 llama_uma_phys_footprint_mib(),
                 (unsigned long long) uma_stream->n_miss, (unsigned long long) uma_stream->n_read,
-                miss_pct, uma_stream->n_slots_active, uma_stream->n_expert);
+                miss_pct, uma_stream->n_slots_active, uma_stream->n_slots, uma_stream->n_expert);
         if (uma_stream->n_resizes > 0 || uma_stream->n_distress > 0) {
             fprintf(stderr, "uma: M6 controller teardown: %llu resizes, %llu distress clamps, S reached [%u,%u] of max %u\n",
                     (unsigned long long) uma_stream->n_resizes, (unsigned long long) uma_stream->n_distress,
@@ -933,8 +971,19 @@ void llama_context::synchronize() {
             const uint32_t n_used = model.hparams.n_expert_used;
             const uint32_t Sn     = uma_stream->n_slots_active; // M6: online admits stay in the active window
             const bool     adapt  = uma_stream->adapt;
-            std::vector<int32_t> ids(n_used);
-            for (uint32_t il = 0; il < uma_stream->topk.size(); il++) {
+            if (Sn == uma_stream->n_expert) {
+                // Every expert is resident: misses and admissions are impossible, and
+                // recency will be rebuilt if a later resize compresses the window. Avoid
+                // one synchronous tiny D2H tensor_get per streaming layer per token while
+                // retaining exact read/miss telemetry.
+                for (uint32_t il = 0; il < uma_stream->topk.size(); il++) {
+                    if (uma_stream->topk[il] != nullptr && uma_stream->streams_layer((int) il)) {
+                        uma_stream->n_read += n_used;
+                    }
+                }
+            } else {
+              std::vector<int32_t> ids(n_used);
+              for (uint32_t il = 0; il < uma_stream->topk.size(); il++) {
                 ggml_tensor * t = uma_stream->topk[il];
                 if (t == nullptr || !uma_stream->streams_layer((int) il)) {
                     continue;
@@ -954,11 +1003,17 @@ void llama_context::synchronize() {
                     }
                     uma_stream->n_read++;
                     int32_t slot = L.slot_of_expert[e];
-                    if (slot >= 0) {
+                    if (slot >= 0 && (uint32_t) slot < Sn) {
                         // hit: refresh recency (adapt LRU keeps the live working set resident)
                         L.pinned[slot]    = L.pass;
                         L.last_used[slot] = L.tick++;
                         continue;
+                    }
+                    if (slot >= 0) {
+                        // A resize must clear inactive mappings. Fail closed if stale metadata
+                        // survives: unpublish it before treating this access as a miss.
+                        L.slot_of_expert[e] = -1;
+                        if (tbl) { tbl[e] = 0; }
                     }
                     uma_stream->n_miss++; // selected expert not resident = decouple miss
                     if (!adapt) {
@@ -1013,6 +1068,7 @@ void llama_context::synchronize() {
                     L.last_used[slot]      = L.tick++;
                     if (tbl) { tbl[e] = slot; } // publish AFTER the pread
                 }
+              }
             }
         }
 
@@ -2957,7 +3013,7 @@ void llama_uma_stream_admit(ggml_tensor * dst, int ith, int /*nth*/, void * user
     const int64_t  n_used = sel->ne[0]; // n_expert_used
     const int64_t  n_tok  = sel->ne[1]; // n_tokens
     int32_t      * out    = (int32_t *) dst->data;
-    const uint32_t Sn     = S->n_slots;
+    const uint32_t Sn     = S->n_slots_active;
     L.pass++;
     L.n_newly = 0;
     // GIVE-BACK ROUTER INVARIANT (ZEDA, arXiv:2605.18643, verified on Qwen3-30B-A3B): the give-back
@@ -2981,7 +3037,10 @@ void llama_uma_stream_admit(ggml_tensor * dst, int ith, int /*nth*/, void * user
             }
             S->n_read++; // valid expert-read (supply-curve miss-rate denominator)
             int32_t slot = L.slot_of_expert[e];
-            if (slot < 0) {
+            if (slot < 0 || (uint32_t) slot >= Sn) {
+                if (slot >= 0) {
+                    L.slot_of_expert[e] = -1; // stale mapping outside the active window
+                }
                 // miss: admit into an empty slot, else evict the LRU-cold slot
                 // that is not pinned by an expert this batch still needs
                 uint64_t best_lu = UINT64_MAX;
@@ -3060,7 +3119,7 @@ void llama_uma_stream_fill(ggml_tensor * dst, int ith, int /*nth*/, void * userd
     for (uint32_t j = 0; j < L.n_newly; j++) {
         const int32_t e    = L.newly_admitted[j];
         const int32_t slot = L.slot_of_expert[e];
-        if (slot < 0 || (uint32_t) slot >= S->n_slots) {
+        if (slot < 0 || (uint32_t) slot >= S->n_slots_active) {
             GGML_ABORT("uma stream fill: (il=%d kind=%d) bad slot %d for expert %d", ud->il, ud->kind, slot, e);
         }
         if (!S->model->uma_stream_pread_expert(ud->il, ud->kind, (int) e, base + (size_t) slot * slab)) {
@@ -3080,7 +3139,7 @@ static void uma_stream_warm_start(llama_uma_stream_state * S, const llama_model 
         return; // cold start
     }
     const uint32_t n_expert      = S->n_expert;
-    const uint32_t n_slots       = S->n_slots;
+    const uint32_t n_slots       = S->n_slots_active;
     const uint32_t n_expert_used = model.hparams.n_expert_used;
     const uint32_t k             = model.uma_stream_k();
 
@@ -3181,6 +3240,9 @@ void llama_context::uma_stream_reseed_resident(uint32_t s_new) {
     const uint32_t n_layer  = model.hparams.n_layer();
     const uint32_t n_expert = uma_stream->n_expert;
     const uint32_t n_used   = model.hparams.n_expert_used;
+    if (s_new < n_used || s_new > uma_stream->n_slots) {
+        throw std::runtime_error(format("uma stream reseed S=%u outside [%u,%u]", s_new, n_used, uma_stream->n_slots));
+    }
     const uint32_t H        = std::min(uma_stream->pin_h, s_new > n_used ? s_new - n_used : 0u);
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!uma_stream->streams_layer((int) il)) { continue; }
@@ -3190,7 +3252,10 @@ void llama_context::uma_stream_reseed_resident(uint32_t s_new) {
         // clear all residency: no slot occupied, every expert non-resident (-> sentinel 0)
         std::fill(L.slot_of_expert.begin(), L.slot_of_expert.end(), -1);
         std::fill(L.expert_in_slot.begin(), L.expert_in_slot.end(), -1);
+        std::fill(L.last_used.begin(), L.last_used.end(), 0);
+        std::fill(L.pinned.begin(), L.pinned.end(), 0);
         std::fill(L.pin_protected.begin(), L.pin_protected.end(), 0);
+        L.n_newly = 0;
         if (tbl) { std::fill(tbl, tbl + n_expert, 0); }
         // seed [0, s_new) with the top-s_new ranked experts; pin the top-H
         uint32_t r = 0;
@@ -3207,7 +3272,9 @@ void llama_context::uma_stream_reseed_resident(uint32_t s_new) {
                     break;
                 }
             }
-            if (!ok) { continue; } // skip on I/O failure (slot r stays empty)
+            if (!ok) {
+                throw std::runtime_error(format("uma stream reseed: pread failed (il=%u slot=%u expert=%d)", il, r, e));
+            }
             L.expert_in_slot[r] = e;
             L.slot_of_expert[e] = (int32_t) r;
             if (tbl) { tbl[e] = (int32_t) r; }
@@ -3288,6 +3355,10 @@ void llama_context::uma_stream_free_slot_buf(size_t i) {
     }
     uma_stream->slot_host[i]  = nullptr;
     uma_stream->slot_alloc[i] = 0;
+    if (i < uma_stream->slots.size() && uma_stream->slots[i] != nullptr) {
+        uma_stream->slots[i]->data   = nullptr;
+        uma_stream->slots[i]->buffer = nullptr;
+    }
 }
 
 void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
@@ -3317,7 +3388,8 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
     if (target == cur) {
         return;
     }
-    const size_t   foot_before = llama_uma_phys_footprint_mib();
+    const size_t   foot_before  = llama_uma_phys_footprint_mib();
+    const size_t   avail_before = llama_uma_avail_reclaim_mib();
     const int64_t  t0_us       = ggml_time_us();
     const uint32_t n_layer     = model.hparams.n_layer();
 
@@ -3331,6 +3403,15 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
             uma_stream_free_slot_buf(i);
         }
     }
+    const int64_t t_free_us = ggml_time_us();
+    const size_t foot_after_free  = llama_uma_phys_footprint_mib();
+    const size_t avail_after_free = llama_uma_avail_reclaim_mib();
+    uma_stream->last_resize_free_us          = (uint64_t) (t_free_us - t0_us);
+    uma_stream->last_resize_foot_after_free  = foot_after_free;
+    uma_stream->last_resize_avail_after_free = avail_after_free;
+    fprintf(stderr, "uma: resize old-pool release point: phys_footprint %zu -> %zu MiB, avail %zu -> %zu MiB (%.1f ms)\n",
+            foot_before, foot_after_free, avail_before, avail_after_free,
+            (t_free_us - t0_us) / 1000.0);
     // 2. reallocate every slot buffer at the new size, with an OOM fallback ladder so a
     //    resize NEVER crashes the process: a grow that cannot get memory degrades to the
     //    pre-resize size (just resident, so it fits), then to the minimum, before it gives
@@ -3340,16 +3421,20 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
         fprintf(stderr, "uma: resize to S=%u could not allocate; falling back to S=%u\n", target, cur);
         eff = cur;
         if (!uma_stream_try_alloc_slots(eff)) {
-            eff = model.hparams.n_expert_used; // minimum viable resident set
+            eff = floor; // only PARK may fall below the coherence knee
             if (!uma_stream_try_alloc_slots(eff)) {
                 throw std::runtime_error("uma stream resize: cannot reallocate the slot pool (OOM)");
             }
         }
     }
     uma_stream->n_slots_active = eff;
+    const int64_t t_alloc_us = ggml_time_us();
+    uma_stream->last_resize_alloc_us = (uint64_t) (t_alloc_us - t_free_us);
 
     // 3. reseed the resident set into the new buffers (pread from the GGUF)
     uma_stream_reseed_resident(eff);
+    const int64_t t_reseed_us = ggml_time_us();
+    uma_stream->last_resize_reseed_us = (uint64_t) (t_reseed_us - t_alloc_us);
 
     // 4. force the next decode to rebuild the graph (it references the freed tensors).
     //    the new wraps share the no-rset buft already allowed at setup, and
@@ -3359,8 +3444,11 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
     if (uma_stream->s_min_active == 0 || eff < uma_stream->s_min_active) { uma_stream->s_min_active = eff; }
     if (eff > uma_stream->s_max_active) { uma_stream->s_max_active = eff; }
     const size_t foot_after = llama_uma_phys_footprint_mib();
-    fprintf(stderr, "uma: resize S %u -> %u: phys_footprint %zu -> %zu MiB (%.1f ms), avail %zu MiB\n",
-            cur, eff, foot_before, foot_after, (ggml_time_us() - t0_us) / 1000.0, llama_uma_avail_reclaim_mib());
+    fprintf(stderr, "uma: resize S %u -> %u: phys_footprint %zu -> %zu MiB (free %.1f + alloc %.1f + reseed %.1f = %.1f ms), avail %zu MiB\n",
+            cur, eff, foot_before, foot_after,
+            (t_free_us - t0_us) / 1000.0, (t_alloc_us - t_free_us) / 1000.0,
+            (t_reseed_us - t_alloc_us) / 1000.0, (t_reseed_us - t0_us) / 1000.0,
+            llama_uma_avail_reclaim_mib());
     uma_write_telemetry(); // M7.1: publish the new state (incl. any distress) immediately
 }
 
@@ -3369,6 +3457,9 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
 // (slot_host == nullptr). Returns false + rolls back its own partial allocations on any
 // mmap/wrap failure, so the caller can retry at a smaller size (the OOM fallback ladder).
 bool llama_context::uma_stream_try_alloc_slots(uint32_t s_new) {
+    if (s_new < model.hparams.n_expert_used || s_new > uma_stream->n_slots) {
+        return false;
+    }
     const uint32_t  n_layer = model.hparams.n_layer();
     std::vector<size_t> done; // indices allocated in THIS call, for rollback
     auto rollback = [&]() { for (size_t i : done) { uma_stream_free_slot_buf(i); } };
@@ -3432,7 +3523,7 @@ void llama_context::uma_stream_controller_tick() {
                 // KV-only: resize to the min viable resident set, legally below the knee.
                 uma_stream_resize(model.hparams.n_expert_used, /*park=*/true);
             }
-        } else if (target >= 0 && (uint32_t) target != uma_stream->n_slots_active) {
+        } else if (target >= 0 && ((uint32_t) target != uma_stream->n_slots_active || uma_stream->parked)) {
             uma_stream_resize((uint32_t) target); // a normal target unparks + clamps below-knee -> distress
         }
     } else if (ctrl) {
@@ -3492,11 +3583,16 @@ void llama_context::uma_write_telemetry() {
     fprintf(f,
             "s_active %u\ns_ceiling %u\nn_expert_used %u\nn_miss %llu\nn_read %llu\n"
             "n_distress %llu\nn_overflow %llu\nn_resizes %llu\ns_min_reached %u\ns_max_reached %u\nphys_footprint_mib %zu\n"
+            "last_resize_free_ms %.3f\nlast_resize_alloc_ms %.3f\nlast_resize_reseed_ms %.3f\n"
+            "last_resize_foot_after_free_mib %zu\nlast_resize_avail_after_free_mib %zu\n"
             "parked %u\n",
             uma_stream->n_slots_active, uma_stream->n_slots, model.hparams.n_expert_used,
             (unsigned long long) uma_stream->n_miss, (unsigned long long) uma_stream->n_read,
             (unsigned long long) uma_stream->n_distress, (unsigned long long) uma_stream->n_overflow, (unsigned long long) uma_stream->n_resizes,
             uma_stream->s_min_active, uma_stream->s_max_active, llama_uma_phys_footprint_mib(),
+            uma_stream->last_resize_free_us / 1000.0, uma_stream->last_resize_alloc_us / 1000.0,
+            uma_stream->last_resize_reseed_us / 1000.0,
+            uma_stream->last_resize_foot_after_free, uma_stream->last_resize_avail_after_free,
             (unsigned) (uma_stream->parked ? 1 : 0));
     fclose(f);
     rename(tmp.c_str(), uma_telemetry_path.c_str());
@@ -3510,19 +3606,11 @@ void llama_context::uma_stream_setup() {
     const uint32_t n_expert      = model.hparams.n_expert;
     const uint32_t n_expert_used = model.hparams.n_expert_used;
 
-    // S = resident slots per (layer,kind). Default n_expert (no compression, pure
-    // remap); LLAMA_UMA_STREAM_S shrinks it (the footprint win). Must be able to
-    // hold one token's experts; a batch needing > S distinct experts aborts.
-    uint32_t n_slots = n_expert;
-    const char * env_s = getenv("LLAMA_UMA_STREAM_S");
-    if (env_s && env_s[0] != '\0') {
-        char * end = nullptr;
-        const long s = strtol(env_s, &end, 10);
-        if (end == env_s || *end != '\0' || s < (long) n_expert_used || s > (long) n_expert) {
-            throw std::runtime_error(format("invalid LLAMA_UMA_STREAM_S '%s' (want %u..%u)", env_s, n_expert_used, n_expert));
-        }
-        n_slots = (uint32_t) s;
-    }
+    // LLAMA_UMA_STREAM_S is the initial active resident set; SMAX is the
+    // independent controller ceiling. An omitted SMAX preserves old S=fixed behavior.
+    const llama_uma_stream_s_config s_cfg = llama_uma_stream_parse_s(n_expert_used, n_expert);
+    const uint32_t n_slots_initial = s_cfg.initial;
+    const uint32_t n_slots         = s_cfg.ceiling;
 
     // GPU backend + the fork's no-rset Metal wrap entry (the WO-C zero-copy path)
     ggml_backend_t gpu_backend = nullptr;
@@ -3563,9 +3651,10 @@ void llama_context::uma_stream_setup() {
     if (!uma_stream) {
         uma_stream = std::make_unique<llama_uma_stream_state>();
         uma_stream->model    = &model;
-        uma_stream->n_slots  = n_slots;
-        uma_stream->n_slots_active = n_slots; // M6: start at S_max (warm-start seeds the full window)
-        uma_stream->s_max_active   = n_slots;
+        uma_stream->n_slots        = n_slots;
+        uma_stream->n_slots_active = n_slots_initial;
+        uma_stream->s_min_active   = n_slots_initial;
+        uma_stream->s_max_active   = n_slots_initial;
         uma_stream->n_expert = n_expert;
         // decouple mode (Part 1): GPU-gather decode routing needs a static, warm-started
         // resident set (the slots do not change during decode), so HOTFREQ is required.
@@ -3610,9 +3699,9 @@ void llama_context::uma_stream_setup() {
                 if (src == nullptr || model.uma_stream_slab_bytes(il, kind) == 0) {
                     continue;
                 }
-                // the slot buffer holds n_slots experts (not n_expert): the
-                // per-expert slab stride is src->nb[2], so S slots = S*nb[2]
-                const size_t slot_bytes = (size_t) n_slots * (size_t) src->nb[2];
+                // Allocate only the initial active window, not the controller ceiling.
+                // A later grow releases this buffer and reallocates at the target S.
+                const size_t slot_bytes = (size_t) n_slots_initial * (size_t) src->nb[2];
                 const size_t i = (size_t) il * LLAMA_UMA_STREAM_N_KIND + kind;
                 // M7.0: platform-dispatched GPU-readable host slot buffer (Metal wrap / CUDA
                 // pinned host). Owned immediately per (il,kind) so any later throw releases it
@@ -3625,8 +3714,8 @@ void llama_context::uma_stream_setup() {
                 uma_stream->slot_alloc[i] = alloc;
                 uma_stream->slot_buf[i].reset(buf);
 
-                // slot tensor is [ne0, ne1, n_slots] (compressed expert dim)
-                const int64_t slot_ne[GGML_MAX_DIMS] = { src->ne[0], src->ne[1], (int64_t) n_slots, 1 };
+                // slot tensor is [ne0, ne1, active S] (compressed expert dim)
+                const int64_t slot_ne[GGML_MAX_DIMS] = { src->ne[0], src->ne[1], (int64_t) n_slots_initial, 1 };
                 ggml_tensor * st = ggml_new_tensor(mctx, src->type, GGML_MAX_DIMS, slot_ne);
                 if (st == nullptr) {
                     throw std::runtime_error("uma stream: failed to create a slot tensor");
@@ -3669,6 +3758,7 @@ void llama_context::uma_stream_setup() {
                         }
                         thost = ggml_backend_buffer_get_base(twrap);
                         memset(thost, 0, tbl_bytes); // non-resident experts -> sentinel slot 0
+                        ggml_backend_buffer_set_usage(twrap, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                         uma_stream->wraps.emplace_back(twrap);
                     } else {
                         const size_t talloc = ((tbl_bytes + page - 1) / page) * page;
@@ -3681,6 +3771,7 @@ void llama_context::uma_stream_setup() {
                             throw std::runtime_error(format("uma stream: table wrap failed il=%u", il));
                         }
                         memset(thost, 0, talloc); // non-resident experts -> sentinel slot 0
+                        ggml_backend_buffer_set_usage(twrap, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                         uma_stream->host_bases.push_back(thost); // Metal: posix_memalign'd (dtor free())
                         uma_stream->wraps.emplace_back(twrap);
                     }
@@ -3698,8 +3789,8 @@ void llama_context::uma_stream_setup() {
                 }
             }
         }
-        fprintf(stderr, "uma: stream slot pool built: %zu tables x %u/%u experts (%s, GPU in-place), layers [0,%u)\n",
-                uma_stream->wraps.size(), n_slots, n_expert,
+        fprintf(stderr, "uma: stream slot pool built: %zu tables, S active/ceiling/expert %u/%u/%u (%s, GPU in-place), layers [0,%u)\n",
+                uma_stream->wraps.size(), n_slots_initial, n_slots, n_expert,
                 uma_stream_use_cuda_host ? "CUDA pinned host" : "Metal StorageModeShared no-rset", k);
 
         // the slot pool is resident; the streamed experts were loaded only to
@@ -3732,8 +3823,10 @@ void llama_context::uma_stream_setup() {
             }
             char * end = nullptr;
             const long smin = strtol(env_smin, &end, 10);
-            if (end == env_smin || *end != '\0' || smin < (long) n_expert_used || smin > (long) n_slots) {
-                throw std::runtime_error(format("invalid LLAMA_UMA_STREAM_SMIN '%s' (want %u..%u)", env_smin, n_expert_used, n_slots));
+            if (end == env_smin || *end != '\0' || smin < (long) n_expert_used ||
+                smin > (long) n_slots_initial) {
+                throw std::runtime_error(format("invalid LLAMA_UMA_STREAM_SMIN '%s' (want %u..initial S=%u)",
+                                                env_smin, n_expert_used, n_slots_initial));
             }
             uma_resize_smin = (int32_t) smin;
         }
@@ -4066,6 +4159,26 @@ llm_graph_cb llama_context::graph_get_cb() const {
             uma_stream->streams_layer(il)) {
             ggml_set_output(cur);
             uma_stream->topk[il] = cur;
+        }
+
+        // Streaming slot/table tensors are host-visible weights. CUDA intentionally does
+        // not advertise CUDA_Host as a generally supported device buft, so the default
+        // batch-1 heuristic can place both the table gather and expert matmuls on CPU.
+        // The scheduler allowlist established by uma_stream_setup proves these exact bufts
+        // GPU-readable; explicitly pin their graph nodes to that GPU device.
+        if (uma_stream && il >= 0 && uma_stream->streams_layer(il) &&
+            (strcmp(name, "ffn_moe_decouple_gather") == 0 ||
+             strcmp(name, "ffn_moe_gate")           == 0 ||
+             strcmp(name, "ffn_moe_up")             == 0 ||
+             strcmp(name, "ffn_moe_gate_up")        == 0 ||
+             strcmp(name, "ffn_moe_down")           == 0)) {
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == uma_stream_gpu_dev &&
+                    ggml_backend_supports_op(backend.get(), cur)) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                    break;
+                }
+            }
         }
 
         // uma-moe fork M5 S1.1.1: the streaming fill op (GGML_OP_CUSTOM, CPU-only)

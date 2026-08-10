@@ -52,11 +52,13 @@ struct llama_uma_stream_admit_ud {
 // pinned so a batch never evicts an expert it still needs).
 struct llama_uma_stream_layer_lru {
     std::vector<int32_t>  slot_of_expert; // n_expert
-    std::vector<int32_t>  expert_in_slot; // n_slots
-    std::vector<uint64_t> last_used;      // n_slots
-    std::vector<uint64_t> pinned;         // n_slots (== pass when pinned this pass)
-    std::vector<uint8_t>  pin_protected;  // n_slots (1 = hot/warm-start, never an eviction victim)
-    std::vector<int32_t>  newly_admitted; // experts admitted this pass (<= n_slots)
+    // Capacity-sized to the ceiling, but only [0,n_slots_active) may be
+    // searched, indexed by a published table entry, or backed by slot bytes.
+    std::vector<int32_t>  expert_in_slot;
+    std::vector<uint64_t> last_used;
+    std::vector<uint64_t> pinned;         // == pass when pinned this pass
+    std::vector<uint8_t>  pin_protected;  // 1 = hot/warm-start, never an eviction victim
+    std::vector<int32_t>  newly_admitted; // experts admitted this pass (<= active S)
     uint32_t n_newly = 0;
     uint64_t tick    = 0;                 // monotonic LRU clock
     uint64_t pass    = 0;                 // monotonic admit-pass counter
@@ -64,8 +66,8 @@ struct llama_uma_stream_layer_lru {
 
 struct llama_uma_stream_state {
     const llama_model * model = nullptr;
-    uint32_t n_slots      = 0;  // S ceiling: max slots per (layer,kind) the controller grows to.
-    uint32_t n_slots_active = 0; // M6: current resident slots. The slot BUFFER is this size and is
+    uint32_t n_slots        = 0; // S ceiling: max slots per (layer,kind) the controller grows to.
+    uint32_t n_slots_active = 0; // Current resident slots. The slot BUFFER is this size and is
                                  // REALLOCATED on resize (a live Metal buffer pins its pages, so an
                                  // in-place madvise cannot shed phys_footprint - only release does).
     uint32_t n_expert     = 0;
@@ -79,6 +81,11 @@ struct llama_uma_stream_state {
     uint64_t n_distress   = 0;  // times a shed target below the knee was clamped (M7 signal)
     uint64_t n_overflow   = 0;  // expert-reads routed to sentinel slot 0 because a batch (a prefill
                                 // ubatch) needed > S distinct experts - graceful miss, a raise-S signal
+    uint64_t last_resize_free_us   = 0;
+    uint64_t last_resize_alloc_us  = 0;
+    uint64_t last_resize_reseed_us = 0;
+    size_t   last_resize_foot_after_free  = 0;
+    size_t   last_resize_avail_after_free = 0;
     uint32_t s_min_active = 0;  // smallest n_slots_active reached (0 = unset)
     uint32_t s_max_active = 0;  // largest n_slots_active reached
     bool     parked       = false; // M7 improvement (1): serving-state park. A provably-not-
