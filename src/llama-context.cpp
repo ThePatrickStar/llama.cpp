@@ -306,11 +306,12 @@ llama_context::llama_context(
 
     // uma-moe give-back (B): cap the prefill ubatch so a single ubatch can never select MORE distinct
     // experts than the resident slot floor S. A ubatch of U tokens selects <= U*n_expert_used distinct
-    // experts; capping U <= S_floor/n_expert_used guarantees <= S_floor <= S, so the admit never
-    // overflows to sentinel slot 0 -> no skewed slot distribution -> the stock mmq activation-scatter
-    // (quantize_scatter_mmq_q8_1) never IMAs (verified on cd-vm: overflow crashes, no-overflow is clean).
-    // S_floor = SMIN (M6 give-back floor) else initial S. Prefill-only
-    // cost (decode is single-token); the deeper mmq-scatter fix would restore full prefill throughput.
+    // experts; capping U <= S_floor/n_expert_used guarantees <= S_floor <= S, so the ordinary admit
+    // path never overflows to sentinel slot 0. Compressed DEVICE_SLOTS route prefill from the static
+    // table, so cold experts can still produce duplicate sentinel-0 ids. The MMQ compact activation
+    // scatter assumes unique ids and IMAs on those duplicates; keep compressed device prefill on the
+    // direct, duplicate-safe MMVQ kernel (MMVQ_MAX_BATCH_SIZE=8). S_floor = SMIN (M6 floor) else initial
+    // S. Both guards are prefill-only; batch-1 decode is unchanged.
     if (const char * env_k = getenv("LLAMA_UMA_STREAM_K");
             env_k != nullptr && env_k[0] != '\0' && !llama_uma_stream_static_full_enabled()) {
         const uint32_t nu = model.hparams.n_expert_used ? model.hparams.n_expert_used : 1;
@@ -321,11 +322,22 @@ llama_context::llama_context(
                                             s_floor, nu, s_cfg.initial));
         }
         if (s_floor > 0) {
-            const uint32_t ub_cap = std::max<uint32_t>(1, (uint32_t) (s_floor / (long) nu));
+            uint32_t ub_cap = std::max<uint32_t>(1, (uint32_t) (s_floor / (long) nu));
+            const bool device_mmvq_guard = llama_uma_stream_device_slots_enabled() &&
+                                           s_cfg.initial < model.hparams.n_expert && ub_cap > 8;
+            if (device_mmvq_guard) {
+                ub_cap = 8; // ggml-cuda MMVQ_MAX_BATCH_SIZE
+            }
             if (cparams.n_ubatch > ub_cap) {
-                fprintf(stderr, "uma: give-back capping n_ubatch %u -> %u (S_floor=%ld / n_expert_used=%u) "
-                        "so a prefill ubatch never overflows the resident slots (mmq-scatter overflow guard)\n",
-                        cparams.n_ubatch, ub_cap, s_floor, nu);
+                if (device_mmvq_guard) {
+                    fprintf(stderr, "uma: device-slot capping n_ubatch %u -> %u (compressed sentinel routes "
+                            "require duplicate-safe MMVQ; MMVQ_MAX_BATCH_SIZE=8)\n",
+                            cparams.n_ubatch, ub_cap);
+                } else {
+                    fprintf(stderr, "uma: give-back capping n_ubatch %u -> %u (S_floor=%ld / n_expert_used=%u) "
+                            "so a prefill ubatch never overflows the resident slots (mmq-scatter overflow guard)\n",
+                            cparams.n_ubatch, ub_cap, s_floor, nu);
+                }
                 cparams.n_ubatch = ub_cap;
             }
         }
