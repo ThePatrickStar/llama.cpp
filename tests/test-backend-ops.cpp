@@ -9038,6 +9038,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // matrix. Exercise both broadcast gate/up and per-route down activations.
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 4, true,  2880, 32, 2880, true));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 4, false, 2880, 32, 2880, true));
+    // Task 20: exercise the duplicate-safe MMQ mapper at the real prefill token count.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 4, true,  32, 512, 32, true));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 4, false, 32, 512, 32, true));
     // The occurrence-preserving helper must remain correct when the route IDs
     // are unique (the all-resident device-slot permutation).
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 4, true,  2880, 35, 2880, false, true));

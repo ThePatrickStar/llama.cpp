@@ -1906,7 +1906,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         static const bool trace_mmvq = ggml_cuda_mmvq_mul_mat_id_env("GGML_CUDA_MMVQ_MUL_MAT_ID_TRACE");
         static const bool trace_mmq  = ggml_cuda_mmvq_mul_mat_id_env("GGML_CUDA_MMQ_MUL_MAT_ID_TRACE");
         const bool marked = ggml_mul_mat_id_get_allow_duplicate_ids(dst);
-        if (force_mmvq && ggml_is_quantized(src0->type) && ne2 > MMVQ_MAX_BATCH_SIZE) {
+        if ((marked || force_mmvq) && ggml_is_quantized(src0->type) && ne2 > MMVQ_MAX_BATCH_SIZE) {
             const int chunk_size = get_mmvq_mmid_max_batch(src0->type, cc);
             GGML_ASSERT(chunk_size > 0 && chunk_size <= MMVQ_MAX_BATCH_SIZE);
             if (trace_mmvq) {

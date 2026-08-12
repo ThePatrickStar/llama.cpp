@@ -2022,11 +2022,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * slot_ids = ggml_reshape_2d(ctx0, g, selected_experts->ne[0], selected_experts->ne[1]);
         cb(slot_ids, "ffn_moe_decouple_route", il);
         route_ids = slot_ids;
-        // Device-slot routes are an arbitrary expert->slot permutation even at
-        // S=n_expert. Use the occurrence-preserving MMQ mapper for the whole
-        // device-slot path: it is equivalent for unique ids and also handles
-        // compressed sentinel aliases. Batch-1 decode still selects MMVQ.
-        route_ids_may_alias = uma_stream->device_slots;
+        // Only compressed device slots can alias several cold experts to the
+        // sentinel slot. All-resident device slots are a unique permutation and
+        // retain the ordinary stock MMQ path; batch-1 decode still selects MMVQ.
+        route_ids_may_alias = uma_stream->device_slots && uma_stream->n_slots < uma_stream->n_expert;
         if (up_exps   && uma_stream->streams(il, LLAMA_UMA_STREAM_UP))   { up_exps   = uma_stream->slot(il, LLAMA_UMA_STREAM_UP); }
         if (gate_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_GATE)) { gate_exps = uma_stream->slot(il, LLAMA_UMA_STREAM_GATE); }
         if (down_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_DOWN)) { down_exps = uma_stream->slot(il, LLAMA_UMA_STREAM_DOWN); }
