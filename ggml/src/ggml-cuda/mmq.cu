@@ -188,6 +188,7 @@ void ggml_cuda_mul_mat_q(
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+    const bool allow_duplicate_ids = ggml_mul_mat_id_get_allow_duplicate_ids(dst);
 
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
@@ -195,7 +196,8 @@ void ggml_cuda_mul_mat_q(
         const int sis1 = nb12 / nb11;
 
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast,
+            allow_duplicate_ids, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -248,7 +250,10 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12};
+        // With unique ids an expert has at most one row per token. Aliased ids
+        // can route all top-k occurrences to one matrix, so register the full
+        // compact-row bound; empty expert tiles return immediately.
+        allow_duplicate_ids ? ne_get_rows : ne12};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }

@@ -304,14 +304,11 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
-    // uma-moe give-back (B): cap the prefill ubatch so a single ubatch can never select MORE distinct
-    // experts than the resident slot floor S. A ubatch of U tokens selects <= U*n_expert_used distinct
-    // experts; capping U <= S_floor/n_expert_used guarantees <= S_floor <= S, so the ordinary admit
-    // path never overflows to sentinel slot 0. Compressed DEVICE_SLOTS route prefill from the static
-    // table, so cold experts can still produce duplicate sentinel-0 ids. The MMQ compact activation
-    // scatter assumes unique ids and IMAs on those duplicates; keep compressed device prefill on the
-    // direct, duplicate-safe MMVQ kernel (MMVQ_MAX_BATCH_SIZE=8). S_floor = SMIN (M6 floor) else initial
-    // S. Both guards are prefill-only; batch-1 decode is unchanged.
+    // uma-moe give-back (B): the ordinary synchronous admit path still caps prefill so one ubatch
+    // cannot select more distinct experts than the resident floor. Compressed DEVICE_SLOTS use the
+    // static expert->slot table instead; their CUDA MUL_MAT_ID nodes explicitly allow aliased route
+    // ids and MMQ preserves every occurrence, so they retain the requested full prefill ubatch.
+    // S_floor = SMIN (M6 give-back floor) else initial S. Decode is single-token and unchanged.
     if (const char * env_k = getenv("LLAMA_UMA_STREAM_K");
             env_k != nullptr && env_k[0] != '\0' && !llama_uma_stream_static_full_enabled()) {
         const uint32_t nu = model.hparams.n_expert_used ? model.hparams.n_expert_used : 1;
@@ -321,23 +318,14 @@ llama_context::llama_context(
             throw std::runtime_error(format("invalid LLAMA_UMA_STREAM_SMIN %ld (want %u..initial S=%u)",
                                             s_floor, nu, s_cfg.initial));
         }
-        if (s_floor > 0) {
-            uint32_t ub_cap = std::max<uint32_t>(1, (uint32_t) (s_floor / (long) nu));
-            const bool device_mmvq_guard = llama_uma_stream_device_slots_enabled() &&
-                                           s_cfg.initial < model.hparams.n_expert && ub_cap > 8;
-            if (device_mmvq_guard) {
-                ub_cap = 8; // ggml-cuda MMVQ_MAX_BATCH_SIZE
-            }
+        const bool compressed_device_slots = llama_uma_stream_device_slots_enabled() &&
+                                             s_cfg.initial < model.hparams.n_expert;
+        if (s_floor > 0 && !compressed_device_slots) {
+            const uint32_t ub_cap = std::max<uint32_t>(1, (uint32_t) (s_floor / (long) nu));
             if (cparams.n_ubatch > ub_cap) {
-                if (device_mmvq_guard) {
-                    fprintf(stderr, "uma: device-slot capping n_ubatch %u -> %u (compressed sentinel routes "
-                            "require duplicate-safe MMVQ; MMVQ_MAX_BATCH_SIZE=8)\n",
-                            cparams.n_ubatch, ub_cap);
-                } else {
-                    fprintf(stderr, "uma: give-back capping n_ubatch %u -> %u (S_floor=%ld / n_expert_used=%u) "
-                            "so a prefill ubatch never overflows the resident slots (mmq-scatter overflow guard)\n",
-                            cparams.n_ubatch, ub_cap, s_floor, nu);
-                }
+                fprintf(stderr, "uma: give-back capping n_ubatch %u -> %u (S_floor=%ld / n_expert_used=%u) "
+                        "so a prefill ubatch never overflows the resident slots (mmq-scatter overflow guard)\n",
+                        cparams.n_ubatch, ub_cap, s_floor, nu);
                 cparams.n_ubatch = ub_cap;
             }
         }

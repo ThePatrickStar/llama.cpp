@@ -120,20 +120,77 @@ static __global__ void mm_ids_helper(
     expert_bounds[gridDim.x] = nex_prev + it_compact;
 }
 
+// Occurrence-preserving variant for route tables that may alias several logical
+// experts to one physical matrix (for example, cold experts to sentinel slot 0).
+// Every flattened (token, top-k slot) route gets its own compact row, including
+// duplicates. This keeps ids_dst a permutation and fully initializes either the
+// inverse broadcast-scatter map or the forward activation-gather map.
+template <int n_expert_used_template>
+__launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mm_ids_helper_duplicate_safe(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
+        int32_t * __restrict__ expert_bounds, const int n_tokens, const int n_expert_used_var,
+        const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
+    const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
+    const int expert = blockIdx.x;
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    // Preserve the stock helper's token-major ordering within each expert.
+    // Some MMQ implementations consume compact rows in that stable order.
+    int nex_prev = 0;
+    for (int it = 0; it < n_tokens; ++it) {
+        for (int iex = 0; iex < n_expert_used; ++iex) {
+            nex_prev += ids[it*si1 + iex] < expert;
+        }
+    }
+
+    int nmatch = 0;
+    for (int it = 0; it < n_tokens; ++it) {
+        for (int iex = 0; iex < n_expert_used; ++iex) {
+            if (ids[it*si1 + iex] != expert) {
+                continue;
+            }
+            const int ir = it*n_expert_used + iex;
+            const int compact = nex_prev + nmatch++;
+            ids_dst[compact] = ir;
+            if (write_inverse) {
+                ids_src1[ir] = compact;
+            } else {
+                ids_src1[compact] = it*sis1 + iex % nchannels_y;
+            }
+        }
+    }
+
+    expert_bounds[expert] = nex_prev;
+    if (expert == static_cast<int>(gridDim.x) - 1) {
+        expert_bounds[gridDim.x] = nex_prev + nmatch;
+    }
+}
+
 template <int n_expert_used_template>
 static void launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+        const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1,
+        const int sis1, const bool write_inverse, const bool allow_duplicate_ids, cudaStream_t stream) {
     GGML_ASSERT(n_tokens          < (1 << 22) && "too few bits in mm_ids_helper_store");
     GGML_ASSERT(n_expert_used_var < (1 << 10) && "too few bits in mm_ids_helper_store");
+    GGML_ASSERT((int64_t) n_tokens*n_expert_used_var <= INT_MAX && "too many mul_mat_id routes");
 
     const int id = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
-    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
-    CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_helper<n_expert_used_template>, smpbo);
 
     const dim3 num_blocks(n_experts, 1, 1);
     const dim3 block_size(warp_size, 1, 1);
+    if (allow_duplicate_ids) {
+        mm_ids_helper_duplicate_safe<n_expert_used_template><<<num_blocks, block_size, 0, stream>>>
+            (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
+        return;
+    }
+
+    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+    CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_helper<n_expert_used_template>, smpbo);
     const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
     GGML_ASSERT(nbytes_shared <= smpbo);
     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
@@ -142,28 +199,29 @@ static void launch_mm_ids_helper(
 
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1,
+        const int sis1, const bool write_inverse, const bool allow_duplicate_ids, cudaStream_t stream) {
     switch (n_expert_used) {
         case  2:
-            launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, allow_duplicate_ids, stream);
             break;
         case  4:
-            launch_mm_ids_helper< 4>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_mm_ids_helper< 4>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, allow_duplicate_ids, stream);
             break;
         case  6:
-            launch_mm_ids_helper< 6>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_mm_ids_helper< 6>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, allow_duplicate_ids, stream);
             break;
         case  8:
-            launch_mm_ids_helper< 8>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_mm_ids_helper< 8>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, allow_duplicate_ids, stream);
             break;
         case 16:
-            launch_mm_ids_helper<16>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_mm_ids_helper<16>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, allow_duplicate_ids, stream);
             break;
         case 32:
-            launch_mm_ids_helper<32>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_mm_ids_helper<32>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, allow_duplicate_ids, stream);
             break;
         default:
-            launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, allow_duplicate_ids, stream);
             break;
     }
 }

@@ -3352,6 +3352,18 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+void ggml_mul_mat_id_set_allow_duplicate_ids(
+        struct ggml_tensor * a,
+        bool                 allow) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    ggml_set_op_params_i32(a, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1, allow ? 1 : 0);
+}
+
+bool ggml_mul_mat_id_get_allow_duplicate_ids(const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    return ggml_get_op_params_i32(a, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1) != 0;
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

@@ -4421,6 +4421,22 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     }
 }
 
+static void init_mul_mat_id_duplicate_tensors(ggml_context * ctx, int n_mats) {
+    init_mul_mat_id_tensors(ctx, n_mats);
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+            continue;
+        }
+        for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+            std::vector<int32_t> data(t->ne[0]);
+            for (int64_t i = 0; i < t->ne[0]; ++i) {
+                data[i] = i == 1 ? 0 : i % n_mats;
+            }
+            ggml_backend_tensor_set(t, data.data(), r*t->nb[1], t->ne[0]*sizeof(int32_t));
+        }
+    }
+}
+
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -4431,9 +4447,10 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const bool duplicate_ids;
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
+        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, duplicate_ids);
     }
 
     double max_nmse_err() override {
@@ -4455,10 +4472,11 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32, bool duplicate_ids = false)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k) {
+            m(m), n(n), k(k), duplicate_ids(duplicate_ids) {
             GGML_ASSERT(n_used <= n_mats);
+            GGML_ASSERT(!duplicate_ids || n_used >= 2);
         }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -4477,13 +4495,18 @@ struct test_mul_mat_id : public test_case {
         ggml_set_name(b, "b");
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_mul_mat_id_set_allow_duplicate_ids(out, duplicate_ids);
         ggml_set_name(out, "out");
 
         return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, n_mats);
+        if (duplicate_ids) {
+            init_mul_mat_id_duplicate_tensors(ctx, n_mats);
+        } else {
+            init_mul_mat_id_tensors(ctx, n_mats);
+        }
     }
 };
 
@@ -9009,6 +9032,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
+    // Compressed MoE slots may map multiple logical experts to one sentinel
+    // matrix. Exercise both broadcast gate/up and per-route down activations.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 4, true,  2880, 32, 2880, true));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 4, false, 2880, 32, 2880, true));
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
