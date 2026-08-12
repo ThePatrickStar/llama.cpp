@@ -1882,6 +1882,11 @@ static void ggml_cuda_mul_mat_id_mmvq_chunked(
     }
 }
 
+static bool ggml_cuda_mmvq_mul_mat_id_env(const char * name) {
+    const char * value = getenv(name);
+    return value != nullptr && std::atoi(value) != 0;
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -1897,10 +1902,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
-        if (ggml_mul_mat_id_get_allow_duplicate_ids(dst) && ggml_is_quantized(src0->type) &&
-                ne2 > MMVQ_MAX_BATCH_SIZE) {
+        static const bool force_mmvq = ggml_cuda_mmvq_mul_mat_id_env("GGML_CUDA_MMVQ_MUL_MAT_ID");
+        static const bool trace_mmvq = ggml_cuda_mmvq_mul_mat_id_env("GGML_CUDA_MMVQ_MUL_MAT_ID_TRACE");
+        const bool marked = ggml_mul_mat_id_get_allow_duplicate_ids(dst);
+        if ((marked || force_mmvq) && ggml_is_quantized(src0->type) && ne2 > MMVQ_MAX_BATCH_SIZE) {
             const int chunk_size = get_mmvq_mmid_max_batch(src0->type, cc);
             GGML_ASSERT(chunk_size > 0 && chunk_size <= MMVQ_MAX_BATCH_SIZE);
+            if (trace_mmvq) {
+                fprintf(stderr,
+                        "ggml_cuda_mul_mat_id: MMVQ tiled dispatch marked=%d forced=%d type=%s "
+                        "ne2=%" PRId64 " chunk=%d\n",
+                        marked ? 1 : 0, force_mmvq ? 1 : 0, ggml_type_name(src0->type), ne2, chunk_size);
+            }
             ggml_cuda_mul_mat_id_mmvq_chunked(ctx, src0, src1, ids, dst, chunk_size);
             return;
         }
