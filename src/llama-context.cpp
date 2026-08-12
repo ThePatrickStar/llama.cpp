@@ -305,9 +305,9 @@ llama_context::llama_context(
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
     // uma-moe give-back (B): the ordinary synchronous admit path still caps prefill so one ubatch
-    // cannot select more distinct experts than the resident floor. Compressed DEVICE_SLOTS use the
-    // static expert->slot table instead; their CUDA MUL_MAT_ID nodes explicitly allow aliased route
-    // ids and MMQ preserves every occurrence, so they retain the requested full prefill ubatch.
+    // cannot select more distinct experts than the resident floor. DEVICE_SLOTS use the static
+    // expert->slot table instead; their CUDA MUL_MAT_ID nodes are marked for duplicate-safe internal
+    // MMVQ tiling, so both compressed and all-resident pools retain the requested full prefill ubatch.
     // S_floor = SMIN (M6 give-back floor) else initial S. Decode is single-token and unchanged.
     if (const char * env_k = getenv("LLAMA_UMA_STREAM_K");
             env_k != nullptr && env_k[0] != '\0' && !llama_uma_stream_static_full_enabled()) {
@@ -318,9 +318,8 @@ llama_context::llama_context(
             throw std::runtime_error(format("invalid LLAMA_UMA_STREAM_SMIN %ld (want %u..initial S=%u)",
                                             s_floor, nu, s_cfg.initial));
         }
-        const bool compressed_device_slots = llama_uma_stream_device_slots_enabled() &&
-                                             s_cfg.initial < model.hparams.n_expert;
-        if (s_floor > 0 && !compressed_device_slots) {
+        const bool device_slots = llama_uma_stream_device_slots_enabled();
+        if (s_floor > 0 && !device_slots) {
             const uint32_t ub_cap = std::max<uint32_t>(1, (uint32_t) (s_floor / (long) nu));
             if (cparams.n_ubatch > ub_cap) {
                 fprintf(stderr, "uma: give-back capping n_ubatch %u -> %u (S_floor=%ld / n_expert_used=%u) "
