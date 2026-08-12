@@ -4448,9 +4448,10 @@ struct test_mul_mat_id : public test_case {
     const int64_t n;
     const int64_t k;
     const bool duplicate_ids;
+    const bool force_duplicate_safe;
 
     std::string vars() override {
-        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, duplicate_ids);
+        return VARS_TO_STR10(type_a, type_b, n_mats, n_used, b, m, n, k, duplicate_ids, force_duplicate_safe);
     }
 
     double max_nmse_err() override {
@@ -4472,9 +4473,10 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32, bool duplicate_ids = false)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32, bool duplicate_ids = false,
+            bool force_duplicate_safe = false)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), duplicate_ids(duplicate_ids) {
+            m(m), n(n), k(k), duplicate_ids(duplicate_ids), force_duplicate_safe(force_duplicate_safe) {
             GGML_ASSERT(n_used <= n_mats);
             GGML_ASSERT(!duplicate_ids || n_used >= 2);
         }
@@ -4495,7 +4497,7 @@ struct test_mul_mat_id : public test_case {
         ggml_set_name(b, "b");
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
-        ggml_mul_mat_id_set_allow_duplicate_ids(out, duplicate_ids);
+        ggml_mul_mat_id_set_allow_duplicate_ids(out, duplicate_ids || force_duplicate_safe);
         ggml_set_name(out, "out");
 
         return out;
@@ -9036,6 +9038,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // matrix. Exercise both broadcast gate/up and per-route down activations.
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 4, true,  2880, 32, 2880, true));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 4, false, 2880, 32, 2880, true));
+    // The occurrence-preserving helper must remain correct when the route IDs
+    // are unique (the all-resident device-slot permutation).
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 4, true,  2880, 32, 2880, false, true));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 4, false, 2880, 32, 2880, false, true));
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
