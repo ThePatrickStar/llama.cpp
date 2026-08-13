@@ -4357,8 +4357,6 @@ void llama_context::uma_stream_setup() {
         uma_stream->decouple = decouple;
         uma_stream->adapt    = adapt;
         uma_stream->device_slots = device_slots_requested;
-        uma_stream->decode_exact_after_resize =
-            device_slots_requested && getenv("LLAMA_UMA_STREAM_EXACT_DECODE") != nullptr;
         uma_stream->device_backend = device_slots_requested ? gpu_backend : nullptr;
         if (decouple && getenv("LLAMA_UMA_STREAM_HOTFREQ") == nullptr) {
             throw std::runtime_error("uma stream: LLAMA_UMA_STREAM_DECOUPLE/ADAPT requires LLAMA_UMA_STREAM_HOTFREQ (initial slot seed)");
