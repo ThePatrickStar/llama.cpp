@@ -1417,9 +1417,15 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s,
-                  bool   allow_duplicate_ids) const {
+                  bool   allow_duplicate_ids,
+          ggml_tensor * service_ids,
+                  void * service_data) const {
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
     ggml_mul_mat_id_set_allow_duplicate_ids(res, allow_duplicate_ids);
+    if (service_ids != nullptr) {
+        ggml_mul_mat_id_set_prefill_service(
+            res, service_ids, llama_uma_stream_service_prefill_tile, service_data);
+    }
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
@@ -1996,6 +2002,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // is discarded anyway); the original expert tensors stay resident for it.
     ggml_tensor * route_ids = selected_experts;
     bool route_ids_may_alias = false;
+    ggml_tensor * route_service_ids = nullptr;
+    void * route_service_data = nullptr;
     if (uma_stream && uma_stream->streams_layer(il) && !cparams.warmup &&
         uma_stream->decouple && uma_stream->expert_table(il) &&
         (selected_experts->ne[1] == 1 || uma_stream->device_slots)) {
@@ -2026,6 +2034,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // sentinel slot. All-resident device slots are a unique permutation and
         // retain the ordinary stock MMQ path; batch-1 decode still selects MMVQ.
         route_ids_may_alias = uma_stream->device_slots && uma_stream->n_slots < uma_stream->n_expert;
+        if (route_ids_may_alias && selected_experts->ne[1] > 1) {
+            route_service_ids = selected_experts;
+            route_service_data = uma_stream->admit_ud(il);
+        }
         if (up_exps   && uma_stream->streams(il, LLAMA_UMA_STREAM_UP))   { up_exps   = uma_stream->slot(il, LLAMA_UMA_STREAM_UP); }
         if (gate_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_GATE)) { gate_exps = uma_stream->slot(il, LLAMA_UMA_STREAM_GATE); }
         if (down_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_DOWN)) { down_exps = uma_stream->slot(il, LLAMA_UMA_STREAM_DOWN); }
@@ -2076,7 +2088,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, route_ids, up_exps_s, route_ids_may_alias); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, route_ids, up_exps_s, route_ids_may_alias, route_service_ids, route_service_data); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2089,7 +2101,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, route_ids, gate_exps_s, route_ids_may_alias); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, route_ids, gate_exps_s, route_ids_may_alias, route_service_ids, route_service_data); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2178,7 +2190,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, route_ids, down_exps_s, route_ids_may_alias); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, route_ids, down_exps_s, route_ids_may_alias, route_service_ids, route_service_data); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {

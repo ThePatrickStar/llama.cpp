@@ -3364,6 +3364,45 @@ bool ggml_mul_mat_id_get_allow_duplicate_ids(const struct ggml_tensor * a) {
     return ggml_get_op_params_i32(a, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1) != 0;
 }
 
+struct ggml_mul_mat_id_prefill_service_params {
+    ggml_mul_mat_id_prefill_service_t service;
+    void * user_data;
+};
+
+void ggml_mul_mat_id_set_prefill_service(
+        struct ggml_tensor                  * a,
+        struct ggml_tensor                  * logical_ids,
+        ggml_mul_mat_id_prefill_service_t     service,
+        void                                * user_data) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(logical_ids != NULL && logical_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(logical_ids->ne[0] == a->src[2]->ne[0]);
+    GGML_ASSERT(logical_ids->ne[1] == a->src[2]->ne[1]);
+    GGML_ASSERT(service != NULL);
+    static_assert(sizeof(struct ggml_mul_mat_id_prefill_service_params) <= GGML_MAX_OP_PARAMS - sizeof(int32_t),
+                  "prefill service parameters must leave room for the duplicate-id flag");
+
+    const struct ggml_mul_mat_id_prefill_service_params params = { service, user_data };
+    memcpy(a->op_params, &params, sizeof(params));
+    a->src[3] = logical_ids;
+}
+
+bool ggml_mul_mat_id_get_prefill_service(
+        const struct ggml_tensor              * a,
+        ggml_mul_mat_id_prefill_service_t     * service,
+        void                                 ** user_data) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    struct ggml_mul_mat_id_prefill_service_params params;
+    memcpy(&params, a->op_params, sizeof(params));
+    if (service != NULL) {
+        *service = params.service;
+    }
+    if (user_data != NULL) {
+        *user_data = params.user_data;
+    }
+    return a->src[3] != NULL && params.service != NULL;
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

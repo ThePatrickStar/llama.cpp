@@ -658,6 +658,17 @@ llama_context::~llama_context() {
             fprintf(stderr, "uma: device-slot miss H2D: %llu experts, %.1f MiB uploaded\n",
                     (unsigned long long) uma_stream->n_h2d_miss,
                     uma_stream->n_h2d_bytes / (1024.0 * 1024.0));
+            fprintf(stderr,
+                    "uma: device-slot prefill service: tiles %llu, cold misses %llu, H2D %llu experts, %.1f MiB uploaded, failures %llu, substitutions %llu, max distinct %u\n",
+                    (unsigned long long) uma_stream->n_prefill_tiles,
+                    (unsigned long long) uma_stream->n_prefill_cold_miss,
+                    (unsigned long long) uma_stream->n_prefill_h2d_miss,
+                    uma_stream->n_prefill_h2d_bytes / (1024.0 * 1024.0),
+                    (unsigned long long) uma_stream->n_prefill_service_fail,
+                    (unsigned long long) uma_stream->n_prefill_substitute,
+                    uma_stream->prefill_max_distinct);
+            fprintf(stderr, "uma: stream substitution overflow: %llu\n",
+                    (unsigned long long) uma_stream->n_overflow);
         }
         if (uma_stream->n_resizes > 0 || uma_stream->n_distress > 0) {
             fprintf(stderr, "uma: M6 controller teardown: %llu resizes, %llu distress clamps, S reached [%u,%u] of max %u\n",
@@ -3172,6 +3183,147 @@ void llama_uma_stream_fill(ggml_tensor * dst, int ith, int /*nth*/, void * userd
     }
 }
 
+int llama_uma_stream_service_prefill_tile(
+        void * userdata, const int32_t * expert_ids, int32_t * slot_ids, int64_t n_ids) {
+    const auto * ud = (const llama_uma_stream_admit_ud *) userdata;
+    llama_uma_stream_state * S = ud == nullptr ? nullptr : ud->state;
+    if (S == nullptr || !S->device_slots || S->device_backend == nullptr || expert_ids == nullptr ||
+        slot_ids == nullptr || n_ids <= 0 || ud->il < 0 || (size_t) ud->il >= S->lru.size()) {
+        if (S != nullptr) {
+            S->n_prefill_service_fail++;
+        }
+        return -1;
+    }
+
+    llama_uma_stream_layer_lru & L = S->lru[ud->il];
+    const uint32_t Sn = S->n_slots_active;
+    std::vector<uint8_t> seen(S->n_expert, 0);
+    std::vector<int32_t> distinct;
+    distinct.reserve((size_t) n_ids);
+    for (int64_t i = 0; i < n_ids; i++) {
+        const int32_t e = expert_ids[i];
+        if (e < 0 || (uint32_t) e >= S->n_expert) {
+            continue;
+        }
+        if (!seen[e]) {
+            seen[e] = 1;
+            distinct.push_back(e);
+        }
+    }
+    if (distinct.size() > Sn) {
+        return 0;
+    }
+
+    S->n_prefill_tiles++;
+    for (int64_t i = 0; i < n_ids; i++) {
+        if (expert_ids[i] >= 0 && (uint32_t) expert_ids[i] < S->n_expert) {
+            S->n_read++;
+        }
+    }
+    S->prefill_max_distinct = std::max(S->prefill_max_distinct, (uint32_t) distinct.size());
+    L.pass++;
+    int32_t * tbl = S->expert_table(ud->il) ? (int32_t *) S->expert_table(ud->il)->data : nullptr;
+
+    for (const int32_t e : distinct) {
+        int32_t slot = L.slot_of_expert[e];
+        if (slot >= 0 && (uint32_t) slot < Sn) {
+            L.pinned[slot] = L.pass;
+            L.last_used[slot] = L.tick++;
+        } else if (slot >= 0) {
+            L.slot_of_expert[e] = -1;
+            if (tbl) {
+                tbl[e] = 0;
+            }
+        }
+    }
+
+    for (const int32_t e : distinct) {
+        if (L.slot_of_expert[e] >= 0) {
+            continue;
+        }
+
+        S->n_miss++;
+        S->n_prefill_cold_miss++;
+        uint64_t best_lu = UINT64_MAX;
+        int32_t slot = -1;
+        for (uint32_t s = 0; s < Sn; s++) {
+            if (L.expert_in_slot[s] < 0) {
+                slot = (int32_t) s;
+                break;
+            }
+            if (L.pinned[s] != L.pass && L.last_used[s] < best_lu) {
+                best_lu = L.last_used[s];
+                slot = (int32_t) s;
+            }
+        }
+        if (slot < 0) {
+            S->n_prefill_service_fail++;
+            return -1;
+        }
+
+        for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+            if (!S->streams(ud->il, kind)) {
+                continue;
+            }
+            const size_t slab = S->model->uma_stream_slab_bytes(ud->il, kind);
+            if ((size_t) kind >= S->device_stage_host.size() ||
+                S->device_stage_host[kind] == nullptr || S->device_stage_bytes[kind] < slab ||
+                !S->model->uma_stream_pread_expert(ud->il, kind, e, S->device_stage_host[kind])) {
+                S->n_prefill_service_fail++;
+                return -1;
+            }
+        }
+
+        uint64_t uploaded = 0;
+        for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+            if (!S->streams(ud->il, kind)) {
+                continue;
+            }
+            const size_t slab = S->model->uma_stream_slab_bytes(ud->il, kind);
+            ggml_backend_tensor_set_async(
+                S->device_backend, S->slot(ud->il, kind), S->device_stage_host[kind],
+                (size_t) slot * slab, slab);
+            uploaded += slab;
+        }
+        ggml_backend_synchronize(S->device_backend);
+
+        const int32_t old = L.expert_in_slot[slot];
+        if (old >= 0) {
+            L.slot_of_expert[old] = -1;
+            if (tbl) {
+                tbl[old] = 0;
+            }
+        }
+        L.expert_in_slot[slot] = e;
+        L.slot_of_expert[e] = slot;
+        L.pinned[slot] = L.pass;
+        L.last_used[slot] = L.tick++;
+        if (tbl) {
+            tbl[e] = slot;
+        }
+        S->n_h2d_miss++;
+        S->n_h2d_bytes += uploaded;
+        S->n_prefill_h2d_miss++;
+        S->n_prefill_h2d_bytes += uploaded;
+    }
+
+    for (int64_t i = 0; i < n_ids; i++) {
+        const int32_t e = expert_ids[i];
+        if (e < 0 || (uint32_t) e >= S->n_expert) {
+            slot_ids[i] = 0;
+            continue;
+        }
+        const int32_t slot = L.slot_of_expert[e];
+        if (slot < 0 || (uint32_t) slot >= Sn || L.expert_in_slot[slot] != e) {
+            S->n_prefill_substitute++;
+            S->n_prefill_service_fail++;
+            return -1;
+        }
+        slot_ids[i] = slot;
+    }
+    return 1;
+}
+
 // uma-moe fork M5 finish: hot-K warm start + LFU pin. Seed each streaming layer's slots
 // with its top-S hottest experts (from an LLAMA_UMA_STREAM_HOTFREQ dump = the
 // m5-capture-freq CSV) and pin the top-H against LRU eviction, so the resident set starts
@@ -3674,6 +3826,8 @@ void llama_context::uma_write_telemetry() {
     fprintf(f,
             "s_active %u\ns_ceiling %u\nn_expert_used %u\nn_miss %llu\nn_read %llu\n"
             "n_h2d_miss %llu\nn_h2d_bytes %llu\n"
+            "n_prefill_tiles %llu\nn_prefill_cold_miss %llu\nn_prefill_h2d_miss %llu\nn_prefill_h2d_bytes %llu\n"
+            "n_prefill_service_fail %llu\nn_prefill_substitute %llu\nprefill_max_distinct %u\n"
             "n_distress %llu\nn_overflow %llu\nn_resizes %llu\ns_min_reached %u\ns_max_reached %u\nphys_footprint_mib %zu\n"
             "last_resize_free_ms %.3f\nlast_resize_alloc_ms %.3f\nlast_resize_reseed_ms %.3f\n"
             "last_resize_foot_after_free_mib %zu\nlast_resize_avail_after_free_mib %zu\n"
@@ -3681,6 +3835,13 @@ void llama_context::uma_write_telemetry() {
             uma_stream->n_slots_active, uma_stream->n_slots, model.hparams.n_expert_used,
             (unsigned long long) uma_stream->n_miss, (unsigned long long) uma_stream->n_read,
             (unsigned long long) uma_stream->n_h2d_miss, (unsigned long long) uma_stream->n_h2d_bytes,
+            (unsigned long long) uma_stream->n_prefill_tiles,
+            (unsigned long long) uma_stream->n_prefill_cold_miss,
+            (unsigned long long) uma_stream->n_prefill_h2d_miss,
+            (unsigned long long) uma_stream->n_prefill_h2d_bytes,
+            (unsigned long long) uma_stream->n_prefill_service_fail,
+            (unsigned long long) uma_stream->n_prefill_substitute,
+            uma_stream->prefill_max_distinct,
             (unsigned long long) uma_stream->n_distress, (unsigned long long) uma_stream->n_overflow, (unsigned long long) uma_stream->n_resizes,
             uma_stream->s_min_active, uma_stream->s_max_active, llama_uma_phys_footprint_mib(),
             uma_stream->last_resize_free_us / 1000.0, uma_stream->last_resize_alloc_us / 1000.0,
@@ -3791,6 +3952,7 @@ void llama_context::uma_stream_setup() {
         uma_stream->decouple = decouple;
         uma_stream->adapt    = adapt;
         uma_stream->device_slots = device_slots_requested;
+        uma_stream->device_backend = device_slots_requested ? gpu_backend : nullptr;
         if (decouple && getenv("LLAMA_UMA_STREAM_HOTFREQ") == nullptr) {
             throw std::runtime_error("uma stream: LLAMA_UMA_STREAM_DECOUPLE/ADAPT requires LLAMA_UMA_STREAM_HOTFREQ (initial slot seed)");
         }

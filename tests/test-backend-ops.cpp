@@ -4437,6 +4437,12 @@ static void init_mul_mat_id_duplicate_tensors(ggml_context * ctx, int n_mats) {
     }
 }
 
+static int test_mul_mat_id_prefill_service(
+        void * /*user_data*/, const int32_t * expert_ids, int32_t * slot_ids, int64_t n_ids) {
+    std::copy(expert_ids, expert_ids + n_ids, slot_ids);
+    return 1;
+}
+
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -4449,9 +4455,10 @@ struct test_mul_mat_id : public test_case {
     const int64_t k;
     const bool duplicate_ids;
     const bool force_duplicate_safe;
+    const bool prefill_service;
 
     std::string vars() override {
-        return VARS_TO_STR10(type_a, type_b, n_mats, n_used, b, m, n, k, duplicate_ids, force_duplicate_safe);
+        return VARS_TO_STR11(type_a, type_b, n_mats, n_used, b, m, n, k, duplicate_ids, force_duplicate_safe, prefill_service);
     }
 
     double max_nmse_err() override {
@@ -4474,9 +4481,10 @@ struct test_mul_mat_id : public test_case {
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
             int64_t m = 32, int64_t n = 32, int64_t k = 32, bool duplicate_ids = false,
-            bool force_duplicate_safe = false)
+            bool force_duplicate_safe = false, bool prefill_service = false)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), duplicate_ids(duplicate_ids), force_duplicate_safe(force_duplicate_safe) {
+            m(m), n(n), k(k), duplicate_ids(duplicate_ids), force_duplicate_safe(force_duplicate_safe),
+            prefill_service(prefill_service) {
             GGML_ASSERT(n_used <= n_mats);
             GGML_ASSERT(!duplicate_ids || n_used >= 2);
         }
@@ -4498,6 +4506,9 @@ struct test_mul_mat_id : public test_case {
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
         ggml_mul_mat_id_set_allow_duplicate_ids(out, duplicate_ids || force_duplicate_safe);
+        if (prefill_service) {
+            ggml_mul_mat_id_set_prefill_service(out, ids, test_mul_mat_id_prefill_service, nullptr);
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -9041,6 +9052,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Task 20: exercise the duplicate-safe MMQ mapper at the real prefill token count.
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 4, true,  32, 512, 32, true));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 4, false, 32, 512, 32, true));
+    // Serviced prefill must preserve the logical route for both activation layouts.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 4, true,  32, 512, 32, false, true, true));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 4, false, 32, 512, 32, false, true, true));
     // The occurrence-preserving helper must remain correct when the route IDs
     // are unique (the all-resident device-slot permutation).
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 4, true,  2880, 35, 2880, false, true));

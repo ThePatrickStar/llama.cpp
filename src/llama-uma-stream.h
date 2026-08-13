@@ -75,6 +75,13 @@ struct llama_uma_stream_state {
     uint64_t n_read       = 0;  // total expert-reads (admits) over the context lifetime
     uint64_t n_h2d_miss   = 0;  // device-slot misses whose staged expert reached CUDA
     uint64_t n_h2d_bytes  = 0;  // bytes uploaded for those successful miss admissions
+    uint64_t n_prefill_tiles        = 0;
+    uint64_t n_prefill_cold_miss    = 0;
+    uint64_t n_prefill_h2d_miss     = 0;
+    uint64_t n_prefill_h2d_bytes    = 0;
+    uint64_t n_prefill_service_fail = 0;
+    uint64_t n_prefill_substitute   = 0;
+    uint32_t prefill_max_distinct   = 0;
     bool     decouple     = false; // LLAMA_UMA_STREAM_DECOUPLE: GPU-gather decode routing (Part 1)
     bool     adapt        = false; // LLAMA_UMA_STREAM_ADAPT: online resident-set maintenance (Part 2 Step 3)
 
@@ -133,6 +140,7 @@ struct llama_uma_stream_state {
     std::vector<ggml_backend_buffer_ptr> device_stage_buf;  // pinned-host pread staging, per kind
     std::vector<void *>                  device_stage_host; // owned by device_stage_buf
     std::vector<size_t>                  device_stage_bytes;
+    ggml_backend_t                       device_backend = nullptr;
     uint32_t pin_h = 0;   // warm-start hot-pin count; reseed reuses it, clamped to the new S
 
     ~llama_uma_stream_state() {
@@ -183,3 +191,8 @@ void llama_uma_stream_admit(ggml_tensor * dst, int ith, int nth, void * userdata
 // is slot_ids (a dependency anchor so this runs after admit). Output aliases the
 // slot tensor so the matmul weight depends on the fill = the CPU->GPU sync.
 void llama_uma_stream_fill(ggml_tensor * dst, int ith, int nth, void * userdata);
+
+// CUDA prefill callback: service all distinct logical experts in one MMVQ tile
+// and return the physical slot for every occurrence. A failure is fail-closed.
+int llama_uma_stream_service_prefill_tile(
+        void * userdata, const int32_t * expert_ids, int32_t * slot_ids, int64_t n_ids);

@@ -970,7 +970,9 @@ struct llm_graph_context {
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
               ggml_tensor * w_s = nullptr,
-                      bool   allow_duplicate_ids = false) const;
+                      bool   allow_duplicate_ids = false,
+              ggml_tensor * service_ids = nullptr,
+                      void * service_data = nullptr) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,

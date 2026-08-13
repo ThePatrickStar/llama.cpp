@@ -1457,6 +1457,28 @@ extern "C" {
     GGML_API bool ggml_mul_mat_id_get_allow_duplicate_ids(
             const struct ggml_tensor * a);
 
+    // Return >0 on success, 0 when the tile must be reduced, and <0 on a
+    // service failure that must stop inference.
+    typedef int (*ggml_mul_mat_id_prefill_service_t)(
+            void          * user_data,
+            const int32_t * expert_ids,
+            int32_t       * slot_ids,
+            int64_t         n_ids);
+
+    // Service logical expert ids before each prefill tile and replace them with
+    // the physical ids returned by the callback. The logical ids are an
+    // additional dependency and may have different strides from the routed ids.
+    GGML_API void ggml_mul_mat_id_set_prefill_service(
+            struct ggml_tensor                  * a,
+            struct ggml_tensor                  * logical_ids,
+            ggml_mul_mat_id_prefill_service_t     service,
+            void                                * user_data);
+
+    GGML_API bool ggml_mul_mat_id_get_prefill_service(
+            const struct ggml_tensor              * a,
+            ggml_mul_mat_id_prefill_service_t     * service,
+            void                                 ** user_data);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows
