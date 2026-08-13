@@ -675,6 +675,14 @@ llama_context::~llama_context() {
                     uma_stream->n_decode_h2d_bytes / (1024.0 * 1024.0),
                     (unsigned long long) uma_stream->n_decode_service_fail,
                     (unsigned long long) uma_stream->n_decode_substitute);
+            fprintf(stderr,
+                    "uma: device-slot fixed-S decode maintenance: calls %llu, late misses %llu, H2D %llu experts, %.1f MiB uploaded, failures %llu, exact-after-resize %u\n",
+                    (unsigned long long) uma_stream->n_decode_late_calls,
+                    (unsigned long long) uma_stream->n_decode_late_cold_miss,
+                    (unsigned long long) uma_stream->n_decode_late_h2d_miss,
+                    uma_stream->n_decode_late_h2d_bytes / (1024.0 * 1024.0),
+                    (unsigned long long) uma_stream->n_decode_late_fail,
+                    (unsigned) uma_stream->decode_exact_after_resize);
             fprintf(stderr, "uma: stream substitution overflow: %llu\n",
                     (unsigned long long) uma_stream->n_overflow);
         }
@@ -992,12 +1000,13 @@ void llama_context::synchronize() {
         // synchronize), so slot + table writes are torn-write-safe with NO background thread;
         // the next graph_compute sees the updated StorageModeShared state. One D2H per layer;
         // no per-layer graph op, so the decouple stays sync-free.
-        // Compressed CUDA device slots are serviced exactly inside the first
-        // MUL_MAT_ID, before weight consumption; that service already maintains
-        // LRU/read/miss telemetry. Do not repeat the old post-compute admission,
-        // which was one token late and would double-count the same selections.
+        // Multi-token prefill is always serviced exactly in its MUL_MAT_ID ops.
+        // Fixed-S decode retains the Task-21 post-compute maintenance fast path;
+        // after a live resize, decode_exact_after_resize switches the rebuilt
+        // graph to exact pre-consume service and suppresses this late path.
         if (uma_stream && uma_stream->decouple && t_compute_start_us != 0 &&
-            !(uma_stream->device_slots && uma_stream->n_slots_active < uma_stream->n_expert)) {
+            !(uma_stream->device_slots && uma_stream->n_slots_active < uma_stream->n_expert &&
+              uma_stream->decode_exact_after_resize)) {
             const uint32_t n_used = model.hparams.n_expert_used;
             const uint32_t Sn     = uma_stream->n_slots_active; // M6: online admits stay in the active window
             const bool     adapt  = uma_stream->adapt;
@@ -1020,6 +1029,9 @@ void llama_context::synchronize() {
                 }
                 if (t->type != GGML_TYPE_I32 || t->ne[0] < (int64_t) n_used) {
                     continue;
+                }
+                if (uma_stream->device_slots) {
+                    uma_stream->n_decode_late_calls++;
                 }
                 ggml_backend_tensor_get(t, ids.data(), 0, n_used * sizeof(int32_t));
                 llama_uma_stream_layer_lru & L = uma_stream->lru[il];
@@ -1046,6 +1058,9 @@ void llama_context::synchronize() {
                         if (tbl) { tbl[e] = 0; }
                     }
                     uma_stream->n_miss++; // selected expert not resident = decouple miss
+                    if (uma_stream->device_slots) {
+                        uma_stream->n_decode_late_cold_miss++;
+                    }
                     if (!adapt) {
                         continue; // static mode (Step 2): count only
                     }
@@ -1060,6 +1075,9 @@ void llama_context::synchronize() {
                         }
                     }
                     if (slot < 0) {
+                        if (uma_stream->device_slots) {
+                            uma_stream->n_decode_late_fail++;
+                        }
                         continue; // all S slots needed this token (>= S misses at once); next token
                     }
                     // Fill every streaming kind, THEN publish the table entry (so the next
@@ -1094,6 +1112,8 @@ void llama_context::synchronize() {
                             ggml_backend_synchronize(uma_stream_cuda_backend);
                             uma_stream->n_h2d_miss++;
                             uma_stream->n_h2d_bytes += uploaded;
+                            uma_stream->n_decode_late_h2d_miss++;
+                            uma_stream->n_decode_late_h2d_bytes += uploaded;
                         }
                     } else {
                         for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
@@ -1107,6 +1127,9 @@ void llama_context::synchronize() {
                         }
                     }
                     if (!ok) {
+                        if (uma_stream->device_slots) {
+                            uma_stream->n_decode_late_fail++;
+                        }
                         // partial pread (some kinds filled, one failed): the slot bytes are now
                         // mixed old/new = corrupt, so the OLD expert must not stay routable.
                         // Invalidate the slot (empty); a later admit refills it cleanly. e stays
@@ -3919,6 +3942,10 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
             uma_stream_force_rebuild = true;
             throw;
         }
+        // Fixed-S decode keeps the validated Task-21 fast path. A committed live
+        // S change can invalidate residents that the next token selects, so every
+        // subsequent decode graph services cold experts before use.
+        uma_stream->decode_exact_after_resize = true;
         if (map_ops_after < map_ops_before || unmap_ops_after < unmap_ops_before ||
             map_bytes_after < map_bytes_before || unmap_bytes_after < unmap_bytes_before) {
             GGML_ABORT("uma stream resize: CUDA VMM operation counters went backwards");
@@ -4177,6 +4204,8 @@ void llama_context::uma_write_telemetry() {
             "n_prefill_service_fail %llu\nn_prefill_substitute %llu\nprefill_max_distinct %u\n"
             "n_decode_service %llu\nn_decode_cold_miss %llu\nn_decode_h2d_miss %llu\nn_decode_h2d_bytes %llu\n"
             "n_decode_service_fail %llu\nn_decode_substitute %llu\n"
+            "n_decode_late_calls %llu\nn_decode_late_cold_miss %llu\nn_decode_late_h2d_miss %llu\nn_decode_late_h2d_bytes %llu\n"
+            "n_decode_late_fail %llu\ndecode_exact_after_resize %u\n"
             "n_distress %llu\nn_overflow %llu\nn_resizes %llu\ns_min_reached %u\ns_max_reached %u\nphys_footprint_mib %zu\n"
             "last_resize_free_ms %.3f\nlast_resize_alloc_ms %.3f\nlast_resize_reseed_ms %.3f\n"
             "last_resize_old_s %u\nlast_resize_new_s %u\nlast_resize_delta_s %u\nlast_resize_segments %u\n"
@@ -4201,6 +4230,12 @@ void llama_context::uma_write_telemetry() {
             (unsigned long long) uma_stream->n_decode_h2d_bytes,
             (unsigned long long) uma_stream->n_decode_service_fail,
             (unsigned long long) uma_stream->n_decode_substitute,
+            (unsigned long long) uma_stream->n_decode_late_calls,
+            (unsigned long long) uma_stream->n_decode_late_cold_miss,
+            (unsigned long long) uma_stream->n_decode_late_h2d_miss,
+            (unsigned long long) uma_stream->n_decode_late_h2d_bytes,
+            (unsigned long long) uma_stream->n_decode_late_fail,
+            (unsigned) uma_stream->decode_exact_after_resize,
             (unsigned long long) uma_stream->n_distress, (unsigned long long) uma_stream->n_overflow, (unsigned long long) uma_stream->n_resizes,
             uma_stream->s_min_active, uma_stream->s_max_active, llama_uma_phys_footprint_mib(),
             uma_stream->last_resize_free_us / 1000.0, uma_stream->last_resize_alloc_us / 1000.0,
@@ -4322,6 +4357,8 @@ void llama_context::uma_stream_setup() {
         uma_stream->decouple = decouple;
         uma_stream->adapt    = adapt;
         uma_stream->device_slots = device_slots_requested;
+        uma_stream->decode_exact_after_resize =
+            device_slots_requested && getenv("LLAMA_UMA_STREAM_EXACT_DECODE") != nullptr;
         uma_stream->device_backend = device_slots_requested ? gpu_backend : nullptr;
         if (decouple && getenv("LLAMA_UMA_STREAM_HOTFREQ") == nullptr) {
             throw std::runtime_error("uma stream: LLAMA_UMA_STREAM_DECOUPLE/ADAPT requires LLAMA_UMA_STREAM_HOTFREQ (initial slot seed)");

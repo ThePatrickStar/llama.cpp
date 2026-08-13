@@ -2038,12 +2038,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // the remaining gate/down matmuls.
         route_ids_may_alias = uma_stream->device_slots &&
             uma_stream->n_slots_active < uma_stream->n_expert;
-        if (route_ids_may_alias) {
+        const bool prefill_service = ubatch.n_seq_tokens > 1;
+        if (route_ids_may_alias && (prefill_service || uma_stream->decode_exact_after_resize)) {
             route_service_ids = selected_experts;
             // n_seq_tokens distinguishes prompt/prefill from continuous-batched
             // decode (several sequences can make total n_tokens > 1 while each
             // contributes exactly one decode token).
-            route_service_each_matmul = ubatch.n_seq_tokens > 1;
+            route_service_each_matmul = prefill_service;
             route_service_data = uma_stream->service_ud(il, route_service_each_matmul);
         }
         if (up_exps   && uma_stream->streams(il, LLAMA_UMA_STREAM_UP))   { up_exps   = uma_stream->slot(il, LLAMA_UMA_STREAM_UP); }

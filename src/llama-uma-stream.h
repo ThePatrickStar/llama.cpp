@@ -88,6 +88,12 @@ struct llama_uma_stream_state {
     uint64_t n_decode_h2d_bytes     = 0;
     uint64_t n_decode_service_fail  = 0;
     uint64_t n_decode_substitute    = 0;
+    uint64_t n_decode_late_calls    = 0; // unchanged fixed-S post-compute maintenance
+    uint64_t n_decode_late_cold_miss = 0;
+    uint64_t n_decode_late_h2d_miss  = 0;
+    uint64_t n_decode_late_h2d_bytes = 0;
+    uint64_t n_decode_late_fail      = 0;
+    bool     decode_exact_after_resize = false; // exact per-layer service after live S changes
     bool     decouple     = false; // LLAMA_UMA_STREAM_DECOUPLE: GPU-gather decode routing (Part 1)
     bool     adapt        = false; // LLAMA_UMA_STREAM_ADAPT: online resident-set maintenance (Part 2 Step 3)
 
