@@ -2004,6 +2004,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     bool route_ids_may_alias = false;
     ggml_tensor * route_service_ids = nullptr;
     void * route_service_data = nullptr;
+    bool route_service_each_matmul = false;
     if (uma_stream && uma_stream->streams_layer(il) && !cparams.warmup &&
         uma_stream->decouple && uma_stream->expert_table(il) &&
         (selected_experts->ne[1] == 1 || uma_stream->device_slots)) {
@@ -2042,7 +2043,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // n_seq_tokens distinguishes prompt/prefill from continuous-batched
             // decode (several sequences can make total n_tokens > 1 while each
             // contributes exactly one decode token).
-            route_service_data = uma_stream->service_ud(il, ubatch.n_seq_tokens > 1);
+            route_service_each_matmul = ubatch.n_seq_tokens > 1;
+            route_service_data = uma_stream->service_ud(il, route_service_each_matmul);
         }
         if (up_exps   && uma_stream->streams(il, LLAMA_UMA_STREAM_UP))   { up_exps   = uma_stream->slot(il, LLAMA_UMA_STREAM_UP); }
         if (gate_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_GATE)) { gate_exps = uma_stream->slot(il, LLAMA_UMA_STREAM_GATE); }
@@ -2094,13 +2096,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        // The graph visits the gate branch before the up branch (gate is src[0]
-        // of the downstream GLU). Attach exact service to that first consumer;
-        // models without a separate gate service on up instead.
-        ggml_tensor * first_service_ids = gate_exps == nullptr ? route_service_ids : nullptr;
-        void * first_service_data = gate_exps == nullptr ? route_service_data : nullptr;
+        // A decode graph has one token per sequence: servicing the graph-first
+        // gate (or up when there is no separate gate) is enough because no later
+        // tile can evict its routes. A multi-token prefill is different: later
+        // tiles can evict slots named by earlier route ids. Re-service every
+        // separate expert matmul so gate, up, and down each consume weights that
+        // are resident for their own tile, rather than reusing stale physical ids.
+        ggml_tensor * up_service_ids =
+            (gate_exps == nullptr || route_service_each_matmul) ? route_service_ids : nullptr;
+        void * up_service_data =
+            (gate_exps == nullptr || route_service_each_matmul) ? route_service_data : nullptr;
         up = build_lora_mm_id(up_exps, cur, route_ids, up_exps_s, route_ids_may_alias,
-            first_service_ids, first_service_data); // [n_ff, n_expert_used, n_tokens]
+            up_service_ids, up_service_data); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2118,10 +2125,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         } else {
             cur = up;
         }
-        // Exact service mutates shared route_ids before the first expert matmul.
-        // Downstream consumers reuse the corrected tensor without re-service.
-        route_service_ids = nullptr;
-        route_service_data = nullptr;
+        // Decode retains the corrected one-token routes through down. Prefill
+        // deliberately keeps service armed for down because the preceding
+        // gate/up tile sequence may have changed the resident set.
+        if (!route_service_each_matmul) {
+            route_service_ids = nullptr;
+            route_service_data = nullptr;
+        }
 
         if (gate_exps_s) {
             cb(cur, "ffn_moe_gate_scaled", il);
