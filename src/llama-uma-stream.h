@@ -44,6 +44,7 @@ struct llama_uma_stream_fill_ud {
 struct llama_uma_stream_admit_ud {
     llama_uma_stream_state * state = nullptr;
     int                      il    = 0;
+    bool                     prefill = false;
 };
 
 // per-layer LRU slot table. slot s holds expert_in_slot[s] (-1 = empty); expert e
@@ -67,9 +68,8 @@ struct llama_uma_stream_layer_lru {
 struct llama_uma_stream_state {
     const llama_model * model = nullptr;
     uint32_t n_slots        = 0; // S ceiling: max slots per (layer,kind) the controller grows to.
-    uint32_t n_slots_active = 0; // Current resident slots. The slot BUFFER is this size and is
-                                 // REALLOCATED on resize (a live Metal buffer pins its pages, so an
-                                 // in-place madvise cannot shed phys_footprint - only release does).
+    uint32_t n_slots_active = 0; // Current resident slots. Metal/pinned-host buffers are rebuilt;
+                                 // segmented CUDA device buffers keep a stable VA and map only this prefix.
     uint32_t n_expert     = 0;
     uint64_t n_miss       = 0;  // expert preads (slot misses) over the context lifetime
     uint64_t n_read       = 0;  // total expert-reads (admits) over the context lifetime
@@ -82,6 +82,12 @@ struct llama_uma_stream_state {
     uint64_t n_prefill_service_fail = 0;
     uint64_t n_prefill_substitute   = 0;
     uint32_t prefill_max_distinct   = 0;
+    uint64_t n_decode_service       = 0;
+    uint64_t n_decode_cold_miss     = 0;
+    uint64_t n_decode_h2d_miss      = 0;
+    uint64_t n_decode_h2d_bytes     = 0;
+    uint64_t n_decode_service_fail  = 0;
+    uint64_t n_decode_substitute    = 0;
     bool     decouple     = false; // LLAMA_UMA_STREAM_DECOUPLE: GPU-gather decode routing (Part 1)
     bool     adapt        = false; // LLAMA_UMA_STREAM_ADAPT: online resident-set maintenance (Part 2 Step 3)
 
@@ -93,6 +99,20 @@ struct llama_uma_stream_state {
     uint64_t last_resize_free_us   = 0;
     uint64_t last_resize_alloc_us  = 0;
     uint64_t last_resize_reseed_us = 0;
+    uint32_t last_resize_old_s      = 0;
+    uint32_t last_resize_new_s      = 0;
+    uint32_t last_resize_delta_s    = 0;
+    uint32_t last_resize_segments   = 0; // physical per-(layer,kind) slot mappings touched
+    uint32_t last_resize_seeded     = 0; // logical per-layer experts seeded on grow
+    uint64_t last_resize_vmm_bytes  = 0; // rounded physical bytes mapped/unmapped
+    uint64_t last_resize_seed_bytes = 0; // expert bytes uploaded only for newly grown slots
+    uint64_t last_resize_map_bytes  = 0; // actual successful backend maps in this transition
+    uint64_t last_resize_unmap_bytes = 0; // actual successful backend unmaps in this transition
+    uint32_t last_resize_map_ops    = 0;
+    uint32_t last_resize_unmap_ops  = 0;
+    uint64_t last_resize_miss_delta = 0; // must stay zero: resize seeding is not a request miss
+    uint64_t last_resize_h2d_delta  = 0; // must stay zero: resize H2D has its own seed counter
+    bool     last_resize_base_stable = false;
     size_t   last_resize_foot_after_free  = 0;
     size_t   last_resize_avail_after_free = 0;
     uint32_t s_min_active = 0;  // smallest n_slots_active reached (0 = unset)
@@ -109,6 +129,7 @@ struct llama_uma_stream_state {
     std::vector<ggml_tensor *>                slots;
     std::vector<llama_uma_stream_fill_ud>     uds;        // per (il,kind)
     std::vector<llama_uma_stream_admit_ud>    admit_uds;  // per il
+    std::vector<llama_uma_stream_admit_ud>    prefill_uds; // exact service, per il
     std::vector<llama_uma_stream_layer_lru>   lru;        // per il
     // decouple mode: per-layer expert->slot table, I32 [1,n_expert,1,1], Metal
     // StorageModeShared (GPU-readable, CPU-writable). The GPU gathers slot_ids from
@@ -128,11 +149,12 @@ struct llama_uma_stream_state {
     std::vector<ggml_backend_buffer_ptr> wraps;
     std::vector<void *>                  host_bases;
 
-    // M6: per-(il,kind) resizable slot buffers. mmap'd (not posix_memalign) on
+    // M6/B: per-(il,kind) resizable slot buffers. mmap'd (not posix_memalign) on
     // Metal so a resize's munmap returns pages to the OS UNCONDITIONALLY; CUDA
     // normally uses cudaHostAlloc-backed buffers. device_slots instead owns
-    // cudaMalloc-backed slot buffers. Misses use one reusable pinned-host staging
-    // slab per kind, then an H2D upload completed before the table is published.
+    // stable-address CUDA VMM slot buffers whose independently mapped active prefix
+    // can grow/shrink. Misses use one reusable pinned-host staging slab per kind,
+    // then an H2D upload completed before the table is published.
     std::vector<ggml_backend_buffer_ptr> slot_buf;   // release before slot_host is unmapped
     std::vector<void *>                  slot_host;  // host base normally; device base in device_slots mode
     std::vector<size_t>                  slot_alloc;  // mmap length per (il,kind), for munmap
@@ -174,6 +196,9 @@ struct llama_uma_stream_state {
     }
     void * admit_ud(int il) const {
         return (void *) &admit_uds[(size_t) il];
+    }
+    void * service_ud(int il, bool prefill) const {
+        return (void *) &(prefill ? prefill_uds : admit_uds)[(size_t) il];
     }
     ggml_tensor * expert_table(int il) const {
         return (size_t) il < slot_of_expert.size() ? slot_of_expert[(size_t) il] : nullptr;

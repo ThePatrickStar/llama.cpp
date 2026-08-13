@@ -2030,13 +2030,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * slot_ids = ggml_reshape_2d(ctx0, g, selected_experts->ne[0], selected_experts->ne[1]);
         cb(slot_ids, "ffn_moe_decouple_route", il);
         route_ids = slot_ids;
-        // Only compressed device slots can alias several cold experts to the
-        // sentinel slot. All-resident device slots are a unique permutation and
-        // retain the ordinary stock MMQ path; batch-1 decode still selects MMVQ.
-        route_ids_may_alias = uma_stream->device_slots && uma_stream->n_slots < uma_stream->n_expert;
-        if (route_ids_may_alias && selected_experts->ne[1] > 1) {
+        // Only an actively compressed device pool can alias several cold experts
+        // to sentinel slot 0. Key this on active S, not the controller ceiling.
+        // The first expert matmul services both prefill and one-token decode before
+        // any expert bytes are consumed; the corrected route-id tensor is shared by
+        // the remaining gate/down matmuls.
+        route_ids_may_alias = uma_stream->device_slots &&
+            uma_stream->n_slots_active < uma_stream->n_expert;
+        if (route_ids_may_alias) {
             route_service_ids = selected_experts;
-            route_service_data = uma_stream->admit_ud(il);
+            // n_seq_tokens distinguishes prompt/prefill from continuous-batched
+            // decode (several sequences can make total n_tokens > 1 while each
+            // contributes exactly one decode token).
+            route_service_data = uma_stream->service_ud(il, ubatch.n_seq_tokens > 1);
         }
         if (up_exps   && uma_stream->streams(il, LLAMA_UMA_STREAM_UP))   { up_exps   = uma_stream->slot(il, LLAMA_UMA_STREAM_UP); }
         if (gate_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_GATE)) { gate_exps = uma_stream->slot(il, LLAMA_UMA_STREAM_GATE); }
@@ -2088,7 +2094,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, route_ids, up_exps_s, route_ids_may_alias, route_service_ids, route_service_data); // [n_ff, n_expert_used, n_tokens]
+        // The graph visits the gate branch before the up branch (gate is src[0]
+        // of the downstream GLU). Attach exact service to that first consumer;
+        // models without a separate gate service on up instead.
+        ggml_tensor * first_service_ids = gate_exps == nullptr ? route_service_ids : nullptr;
+        void * first_service_data = gate_exps == nullptr ? route_service_data : nullptr;
+        up = build_lora_mm_id(up_exps, cur, route_ids, up_exps_s, route_ids_may_alias,
+            first_service_ids, first_service_data); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2106,6 +2118,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         } else {
             cur = up;
         }
+        // Exact service mutates shared route_ids before the first expert matmul.
+        // Downstream consumers reuse the corrected tensor without re-service.
+        route_service_ids = nullptr;
+        route_service_data = nullptr;
 
         if (gate_exps_s) {
             cb(cur, "ffn_moe_gate_scaled", il);

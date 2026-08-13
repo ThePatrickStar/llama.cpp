@@ -667,6 +667,14 @@ llama_context::~llama_context() {
                     (unsigned long long) uma_stream->n_prefill_service_fail,
                     (unsigned long long) uma_stream->n_prefill_substitute,
                     uma_stream->prefill_max_distinct);
+            fprintf(stderr,
+                    "uma: device-slot decode service: calls %llu, cold misses %llu, H2D %llu experts, %.1f MiB uploaded, failures %llu, substitutions %llu\n",
+                    (unsigned long long) uma_stream->n_decode_service,
+                    (unsigned long long) uma_stream->n_decode_cold_miss,
+                    (unsigned long long) uma_stream->n_decode_h2d_miss,
+                    uma_stream->n_decode_h2d_bytes / (1024.0 * 1024.0),
+                    (unsigned long long) uma_stream->n_decode_service_fail,
+                    (unsigned long long) uma_stream->n_decode_substitute);
             fprintf(stderr, "uma: stream substitution overflow: %llu\n",
                     (unsigned long long) uma_stream->n_overflow);
         }
@@ -984,7 +992,12 @@ void llama_context::synchronize() {
         // synchronize), so slot + table writes are torn-write-safe with NO background thread;
         // the next graph_compute sees the updated StorageModeShared state. One D2H per layer;
         // no per-layer graph op, so the decouple stays sync-free.
-        if (uma_stream && uma_stream->decouple && t_compute_start_us != 0) {
+        // Compressed CUDA device slots are serviced exactly inside the first
+        // MUL_MAT_ID, before weight consumption; that service already maintains
+        // LRU/read/miss telemetry. Do not repeat the old post-compute admission,
+        // which was one token late and would double-count the same selections.
+        if (uma_stream && uma_stream->decouple && t_compute_start_us != 0 &&
+            !(uma_stream->device_slots && uma_stream->n_slots_active < uma_stream->n_expert)) {
             const uint32_t n_used = model.hparams.n_expert_used;
             const uint32_t Sn     = uma_stream->n_slots_active; // M6: online admits stay in the active window
             const bool     adapt  = uma_stream->adapt;
@@ -3190,12 +3203,14 @@ int llama_uma_stream_service_prefill_tile(
     if (S == nullptr || !S->device_slots || S->device_backend == nullptr || expert_ids == nullptr ||
         slot_ids == nullptr || n_ids <= 0 || ud->il < 0 || (size_t) ud->il >= S->lru.size()) {
         if (S != nullptr) {
-            S->n_prefill_service_fail++;
+            if (ud != nullptr && !ud->prefill) { S->n_decode_service_fail++; }
+            else                               { S->n_prefill_service_fail++; }
         }
         return -1;
     }
 
     llama_uma_stream_layer_lru & L = S->lru[ud->il];
+    const bool prefill = ud->prefill;
     const uint32_t Sn = S->n_slots_active;
     std::vector<uint8_t> seen(S->n_expert, 0);
     std::vector<int32_t> distinct;
@@ -3214,13 +3229,19 @@ int llama_uma_stream_service_prefill_tile(
         return 0;
     }
 
-    S->n_prefill_tiles++;
+    if (prefill) {
+        S->n_prefill_tiles++;
+    } else {
+        S->n_decode_service++;
+    }
     for (int64_t i = 0; i < n_ids; i++) {
         if (expert_ids[i] >= 0 && (uint32_t) expert_ids[i] < S->n_expert) {
             S->n_read++;
         }
     }
-    S->prefill_max_distinct = std::max(S->prefill_max_distinct, (uint32_t) distinct.size());
+    if (prefill) {
+        S->prefill_max_distinct = std::max(S->prefill_max_distinct, (uint32_t) distinct.size());
+    }
     L.pass++;
     int32_t * tbl = S->expert_table(ud->il) ? (int32_t *) S->expert_table(ud->il)->data : nullptr;
 
@@ -3243,7 +3264,8 @@ int llama_uma_stream_service_prefill_tile(
         }
 
         S->n_miss++;
-        S->n_prefill_cold_miss++;
+        if (prefill) { S->n_prefill_cold_miss++; }
+        else         { S->n_decode_cold_miss++; }
         uint64_t best_lu = UINT64_MAX;
         int32_t slot = -1;
         for (uint32_t s = 0; s < Sn; s++) {
@@ -3257,7 +3279,8 @@ int llama_uma_stream_service_prefill_tile(
             }
         }
         if (slot < 0) {
-            S->n_prefill_service_fail++;
+            if (prefill) { S->n_prefill_service_fail++; }
+            else         { S->n_decode_service_fail++; }
             return -1;
         }
 
@@ -3269,7 +3292,8 @@ int llama_uma_stream_service_prefill_tile(
             if ((size_t) kind >= S->device_stage_host.size() ||
                 S->device_stage_host[kind] == nullptr || S->device_stage_bytes[kind] < slab ||
                 !S->model->uma_stream_pread_expert(ud->il, kind, e, S->device_stage_host[kind])) {
-                S->n_prefill_service_fail++;
+                if (prefill) { S->n_prefill_service_fail++; }
+                else         { S->n_decode_service_fail++; }
                 return -1;
             }
         }
@@ -3303,8 +3327,13 @@ int llama_uma_stream_service_prefill_tile(
         }
         S->n_h2d_miss++;
         S->n_h2d_bytes += uploaded;
-        S->n_prefill_h2d_miss++;
-        S->n_prefill_h2d_bytes += uploaded;
+        if (prefill) {
+            S->n_prefill_h2d_miss++;
+            S->n_prefill_h2d_bytes += uploaded;
+        } else {
+            S->n_decode_h2d_miss++;
+            S->n_decode_h2d_bytes += uploaded;
+        }
     }
 
     for (int64_t i = 0; i < n_ids; i++) {
@@ -3315,8 +3344,13 @@ int llama_uma_stream_service_prefill_tile(
         }
         const int32_t slot = L.slot_of_expert[e];
         if (slot < 0 || (uint32_t) slot >= Sn || L.expert_in_slot[slot] != e) {
-            S->n_prefill_substitute++;
-            S->n_prefill_service_fail++;
+            if (prefill) {
+                S->n_prefill_substitute++;
+                S->n_prefill_service_fail++;
+            } else {
+                S->n_decode_substitute++;
+                S->n_decode_service_fail++;
+            }
             return -1;
         }
         slot_ids[i] = slot;
@@ -3534,7 +3568,13 @@ bool llama_context::uma_stream_alloc_slot_buf(ggml_tensor * slot, size_t data_by
     }
     if (uma_stream_use_cuda_device) {
         const size_t bytes = ggml_backend_buft_get_alloc_size(uma_stream_cuda_device_buft, slot);
-        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(uma_stream_cuda_device_buft, bytes);
+        const size_t pad = bytes - data_bytes;
+        typedef ggml_backend_buffer_t (*vmm_alloc_fn_t)(
+            ggml_backend_buffer_type_t, size_t, size_t, size_t, size_t);
+        const vmm_alloc_fn_t alloc_fn = (vmm_alloc_fn_t) uma_stream_vmm_alloc_fn;
+        ggml_backend_buffer_t buf = alloc_fn == nullptr ? nullptr : alloc_fn(
+            uma_stream_cuda_device_buft, (size_t) slot->nb[2], (size_t) slot->ne[2],
+            (size_t) uma_stream->n_slots, pad);
         if (buf == nullptr) { return false; }
         ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         slot->buffer = buf;
@@ -3602,12 +3642,6 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
         (uma_stream_wrap_fn == nullptr && !uma_stream_use_cuda_host)) {
         return;
     }
-    if (uma_stream->device_slots) {
-        if (park || s_new != uma_stream->n_slots_active) {
-            throw std::runtime_error("uma stream: CUDA device slots use a fixed S; live resize is not enabled");
-        }
-        return;
-    }
     const uint32_t smax = uma_stream->n_slots;
     const uint32_t smin = uma_resize_smin >= 0 ? (uint32_t) uma_resize_smin : smax;
     // M7 improvement (1): a park command may go LEGALLY below the coherence knee to the
@@ -3625,9 +3659,321 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
     if (target > smax) {
         target = smax;
     }
-    uma_stream->parked = park;   // record serving-state park (cleared by any normal resize)
+    const bool parked_before = uma_stream->parked;
     const uint32_t cur = uma_stream->n_slots_active;
     if (target == cur) {
+        uma_stream->parked = park; // a normal no-op target still unparks
+        return;
+    }
+
+    if (uma_stream->device_slots) {
+        typedef bool (*vmm_resize_fn_t)(ggml_backend_buffer_t, size_t);
+        typedef bool (*vmm_info_fn_t)(ggml_backend_buffer_t, size_t *, size_t *, size_t *, size_t *, size_t *);
+        typedef bool (*vmm_stats_fn_t)(ggml_backend_buffer_t, uint64_t *, uint64_t *, uint64_t *, uint64_t *, void **);
+        const vmm_resize_fn_t resize_fn = (vmm_resize_fn_t) uma_stream_vmm_resize_fn;
+        const vmm_info_fn_t info_fn = (vmm_info_fn_t) uma_stream_vmm_info_fn;
+        const vmm_stats_fn_t stats_fn = (vmm_stats_fn_t) uma_stream_vmm_stats_fn;
+        if (resize_fn == nullptr || info_fn == nullptr || stats_fn == nullptr) {
+            throw std::runtime_error("uma stream resize: CUDA VMM resize procedures unavailable");
+        }
+
+        ggml_backend_synchronize(uma_stream_cuda_backend);
+        const size_t foot_before  = llama_uma_phys_footprint_mib();
+        const size_t avail_before = llama_uma_avail_reclaim_mib();
+        const int64_t t0_us = ggml_time_us();
+        uint64_t mapped_before = 0;
+        uint64_t map_ops_before = 0, unmap_ops_before = 0;
+        uint64_t map_bytes_before = 0, unmap_bytes_before = 0;
+        const uint64_t miss_before = uma_stream->n_miss;
+        const uint64_t h2d_before = uma_stream->n_h2d_miss;
+        std::vector<void *> bases_before;
+        uint32_t n_buffers = 0;
+        for (const auto & owner : uma_stream->slot_buf) {
+            if (!owner) { continue; }
+            size_t active = 0, max = 0, mapped = 0;
+            if (!info_fn(owner.get(), &active, &max, &mapped, nullptr, nullptr) || active != cur || max != smax) {
+                throw std::runtime_error("uma stream resize: inconsistent CUDA VMM slot buffer before resize");
+            }
+            uint64_t map_ops = 0, unmap_ops = 0, map_bytes = 0, unmap_bytes = 0;
+            void * base = nullptr;
+            if (!stats_fn(owner.get(), &map_ops, &unmap_ops, &map_bytes, &unmap_bytes, &base)) {
+                throw std::runtime_error("uma stream resize: missing CUDA VMM slot-buffer stats");
+            }
+            map_ops_before += map_ops;
+            unmap_ops_before += unmap_ops;
+            map_bytes_before += map_bytes;
+            unmap_bytes_before += unmap_bytes;
+            bases_before.push_back(base);
+            mapped_before += mapped;
+            n_buffers++;
+        }
+
+        std::vector<llama_uma_stream_layer_lru> lru_before;
+        std::vector<std::vector<int32_t>> tables_before;
+        if (target > cur) {
+            lru_before = uma_stream->lru;
+            tables_before.resize(uma_stream->lru.size());
+            for (uint32_t il = 0; il < uma_stream->lru.size(); il++) {
+                const int32_t * tbl = uma_stream->expert_table((int) il) ?
+                    (const int32_t *) uma_stream->expert_table((int) il)->data : nullptr;
+                if (tbl) {
+                    tables_before[il].assign(tbl, tbl + uma_stream->n_expert);
+                }
+            }
+        }
+
+        // A shrink first unpublishes every tail resident while all backing remains
+        // mapped. No graph can consume a tail id after this point; the GPU is idle.
+        if (target < cur) {
+            for (uint32_t il = 0; il < uma_stream->lru.size(); il++) {
+                if (!uma_stream->streams_layer((int) il)) { continue; }
+                llama_uma_stream_layer_lru & L = uma_stream->lru[il];
+                int32_t * tbl = uma_stream->expert_table((int) il) ?
+                    (int32_t *) uma_stream->expert_table((int) il)->data : nullptr;
+                for (uint32_t s = target; s < cur; s++) {
+                    const int32_t e = L.expert_in_slot[s];
+                    if (e >= 0) {
+                        L.slot_of_expert[e] = -1;
+                        if (tbl) { tbl[e] = 0; }
+                    }
+                    L.expert_in_slot[s] = -1;
+                    L.last_used[s] = 0;
+                    L.pinned[s] = 0;
+                    L.pin_protected[s] = 0;
+                }
+                L.n_newly = 0;
+            }
+        }
+
+        int64_t t_free_us = t0_us;
+        int64_t t_alloc_us = t0_us;
+        std::vector<ggml_backend_buffer_t> changed;
+        changed.reserve(n_buffers);
+        if (target < cur) {
+            for (const auto & owner : uma_stream->slot_buf) {
+                if (owner && !resize_fn(owner.get(), target)) {
+                    GGML_ABORT("uma stream resize: CUDA VMM tail unmap failed");
+                }
+            }
+            t_free_us = ggml_time_us();
+            t_alloc_us = t_free_us;
+        } else {
+            for (const auto & owner : uma_stream->slot_buf) {
+                if (!owner) { continue; }
+                if (!resize_fn(owner.get(), target)) {
+                    for (ggml_backend_buffer_t done : changed) {
+                        if (!resize_fn(done, cur)) {
+                            GGML_ABORT("uma stream resize: CUDA VMM grow rollback failed");
+                        }
+                    }
+                    uma_stream->parked = parked_before;
+                    throw std::runtime_error("uma stream resize: CUDA VMM grow allocation failed");
+                }
+                changed.push_back(owner.get());
+            }
+            t_free_us = t0_us;
+            t_alloc_us = ggml_time_us();
+        }
+        const size_t foot_after_free = target < cur ? llama_uma_phys_footprint_mib() : foot_before;
+        const size_t avail_after_free = target < cur ? llama_uma_avail_reclaim_mib() : avail_before;
+        uint32_t seeded = 0;
+        uint64_t seed_bytes = 0;
+        int64_t t_reseed_us = 0;
+        uint64_t mapped_after = 0;
+        uint64_t map_ops_after = 0, unmap_ops_after = 0;
+        uint64_t map_bytes_after = 0, unmap_bytes_after = 0;
+        bool base_stable = true;
+
+        try {
+            // Every persistent tensor retains its buffer and base address. Only its
+            // active expert dimension changes; zero the CUDA quant tail at the new end.
+            for (ggml_tensor * st : uma_stream->slots) {
+                if (st == nullptr) { continue; }
+                st->ne[2] = (int64_t) target;
+                st->nb[3] = st->nb[2] * (size_t) target;
+                if (ggml_backend_buffer_init_tensor(st->buffer, st) != GGML_STATUS_SUCCESS) {
+                    uma_stream_force_rebuild = true;
+                    throw std::runtime_error("uma stream resize: CUDA VMM tensor reinitialization failed");
+                }
+            }
+            uma_stream_force_rebuild = true;
+
+            // Grow fills only the newly mapped tail from the frozen ranking. Retained
+            // slots and their LRU ages are byte-for-byte untouched. An expert is
+            // published only after all three kinds have reached CUDA and synchronized.
+            if (target > cur) {
+            for (uint32_t il = 0; il < uma_stream->lru.size(); il++) {
+                if (!uma_stream->streams_layer((int) il)) { continue; }
+                llama_uma_stream_layer_lru & L = uma_stream->lru[il];
+                int32_t * tbl = uma_stream->expert_table((int) il) ?
+                    (int32_t *) uma_stream->expert_table((int) il)->data : nullptr;
+                const std::vector<int32_t> & rank = uma_stream->ranked[il];
+                size_t ri = 0;
+                for (uint32_t s = cur; s < target; s++) {
+                    int32_t e = -1;
+                    while (ri < rank.size()) {
+                        const int32_t candidate = rank[ri++];
+                        if (candidate >= 0 && (uint32_t) candidate < uma_stream->n_expert &&
+                            L.slot_of_expert[candidate] < 0) {
+                            e = candidate;
+                            break;
+                        }
+                    }
+                    if (e < 0) {
+                        throw std::runtime_error(format("uma stream resize: no ranked expert for grow il=%u slot=%u", il, s));
+                    }
+                    for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+                        if (!uma_stream->streams((int) il, kind)) { continue; }
+                        const size_t slab = model.uma_stream_slab_bytes((int) il, kind);
+                        if ((size_t) kind >= uma_stream->device_stage_host.size() ||
+                            uma_stream->device_stage_host[kind] == nullptr ||
+                            uma_stream->device_stage_bytes[kind] < slab ||
+                            !model.uma_stream_pread_expert((int) il, kind, e,
+                                                           uma_stream->device_stage_host[kind])) {
+                            throw std::runtime_error(format(
+                                "uma stream resize: grow pread failed il=%u kind=%d slot=%u expert=%d",
+                                il, kind, s, e));
+                        }
+                    }
+                    uint64_t uploaded = 0;
+                    for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+                        if (!uma_stream->streams((int) il, kind)) { continue; }
+                        const size_t slab = model.uma_stream_slab_bytes((int) il, kind);
+                        ggml_backend_tensor_set_async(
+                            uma_stream_cuda_backend, uma_stream->slot((int) il, kind),
+                            uma_stream->device_stage_host[kind], (size_t) s * slab, slab);
+                        uploaded += slab;
+                    }
+                    ggml_backend_synchronize(uma_stream_cuda_backend);
+                    L.expert_in_slot[s] = e;
+                    L.slot_of_expert[e] = (int32_t) s;
+                    L.last_used[s] = L.tick++;
+                    L.pinned[s] = 0;
+                    if (tbl) { tbl[e] = (int32_t) s; }
+                    seeded++;
+                    seed_bytes += uploaded;
+                }
+                L.n_newly = 0;
+            }
+            }
+
+            uma_stream->n_slots_active = target;
+            uma_stream->parked = park; // publish serving state only with committed S
+            t_reseed_us = ggml_time_us();
+            size_t bi = 0;
+            for (const auto & owner : uma_stream->slot_buf) {
+                if (!owner) { continue; }
+                size_t active = 0, max = 0, mapped = 0;
+                if (!info_fn(owner.get(), &active, &max, &mapped, nullptr, nullptr) ||
+                    active != target || max != smax) {
+                    throw std::runtime_error("uma stream resize: inconsistent CUDA VMM slot buffer after resize");
+                }
+                uint64_t map_ops = 0, unmap_ops = 0, map_bytes = 0, unmap_bytes = 0;
+                void * base = nullptr;
+                if (!stats_fn(owner.get(), &map_ops, &unmap_ops, &map_bytes, &unmap_bytes, &base)) {
+                    throw std::runtime_error("uma stream resize: missing final CUDA VMM slot-buffer stats");
+                }
+                if (bi >= bases_before.size() || base != bases_before[bi]) { base_stable = false; }
+                bi++;
+                map_ops_after += map_ops;
+                unmap_ops_after += unmap_ops;
+                map_bytes_after += map_bytes;
+                unmap_bytes_after += unmap_bytes;
+                mapped_after += mapped;
+            }
+            if (bi != bases_before.size() || !base_stable) {
+                throw std::runtime_error("uma stream resize: CUDA VMM base address changed");
+            }
+        } catch (...) {
+            if (target < cur) {
+                // Shrink has already discarded physical tail contents. A failure
+                // after that point cannot safely resume inference, so fail-stop.
+                GGML_ABORT("uma stream resize: irreversible CUDA VMM shrink failed");
+            }
+            ggml_backend_synchronize(uma_stream_cuda_backend);
+            uma_stream->lru = lru_before;
+            for (uint32_t il = 0; il < tables_before.size(); il++) {
+                int32_t * tbl = uma_stream->expert_table((int) il) ?
+                    (int32_t *) uma_stream->expert_table((int) il)->data : nullptr;
+                if (tbl && !tables_before[il].empty()) {
+                    std::copy(tables_before[il].begin(), tables_before[il].end(), tbl);
+                }
+            }
+            uma_stream->n_slots_active = cur;
+            for (ggml_tensor * st : uma_stream->slots) {
+                if (st == nullptr) { continue; }
+                st->ne[2] = (int64_t) cur;
+                st->nb[3] = st->nb[2] * (size_t) cur;
+            }
+            for (const auto & owner : uma_stream->slot_buf) {
+                if (owner && !resize_fn(owner.get(), cur)) {
+                    GGML_ABORT("uma stream resize: CUDA VMM grow rollback unmap failed");
+                }
+            }
+            for (ggml_tensor * st : uma_stream->slots) {
+                if (st != nullptr && ggml_backend_buffer_init_tensor(st->buffer, st) != GGML_STATUS_SUCCESS) {
+                    GGML_ABORT("uma stream resize: CUDA VMM grow rollback tensor init failed");
+                }
+            }
+            uma_stream->parked = parked_before;
+            uma_stream_force_rebuild = true;
+            throw;
+        }
+        if (map_ops_after < map_ops_before || unmap_ops_after < unmap_ops_before ||
+            map_bytes_after < map_bytes_before || unmap_bytes_after < unmap_bytes_before) {
+            GGML_ABORT("uma stream resize: CUDA VMM operation counters went backwards");
+        }
+        const uint64_t map_ops_delta = map_ops_after - map_ops_before;
+        const uint64_t unmap_ops_delta = unmap_ops_after - unmap_ops_before;
+        const uint64_t map_bytes_delta = map_bytes_after - map_bytes_before;
+        const uint64_t unmap_bytes_delta = unmap_bytes_after - unmap_bytes_before;
+        const uint64_t vmm_bytes = map_bytes_delta + unmap_bytes_delta;
+        const bool mapped_accounting_ok = target > cur ?
+            (mapped_after >= mapped_before && mapped_after - mapped_before == map_bytes_delta && unmap_bytes_delta == 0) :
+            (mapped_before >= mapped_after && mapped_before - mapped_after == unmap_bytes_delta && map_bytes_delta == 0);
+        const uint64_t miss_delta = uma_stream->n_miss - miss_before;
+        const uint64_t h2d_delta = uma_stream->n_h2d_miss - h2d_before;
+        if (miss_delta != 0 || h2d_delta != 0 || !base_stable || !mapped_accounting_ok) {
+            GGML_ABORT("uma stream resize: admission, stable-base, or VMM byte accounting invariant failed");
+        }
+        uma_stream->last_resize_free_us = (uint64_t) (t_free_us - t0_us);
+        uma_stream->last_resize_alloc_us = (uint64_t) (t_alloc_us - t_free_us);
+        uma_stream->last_resize_reseed_us = (uint64_t) (t_reseed_us - t_alloc_us);
+        uma_stream->last_resize_old_s = cur;
+        uma_stream->last_resize_new_s = target;
+        uma_stream->last_resize_delta_s = cur > target ? cur - target : target - cur;
+        uma_stream->last_resize_segments = (uint32_t) (map_ops_delta + unmap_ops_delta);
+        uma_stream->last_resize_seeded = seeded;
+        uma_stream->last_resize_vmm_bytes = vmm_bytes;
+        uma_stream->last_resize_seed_bytes = seed_bytes;
+        uma_stream->last_resize_map_ops = (uint32_t) map_ops_delta;
+        uma_stream->last_resize_unmap_ops = (uint32_t) unmap_ops_delta;
+        uma_stream->last_resize_map_bytes = map_bytes_delta;
+        uma_stream->last_resize_unmap_bytes = unmap_bytes_delta;
+        uma_stream->last_resize_miss_delta = miss_delta;
+        uma_stream->last_resize_h2d_delta = h2d_delta;
+        uma_stream->last_resize_base_stable = base_stable;
+        uma_stream->last_resize_foot_after_free = foot_after_free;
+        uma_stream->last_resize_avail_after_free = avail_after_free;
+        uma_stream->n_resizes++;
+        if (uma_stream->s_min_active == 0 || target < uma_stream->s_min_active) { uma_stream->s_min_active = target; }
+        if (target > uma_stream->s_max_active) { uma_stream->s_max_active = target; }
+        const size_t foot_after = llama_uma_phys_footprint_mib();
+        fprintf(stderr,
+            "uma: segmented device resize S %u -> %u: logical delta %u, actual map/unmap %u/%u, VMM map/unmap %.1f/%.1f MiB, stable-base %u, "
+            "seeded %u experts / %.1f MiB (free %.3f + alloc %.3f + reseed %.3f = %.3f ms), "
+            "request miss/H2D delta %llu/%llu, phys_footprint %zu -> %zu MiB, avail %zu -> %zu MiB\n",
+            cur, target, uma_stream->last_resize_delta_s,
+            uma_stream->last_resize_map_ops, uma_stream->last_resize_unmap_ops,
+            map_bytes_delta / (1024.0 * 1024.0), unmap_bytes_delta / (1024.0 * 1024.0),
+            (unsigned) base_stable, seeded, seed_bytes / (1024.0 * 1024.0),
+            uma_stream->last_resize_free_us / 1000.0, uma_stream->last_resize_alloc_us / 1000.0,
+            uma_stream->last_resize_reseed_us / 1000.0,
+            (t_reseed_us - t0_us) / 1000.0,
+            (unsigned long long) miss_delta, (unsigned long long) h2d_delta,
+            foot_before, foot_after, avail_before,
+            llama_uma_avail_reclaim_mib());
+        uma_write_telemetry();
         return;
     }
     const size_t   foot_before  = llama_uma_phys_footprint_mib();
@@ -3670,6 +4016,7 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
         }
     }
     uma_stream->n_slots_active = eff;
+    uma_stream->parked = park;
     const int64_t t_alloc_us = ggml_time_us();
     uma_stream->last_resize_alloc_us = (uint64_t) (t_alloc_us - t_free_us);
 
@@ -3828,8 +4175,14 @@ void llama_context::uma_write_telemetry() {
             "n_h2d_miss %llu\nn_h2d_bytes %llu\n"
             "n_prefill_tiles %llu\nn_prefill_cold_miss %llu\nn_prefill_h2d_miss %llu\nn_prefill_h2d_bytes %llu\n"
             "n_prefill_service_fail %llu\nn_prefill_substitute %llu\nprefill_max_distinct %u\n"
+            "n_decode_service %llu\nn_decode_cold_miss %llu\nn_decode_h2d_miss %llu\nn_decode_h2d_bytes %llu\n"
+            "n_decode_service_fail %llu\nn_decode_substitute %llu\n"
             "n_distress %llu\nn_overflow %llu\nn_resizes %llu\ns_min_reached %u\ns_max_reached %u\nphys_footprint_mib %zu\n"
             "last_resize_free_ms %.3f\nlast_resize_alloc_ms %.3f\nlast_resize_reseed_ms %.3f\n"
+            "last_resize_old_s %u\nlast_resize_new_s %u\nlast_resize_delta_s %u\nlast_resize_segments %u\n"
+            "last_resize_seeded %u\nlast_resize_vmm_bytes %llu\nlast_resize_seed_bytes %llu\n"
+            "last_resize_map_ops %u\nlast_resize_unmap_ops %u\nlast_resize_map_bytes %llu\nlast_resize_unmap_bytes %llu\n"
+            "last_resize_miss_delta %llu\nlast_resize_h2d_delta %llu\nlast_resize_base_stable %u\n"
             "last_resize_foot_after_free_mib %zu\nlast_resize_avail_after_free_mib %zu\n"
             "parked %u\n",
             uma_stream->n_slots_active, uma_stream->n_slots, model.hparams.n_expert_used,
@@ -3842,10 +4195,27 @@ void llama_context::uma_write_telemetry() {
             (unsigned long long) uma_stream->n_prefill_service_fail,
             (unsigned long long) uma_stream->n_prefill_substitute,
             uma_stream->prefill_max_distinct,
+            (unsigned long long) uma_stream->n_decode_service,
+            (unsigned long long) uma_stream->n_decode_cold_miss,
+            (unsigned long long) uma_stream->n_decode_h2d_miss,
+            (unsigned long long) uma_stream->n_decode_h2d_bytes,
+            (unsigned long long) uma_stream->n_decode_service_fail,
+            (unsigned long long) uma_stream->n_decode_substitute,
             (unsigned long long) uma_stream->n_distress, (unsigned long long) uma_stream->n_overflow, (unsigned long long) uma_stream->n_resizes,
             uma_stream->s_min_active, uma_stream->s_max_active, llama_uma_phys_footprint_mib(),
             uma_stream->last_resize_free_us / 1000.0, uma_stream->last_resize_alloc_us / 1000.0,
             uma_stream->last_resize_reseed_us / 1000.0,
+            uma_stream->last_resize_old_s, uma_stream->last_resize_new_s,
+            uma_stream->last_resize_delta_s, uma_stream->last_resize_segments,
+            uma_stream->last_resize_seeded,
+            (unsigned long long) uma_stream->last_resize_vmm_bytes,
+            (unsigned long long) uma_stream->last_resize_seed_bytes,
+            uma_stream->last_resize_map_ops, uma_stream->last_resize_unmap_ops,
+            (unsigned long long) uma_stream->last_resize_map_bytes,
+            (unsigned long long) uma_stream->last_resize_unmap_bytes,
+            (unsigned long long) uma_stream->last_resize_miss_delta,
+            (unsigned long long) uma_stream->last_resize_h2d_delta,
+            (unsigned) uma_stream->last_resize_base_stable,
             uma_stream->last_resize_foot_after_free, uma_stream->last_resize_avail_after_free,
             (unsigned) (uma_stream->parked ? 1 : 0));
     fclose(f);
@@ -3869,11 +4239,6 @@ void llama_context::uma_stream_setup() {
     const uint32_t n_slots_initial = s_cfg.initial;
     const uint32_t n_slots         = s_cfg.ceiling;
     const bool device_slots_requested = llama_uma_stream_device_slots_enabled();
-    if (device_slots_requested && n_slots_initial != n_slots) {
-        throw std::runtime_error(format(
-            "LLAMA_UMA_STREAM_DEVICE_SLOTS requires a fixed pool with initial S=ceiling (got %u/%u)",
-            n_slots_initial, n_slots));
-    }
 
     // GPU backend + the fork's no-rset Metal wrap entry (the WO-C zero-copy path)
     ggml_backend_t gpu_backend = nullptr;
@@ -3917,13 +4282,18 @@ void llama_context::uma_stream_setup() {
         }
         uma_stream_use_cuda_device = true;
         uma_stream_cuda_backend = gpu_backend;
-        for (const char * name : { "LLAMA_UMA_STREAM_SCHED", "LLAMA_UMA_STREAM_LOWMIB",
-                                   "LLAMA_UMA_STREAM_HIGHMIB", "LLAMA_UMA_STREAM_CONTROL" }) {
-            const char * value = getenv(name);
-            if (value != nullptr && value[0] != '\0') {
-                throw std::runtime_error(format(
-                    "LLAMA_UMA_STREAM_DEVICE_SLOTS forbids resize driver %s", name));
-            }
+        uma_stream_vmm_alloc_fn = gpu_reg == nullptr ? nullptr :
+            ggml_backend_reg_get_proc_address(gpu_reg, "ggml_backend_cuda_vmm_slot_buffer_alloc");
+        uma_stream_vmm_resize_fn = gpu_reg == nullptr ? nullptr :
+            ggml_backend_reg_get_proc_address(gpu_reg, "ggml_backend_cuda_vmm_slot_buffer_resize");
+        uma_stream_vmm_info_fn = gpu_reg == nullptr ? nullptr :
+            ggml_backend_reg_get_proc_address(gpu_reg, "ggml_backend_cuda_vmm_slot_buffer_get_info");
+        uma_stream_vmm_stats_fn = gpu_reg == nullptr ? nullptr :
+            ggml_backend_reg_get_proc_address(gpu_reg, "ggml_backend_cuda_vmm_slot_buffer_get_stats");
+        if (uma_stream_vmm_alloc_fn == nullptr || uma_stream_vmm_resize_fn == nullptr ||
+            uma_stream_vmm_info_fn == nullptr || uma_stream_vmm_stats_fn == nullptr) {
+            throw std::runtime_error(
+                "LLAMA_UMA_STREAM_DEVICE_SLOTS requires CUDA VMM segmented-buffer support");
         }
     }
     // M6: keep the device + wrap entry so a runtime resize can reallocate slot buffers
@@ -3963,6 +4333,7 @@ void llama_context::uma_stream_setup() {
         uma_stream->slot_alloc.assign((size_t) n_layer * LLAMA_UMA_STREAM_N_KIND, 0);
         uma_stream->uds.assign((size_t) n_layer * LLAMA_UMA_STREAM_N_KIND, {});
         uma_stream->admit_uds.assign((size_t) n_layer, {});
+        uma_stream->prefill_uds.assign((size_t) n_layer, {});
         uma_stream->lru.assign((size_t) n_layer, {});
         uma_stream->slot_of_expert.assign((size_t) n_layer, nullptr);
         uma_stream->topk.assign((size_t) n_layer, nullptr);
@@ -4027,7 +4398,8 @@ void llama_context::uma_stream_setup() {
                 layer_streams = true;
             }
             if (layer_streams) {
-                uma_stream->admit_uds[il] = { uma_stream.get(), (int) il };
+                uma_stream->admit_uds[il] = { uma_stream.get(), (int) il, false };
+                uma_stream->prefill_uds[il] = { uma_stream.get(), (int) il, true };
                 llama_uma_stream_layer_lru & L = uma_stream->lru[il];
                 L.slot_of_expert.assign(n_expert, -1);
                 L.expert_in_slot.assign(n_slots, -1);
@@ -4082,9 +4454,38 @@ void llama_context::uma_stream_setup() {
                 }
             }
         }
+        if (device_slots_requested) {
+            typedef bool (*vmm_info_fn_t)(ggml_backend_buffer_t, size_t *, size_t *, size_t *, size_t *, size_t *);
+            typedef bool (*vmm_stats_fn_t)(ggml_backend_buffer_t, uint64_t *, uint64_t *, uint64_t *, uint64_t *, void **);
+            const vmm_info_fn_t info_fn = (vmm_info_fn_t) uma_stream_vmm_info_fn;
+            const vmm_stats_fn_t stats_fn = (vmm_stats_fn_t) uma_stream_vmm_stats_fn;
+            uint64_t mapped = 0, reserved = 0;
+            size_t granularity = 0;
+            uint64_t mappings = 0;
+            for (const auto & owner : uma_stream->slot_buf) {
+                if (!owner) { continue; }
+                size_t active = 0, max = 0, bytes = 0, reserve = 0, gran = 0;
+                if (!info_fn(owner.get(), &active, &max, &bytes, &reserve, &gran) ||
+                    active != n_slots_initial || max != n_slots) {
+                    throw std::runtime_error("uma stream: CUDA VMM slot-buffer invariant failed at setup");
+                }
+                mapped += bytes;
+                reserved += reserve;
+                granularity = gran;
+                uint64_t map_ops = 0;
+                if (!stats_fn(owner.get(), &map_ops, nullptr, nullptr, nullptr, nullptr)) {
+                    throw std::runtime_error("uma stream: CUDA VMM slot-buffer stats unavailable at setup");
+                }
+                mappings += map_ops;
+            }
+            fprintf(stderr,
+                "uma: segmented device slot backing: %llu actual mappings, %.1f MiB mapped / %.1f MiB VA reserved, %.1f MiB granularity\n",
+                (unsigned long long) mappings, mapped / (1024.0 * 1024.0), reserved / (1024.0 * 1024.0),
+                granularity / (1024.0 * 1024.0));
+        }
         fprintf(stderr, "uma: stream slot pool built: %zu tables, S active/ceiling/expert %u/%u/%u (%s, GPU in-place), layers [0,%u)\n",
                 uma_stream->wraps.size(), n_slots_initial, n_slots, n_expert,
-                uma_stream_use_cuda_device ? "CUDA device" :
+                uma_stream_use_cuda_device ? "CUDA device VMM-segmented" :
                 (uma_stream_use_cuda_host ? "CUDA pinned host" : "Metal StorageModeShared no-rset"), k);
 
         if (device_slots_requested) {

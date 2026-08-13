@@ -11,6 +11,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -2074,6 +2075,25 @@ int llama_perplexity(int argc, char ** argv) {
     {
         LOG_INF("\n");
         LOG_INF("%s\n", common_params_get_system_info(params).c_str());
+    }
+
+    // Validation-only hook for live-resize correctness: execute one real
+    // single-token decode so the ordinary post-sync controller consumes its
+    // control-file target, then clear KV before the registered KL workload.
+    // No special resize API is exposed and the measured KL batches remain
+    // byte-for-byte identical to the stock-reference trace.
+    if (params.kl_divergence && getenv("LLAMA_UMA_STREAM_PRE_KL_RESIZE_TICK") != nullptr) {
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        llama_token token = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : 0;
+        llama_memory_clear(llama_get_memory(ctx), true);
+        const int rc = llama_decode(ctx, llama_batch_get_one(&token, 1));
+        if (rc != 0) {
+            LOG_ERR("%s: pre-KL resize tick decode failed, rc=%d\n", __func__, rc);
+            return 1;
+        }
+        llama_synchronize(ctx);
+        llama_memory_clear(llama_get_memory(ctx), true);
+        LOG_INF("pre-KL resize tick complete; KV cleared before KL workload\n");
     }
 
     struct results_perplexity results;

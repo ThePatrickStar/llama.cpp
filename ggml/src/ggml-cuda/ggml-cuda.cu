@@ -725,6 +725,21 @@ struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+#if defined(GGML_USE_VMM)
+    bool vmm = false;
+    int physical_device = -1;
+    size_t vmm_slot_stride = 0;
+    size_t vmm_tail_pad = 0;
+    size_t vmm_active_slots = 0;
+    size_t vmm_max_slots = 0;
+    size_t vmm_granularity = 0;
+    size_t vmm_mapped_size = 0;
+    size_t vmm_reserved_size = 0;
+    uint64_t vmm_map_ops = 0;
+    uint64_t vmm_unmap_ops = 0;
+    uint64_t vmm_map_bytes = 0;
+    uint64_t vmm_unmap_bytes = 0;
+#endif
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -732,9 +747,104 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+#if defined(GGML_USE_VMM)
+        if (vmm) {
+            ggml_cuda_set_device(device);
+            for (size_t slot = vmm_active_slots; slot > 0; --slot) {
+                const size_t begin = slot == 1 ? 0 : vmm_granularity *
+                    (((slot - 1)*vmm_slot_stride + vmm_tail_pad + vmm_granularity - 1)/vmm_granularity);
+                const size_t end = vmm_granularity *
+                    ((slot*vmm_slot_stride + vmm_tail_pad + vmm_granularity - 1)/vmm_granularity);
+                if (end > begin) {
+                    CU_CHECK(cuMemUnmap((CUdeviceptr) dev_ptr + begin, end - begin));
+                }
+            }
+            CU_CHECK(cuMemAddressFree((CUdeviceptr) dev_ptr, vmm_reserved_size));
+            return;
+        }
+#endif
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
+
+#if defined(GGML_USE_VMM)
+static size_t ggml_backend_cuda_vmm_boundary(const ggml_backend_cuda_buffer_context * ctx, size_t slots) {
+    if (slots == 0) {
+        return 0;
+    }
+    const size_t bytes = slots*ctx->vmm_slot_stride + ctx->vmm_tail_pad;
+    return ctx->vmm_granularity * ((bytes + ctx->vmm_granularity - 1)/ctx->vmm_granularity);
+}
+
+static bool ggml_backend_cuda_vmm_map_slot(ggml_backend_cuda_buffer_context * ctx, size_t slot) {
+    GGML_ASSERT(ctx->vmm && slot > 0 && slot <= ctx->vmm_max_slots);
+    const size_t begin = ggml_backend_cuda_vmm_boundary(ctx, slot - 1);
+    const size_t end   = ggml_backend_cuda_vmm_boundary(ctx, slot);
+    if (end == begin) {
+        return true;
+    }
+
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = ctx->physical_device;
+
+    CUmemGenericAllocationHandle handle;
+    CUresult result = cuMemCreate(&handle, end - begin, &prop, 0);
+    if (result != CUDA_SUCCESS) {
+        return false;
+    }
+    result = cuMemMap((CUdeviceptr) ctx->dev_ptr + begin, end - begin, 0, handle, 0);
+    if (result != CUDA_SUCCESS) {
+        CU_CHECK(cuMemRelease(handle));
+        return false;
+    }
+    // A failed release cannot be represented as an ordinary recoverable OOM:
+    // losing this handle would leak the physical allocation while falsely
+    // reporting a clean rollback. Fail-stop through CU_CHECK instead.
+    CU_CHECK(cuMemRelease(handle));
+
+    // Preserve ordinary CUDA-buffer peer-copy semantics: grant every distinct
+    // backing physical device that can access this allocation, including self.
+    std::vector<CUmemAccessDesc> access_descs;
+    bool physical_seen[GGML_CUDA_MAX_DEVICES] = {};
+    for (int id = 0; id < ggml_cuda_info().device_count; ++id) {
+        const int peer = ggml_cuda_get_physical_device(id);
+        if (physical_seen[peer]) { continue; }
+        if (peer != ctx->physical_device) {
+            int can_access = 0;
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, peer, ctx->physical_device));
+            if (!can_access) { continue; }
+        }
+        physical_seen[peer] = true;
+        CUmemAccessDesc access = {};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = peer;
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        access_descs.push_back(access);
+    }
+    result = cuMemSetAccess((CUdeviceptr) ctx->dev_ptr + begin, end - begin,
+        access_descs.data(), access_descs.size());
+    if (result != CUDA_SUCCESS) {
+        CU_CHECK(cuMemUnmap((CUdeviceptr) ctx->dev_ptr + begin, end - begin));
+        return false;
+    }
+    ctx->vmm_map_ops++;
+    ctx->vmm_map_bytes += end - begin;
+    return true;
+}
+
+static void ggml_backend_cuda_vmm_unmap_slot(ggml_backend_cuda_buffer_context * ctx, size_t slot) {
+    GGML_ASSERT(ctx->vmm && slot > 0 && slot <= ctx->vmm_max_slots);
+    const size_t begin = ggml_backend_cuda_vmm_boundary(ctx, slot - 1);
+    const size_t end   = ggml_backend_cuda_vmm_boundary(ctx, slot);
+    if (end > begin) {
+        CU_CHECK(cuMemUnmap((CUdeviceptr) ctx->dev_ptr + begin, end - begin));
+        ctx->vmm_unmap_ops++;
+        ctx->vmm_unmap_bytes += end - begin;
+    }
+}
+#endif
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
@@ -862,12 +972,170 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
     /* .reset           = */ NULL,
 };
 
-// cuda buffer type
 struct ggml_backend_cuda_buffer_type_context {
     int device;
     std::string name;
 };
 
+static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft);
+
+// A resizeable CUDA weight buffer backed by independently freeable VMM slot
+// mappings. It deliberately uses the ordinary CUDA buft/interface: all existing
+// tensor copies, scheduler checks, and kernels continue to see one dense tensor
+// at a stable virtual address. Only the physical prefix changes at a GPU-idle
+// resize point.
+static ggml_backend_buffer_t ggml_backend_cuda_vmm_slot_buffer_alloc(
+        ggml_backend_buffer_type_t buft, size_t slot_stride, size_t initial_slots,
+        size_t max_slots, size_t tail_pad) {
+#if defined(GGML_USE_VMM)
+    if (!ggml_backend_buft_is_cuda(buft) || slot_stride == 0 || initial_slots == 0 ||
+        initial_slots > max_slots) {
+        return nullptr;
+    }
+    auto * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+    const int device = buft_ctx->device;
+    const auto & info = ggml_cuda_info();
+    if (!info.devices[device].vmm || info.devices[device].vmm_granularity == 0) {
+        return nullptr;
+    }
+
+    ggml_cuda_set_device(device);
+    auto * ctx = new ggml_backend_cuda_buffer_context(device, nullptr);
+    ctx->vmm = true;
+    ctx->physical_device = ggml_cuda_get_physical_device(device);
+    ctx->vmm_slot_stride = slot_stride;
+    ctx->vmm_tail_pad = tail_pad;
+    ctx->vmm_max_slots = max_slots;
+    ctx->vmm_granularity = info.devices[device].vmm_granularity;
+    ctx->vmm_reserved_size = ggml_backend_cuda_vmm_boundary(ctx, max_slots);
+
+    CUdeviceptr address = 0;
+    if (cuMemAddressReserve(&address, ctx->vmm_reserved_size, ctx->vmm_granularity, 0, 0) != CUDA_SUCCESS) {
+        ctx->vmm = false;
+        delete ctx;
+        return nullptr;
+    }
+    ctx->dev_ptr = (void *) address;
+    for (size_t slot = 1; slot <= initial_slots; ++slot) {
+        if (!ggml_backend_cuda_vmm_map_slot(ctx, slot)) {
+            delete ctx;
+            return nullptr;
+        }
+        ctx->vmm_active_slots = slot;
+    }
+    ctx->vmm_mapped_size = ggml_backend_cuda_vmm_boundary(ctx, initial_slots);
+    const size_t logical_size = initial_slots*slot_stride + tail_pad;
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, logical_size);
+#else
+    GGML_UNUSED(buft);
+    GGML_UNUSED(slot_stride);
+    GGML_UNUSED(initial_slots);
+    GGML_UNUSED(max_slots);
+    GGML_UNUSED(tail_pad);
+    return nullptr;
+#endif
+}
+
+static bool ggml_backend_cuda_vmm_slot_buffer_resize(ggml_backend_buffer_t buffer, size_t new_slots) {
+#if defined(GGML_USE_VMM)
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (!ctx->vmm || new_slots == 0 || new_slots > ctx->vmm_max_slots) {
+        return false;
+    }
+    const size_t old_slots = ctx->vmm_active_slots;
+    if (new_slots == old_slots) {
+        return true;
+    }
+
+    ggml_cuda_set_device(ctx->device);
+    if (new_slots > old_slots) {
+        for (size_t slot = old_slots + 1; slot <= new_slots; ++slot) {
+            if (!ggml_backend_cuda_vmm_map_slot(ctx, slot)) {
+                while (ctx->vmm_active_slots > old_slots) {
+                    ggml_backend_cuda_vmm_unmap_slot(ctx, ctx->vmm_active_slots);
+                    --ctx->vmm_active_slots;
+                }
+                ctx->vmm_mapped_size = ggml_backend_cuda_vmm_boundary(ctx, old_slots);
+                return false;
+            }
+            ctx->vmm_active_slots = slot;
+        }
+    } else {
+        while (ctx->vmm_active_slots > new_slots) {
+            ggml_backend_cuda_vmm_unmap_slot(ctx, ctx->vmm_active_slots);
+            --ctx->vmm_active_slots;
+        }
+    }
+    ctx->vmm_mapped_size = ggml_backend_cuda_vmm_boundary(ctx, new_slots);
+    buffer->size = new_slots*ctx->vmm_slot_stride + ctx->vmm_tail_pad;
+    return true;
+#else
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(new_slots);
+    return false;
+#endif
+}
+
+static bool ggml_backend_cuda_vmm_slot_buffer_get_info(
+        ggml_backend_buffer_t buffer, size_t * active_slots, size_t * max_slots,
+        size_t * mapped_size, size_t * reserved_size, size_t * granularity) {
+#if defined(GGML_USE_VMM)
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (!ctx->vmm) {
+        return false;
+    }
+    if (active_slots)  { *active_slots  = ctx->vmm_active_slots; }
+    if (max_slots)     { *max_slots     = ctx->vmm_max_slots; }
+    if (mapped_size)   { *mapped_size   = ctx->vmm_mapped_size; }
+    if (reserved_size) { *reserved_size = ctx->vmm_reserved_size; }
+    if (granularity)   { *granularity   = ctx->vmm_granularity; }
+    return true;
+#else
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(active_slots);
+    GGML_UNUSED(max_slots);
+    GGML_UNUSED(mapped_size);
+    GGML_UNUSED(reserved_size);
+    GGML_UNUSED(granularity);
+    return false;
+#endif
+}
+
+static bool ggml_backend_cuda_vmm_slot_buffer_get_stats(
+        ggml_backend_buffer_t buffer, uint64_t * map_ops, uint64_t * unmap_ops,
+        uint64_t * map_bytes, uint64_t * unmap_bytes, void ** base) {
+#if defined(GGML_USE_VMM)
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (!ctx->vmm) {
+        return false;
+    }
+    if (map_ops)     { *map_ops = ctx->vmm_map_ops; }
+    if (unmap_ops)   { *unmap_ops = ctx->vmm_unmap_ops; }
+    if (map_bytes)   { *map_bytes = ctx->vmm_map_bytes; }
+    if (unmap_bytes) { *unmap_bytes = ctx->vmm_unmap_bytes; }
+    if (base)        { *base = ctx->dev_ptr; }
+    return true;
+#else
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(map_ops);
+    GGML_UNUSED(unmap_ops);
+    GGML_UNUSED(map_bytes);
+    GGML_UNUSED(unmap_bytes);
+    GGML_UNUSED(base);
+    return false;
+#endif
+}
+
+// cuda buffer type
 static const char * ggml_backend_cuda_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_buffer_type_context * ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
 
@@ -5446,6 +5714,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_vmm_slot_buffer_alloc") == 0) {
+        return (void *)ggml_backend_cuda_vmm_slot_buffer_alloc;
+    }
+    if (strcmp(name, "ggml_backend_cuda_vmm_slot_buffer_resize") == 0) {
+        return (void *)ggml_backend_cuda_vmm_slot_buffer_resize;
+    }
+    if (strcmp(name, "ggml_backend_cuda_vmm_slot_buffer_get_info") == 0) {
+        return (void *)ggml_backend_cuda_vmm_slot_buffer_get_info;
+    }
+    if (strcmp(name, "ggml_backend_cuda_vmm_slot_buffer_get_stats") == 0) {
+        return (void *)ggml_backend_cuda_vmm_slot_buffer_get_stats;
     }
     return nullptr;
 }

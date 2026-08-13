@@ -458,6 +458,10 @@ private:
     bool    uma_stream_use_cuda_device = false;
     ggml_backend_buffer_type_t uma_stream_cuda_device_buft = nullptr;
     ggml_backend_t uma_stream_cuda_backend = nullptr; // async H2D stream; backend not owned here
+    void *  uma_stream_vmm_alloc_fn  = nullptr;
+    void *  uma_stream_vmm_resize_fn = nullptr;
+    void *  uma_stream_vmm_info_fn   = nullptr;
+    void *  uma_stream_vmm_stats_fn  = nullptr;
     // Allocate/free ONE GPU-readable slot tensor. out_alloc = mmap length (Metal,
     // munmap on free) or 0 (CUDA, the buffer owns the pinned-host/device allocation).
     // Both CUDA paths retain MATRIX_ROW_PADDING; device buffers use the backend's
