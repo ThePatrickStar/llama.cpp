@@ -4356,6 +4356,13 @@ void llama_context::uma_stream_setup() {
         }
         uma_stream->decouple = decouple;
         uma_stream->adapt    = adapt;
+        // Correctness/reference mode: service compressed decode routes before
+        // the first expert matmul from the beginning of the context.  Live
+        // resize commits arm the same mode permanently.  The opt-in keeps the
+        // Task-21 fixed-S performance path unchanged while allowing a matched
+        // exact reference for KV-intact resize validation.
+        uma_stream->decode_exact_after_resize =
+            getenv("LLAMA_UMA_STREAM_DECODE_EXACT") != nullptr;
         uma_stream->device_slots = device_slots_requested;
         uma_stream->device_backend = device_slots_requested ? gpu_backend : nullptr;
         if (decouple && getenv("LLAMA_UMA_STREAM_HOTFREQ") == nullptr) {
