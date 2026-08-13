@@ -1949,7 +1949,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             GGML_ASSERT(marked && ggml_is_quantized(src0->type));
             const int chunk_size = get_mmvq_mmid_max_batch(src0->type, cc);
             GGML_ASSERT(chunk_size > 0 && chunk_size <= MMVQ_MAX_BATCH_SIZE);
-            if (trace_mmvq) {
+            if (trace_mmvq && ne2 > MMVQ_MAX_BATCH_SIZE) {
                 fprintf(stderr,
                         "ggml_cuda_mul_mat_id: MMVQ tiled dispatch marked=1 forced=%d type=%s "
                         "ne2=%" PRId64 " chunk=%d\n",
