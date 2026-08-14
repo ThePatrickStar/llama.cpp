@@ -4290,6 +4290,7 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
                 }
                 int oracle_fd = -1;
                 if (action == "refresh" || action == "restore" || action == "restore-map" ||
+                    action == "split-control" ||
                     action == "restore-lru") {
                     const char * model_path = getenv("LLAMA_UMA_STREAM_GGUF_ORACLE_MODEL");
                     if (model_path == nullptr || model_path[0] == '\0') {
@@ -4336,7 +4337,7 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
                         }
                     }
                 };
-                if (action == "restore-map" || action == "restore-lru") {
+                if (action == "split-control" || action == "restore-map" || action == "restore-lru") {
                     audit_device_content(false, audit_before_groups, audit_before_bytes,
                                          audit_before_mismatches, device_before_hash);
                 }
@@ -4423,7 +4424,7 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
                         L.n_newly = E.n_newly; L.tick = E.tick; L.pass = E.pass;
                     }
                 }
-                if (action == "restore-map" || action == "restore-lru") {
+                if (action == "split-control" || action == "restore-map" || action == "restore-lru") {
                     audit_device_content(action == "restore-map", audit_after_groups, audit_after_bytes,
                                          audit_after_mismatches, device_after_hash);
                 }
@@ -4449,7 +4450,7 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
                 const bool coverage = uploads ?
                     groups == expected_groups && bytes == expected_bytes && syncs == expected_syncs :
                     groups == 0 && bytes == 0 && syncs == 0;
-                const bool split_audit = (action != "restore-map" && action != "restore-lru") ||
+                const bool split_audit = (action != "split-control" && action != "restore-map" && action != "restore-lru") ||
                     (audit_before_groups == expected_groups && audit_before_bytes == expected_bytes &&
                      audit_before_mismatches == 0 && audit_after_groups == expected_groups &&
                      audit_after_bytes == expected_bytes && audit_after_mismatches == 0 &&
@@ -5124,6 +5125,7 @@ void llama_context::uma_stream_setup() {
             if (uma_stream->diag_postgrow_action != "control" &&
                 uma_stream->diag_postgrow_action != "refresh" &&
                 uma_stream->diag_postgrow_action != "restore" &&
+                uma_stream->diag_postgrow_action != "split-control" &&
                 uma_stream->diag_postgrow_action != "restore-map" &&
                 uma_stream->diag_postgrow_action != "restore-lru") {
                 throw std::runtime_error("uma stream diagnostic: invalid post-grow action");
@@ -5339,6 +5341,7 @@ void llama_context::uma_stream_setup() {
         const bool diag_postgrow_needs_oracle =
             uma_stream->diag_postgrow_action == "refresh" ||
             uma_stream->diag_postgrow_action == "restore" ||
+            uma_stream->diag_postgrow_action == "split-control" ||
             uma_stream->diag_postgrow_action == "restore-map" ||
             uma_stream->diag_postgrow_action == "restore-lru";
         if (uma_stream->diag_resize_audit || diag_postgrow_needs_oracle) {
