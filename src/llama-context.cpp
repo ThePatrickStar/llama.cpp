@@ -18,9 +18,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unistd.h>
 
 //
 // llama_context
@@ -3278,12 +3280,34 @@ int llama_uma_stream_service_prefill_tile(
     if (prefill) {
         S->prefill_max_distinct = std::max(S->prefill_max_distinct, (uint32_t) distinct.size());
     }
+    auto diag_hash_u32 = [](uint64_t h, uint32_t v) {
+        for (int shift = 0; shift < 32; shift += 8) {
+            h = (h ^ ((v >> shift) & 0xffU)) * UINT64_C(1099511628211);
+        }
+        return h;
+    };
+    if (S->diag_enabled && !prefill) {
+        S->diag_route_hash = diag_hash_u32(S->diag_route_hash, (uint32_t) ud->il);
+        S->diag_route_hash = diag_hash_u32(S->diag_route_hash, (uint32_t) distinct.size());
+        for (const int32_t e : distinct) {
+            S->diag_route_hash = diag_hash_u32(S->diag_route_hash, (uint32_t) e);
+        }
+        S->n_diag_route_events++;
+    }
     L.pass++;
     int32_t * tbl = S->expert_table(ud->il) ? (int32_t *) S->expert_table(ud->il)->data : nullptr;
 
     for (const int32_t e : distinct) {
         int32_t slot = L.slot_of_expert[e];
         if (slot >= 0 && (uint32_t) slot < Sn) {
+            if (S->diag_enabled && S->n_resizes > 0 && !prefill) {
+                S->n_diag_resident_hit_groups++;
+                for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+                    if (S->streams(ud->il, kind)) {
+                        S->n_diag_resident_hit_bytes += S->model->uma_stream_slab_bytes(ud->il, kind);
+                    }
+                }
+            }
             // Diagnostic E: refresh a resident hit into the SAME physical slot
             // from the canonical GGUF bytes.  Mapping, LRU decisions, KV, route
             // ids and normal miss/H2D accounting are deliberately untouched.
@@ -3418,6 +3442,11 @@ int llama_uma_stream_service_prefill_tile(
             return -1;
         }
         slot_ids[i] = slot;
+        if (S->diag_enabled && !prefill) {
+            S->diag_slot_hash = diag_hash_u32(S->diag_slot_hash, (uint32_t) ud->il);
+            S->diag_slot_hash = diag_hash_u32(S->diag_slot_hash, (uint32_t) e);
+            S->diag_slot_hash = diag_hash_u32(S->diag_slot_hash, (uint32_t) slot);
+        }
     }
     return 1;
 }
@@ -3967,17 +3996,25 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
                 uint64_t groups = 0, bytes = 0, byte_mismatches = 0;
                 uint64_t device_hash = UINT64_C(1469598103934665603);
                 uint64_t source_hash = UINT64_C(1469598103934665603);
+                uint64_t oracle_mismatches = 0, missing_oracles = 0;
                 uint64_t mapping_mismatches = 0, reverse_mismatches = 0;
-                uint64_t table_mismatches = 0, lru_mismatches = 0;
+                uint64_t table_mismatches = 0, missing_tables = 0, lru_mismatches = 0;
                 auto hash_bytes = [](uint64_t h, const uint8_t * p, size_t n) {
                     for (size_t i = 0; i < n; i++) { h = (h ^ p[i]) * UINT64_C(1099511628211); }
                     return h;
                 };
+                const char * oracle_model_path = getenv("LLAMA_UMA_STREAM_GGUF_ORACLE_MODEL");
+                if (oracle_model_path == nullptr || oracle_model_path[0] == '\0') {
+                    throw std::runtime_error("uma stream resize audit: independent GGUF oracle model path missing");
+                }
+                const int oracle_fd = open(oracle_model_path, O_RDONLY);
+                if (oracle_fd < 0) { throw std::runtime_error("uma stream resize audit: cannot open oracle model"); }
                 for (uint32_t il = 0; il < uma_stream->lru.size(); il++) {
                     if (!uma_stream->streams_layer((int) il)) { continue; }
                     const auto & L = uma_stream->lru[il];
                     const int32_t * tbl = uma_stream->expert_table((int) il) ?
                         (const int32_t *) uma_stream->expert_table((int) il)->data : nullptr;
+                    if (tbl == nullptr) { missing_tables++; }
                     const bool have_expected =
                         il < uma_stream->diag_pre_shrink_lru.size() &&
                         uma_stream->diag_pre_shrink_s == target;
@@ -4001,14 +4038,29 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
                             const size_t slab = model.uma_stream_slab_bytes((int) il, kind);
                             std::vector<uint8_t> device(slab), source(slab);
                             ggml_backend_tensor_get(st, device.data(), (size_t) s * slab, slab);
-                            if (!model.uma_stream_pread_expert((int) il, kind, e, source.data())) {
-                                throw std::runtime_error(format(
-                                    "uma stream resize audit: source read failed il=%u kind=%d slot=%u expert=%d",
-                                    il, kind, s, e));
-                            }
+                            const uint64_t tuple_hash = hash_bytes(UINT64_C(1469598103934665603), device.data(), slab);
+                            GGML_UNUSED(tuple_hash);
                             device_hash = hash_bytes(device_hash, device.data(), slab);
-                            source_hash = hash_bytes(source_hash, source.data(), slab);
-                            if (memcmp(device.data(), source.data(), slab) != 0) { byte_mismatches++; }
+                            const size_t oi = ((size_t) il * LLAMA_UMA_STREAM_N_KIND + (size_t) kind) *
+                                              uma_stream->n_expert + (size_t) e;
+                            if (oi >= uma_stream->diag_oracle_offsets.size() ||
+                                uma_stream->diag_oracle_offsets[oi] == UINT64_MAX) {
+                                missing_oracles++;
+                            } else {
+                                size_t got = 0;
+                                while (got < slab) {
+                                    const ssize_t nr = pread(oracle_fd, source.data() + got, slab - got,
+                                        (off_t) (uma_stream->diag_oracle_offsets[oi] + got));
+                                    if (nr <= 0) { close(oracle_fd); throw std::runtime_error("uma stream resize audit: raw GGUF pread failed"); }
+                                    got += (size_t) nr;
+                                }
+                                source_hash = hash_bytes(source_hash, source.data(), slab);
+                                if (uma_stream->diag_oracle_bytes[oi] != slab ||
+                                    memcmp(device.data(), source.data(), slab) != 0) {
+                                    oracle_mismatches++;
+                                    byte_mismatches++;
+                                }
+                            }
                             groups++;
                             bytes += slab;
                         }
@@ -4022,6 +4074,7 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
                         lru_mismatches++;
                     }
                 }
+                close(oracle_fd);
                 FILE * af = uma_stream->diag_audit_path.empty() ? nullptr :
                     fopen(uma_stream->diag_audit_path.c_str(), "a");
                 if (af == nullptr) {
@@ -4029,13 +4082,15 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
                 }
                 fprintf(af,
                     "grow old=%u new=%u groups=%llu bytes=%llu byte_mismatches=%llu "
-                    "device_hash=%016llx source_hash=%016llx mapping_mismatches=%llu "
-                    "reverse_mismatches=%llu table_mismatches=%llu lru_mismatches=%llu\n",
+                    "device_hash=%016llx source_hash=%016llx oracle_mismatches=%llu missing_oracles=%llu mapping_mismatches=%llu "
+                    "reverse_mismatches=%llu table_mismatches=%llu missing_tables=%llu lru_mismatches=%llu\n",
                     cur, target, (unsigned long long) groups, (unsigned long long) bytes,
                     (unsigned long long) byte_mismatches, (unsigned long long) device_hash,
-                    (unsigned long long) source_hash, (unsigned long long) mapping_mismatches,
+                    (unsigned long long) source_hash,
+                    (unsigned long long) oracle_mismatches, (unsigned long long) missing_oracles,
+                    (unsigned long long) mapping_mismatches,
                     (unsigned long long) reverse_mismatches, (unsigned long long) table_mismatches,
-                    (unsigned long long) lru_mismatches);
+                    (unsigned long long) missing_tables, (unsigned long long) lru_mismatches);
                 fclose(af);
                 fprintf(stderr,
                     "uma: resize audit grow %u -> %u groups=%llu bytes=%llu byte_mismatch=%llu "
@@ -4442,6 +4497,27 @@ void llama_context::uma_write_telemetry() {
     if (f == nullptr) {
         return;
     }
+    auto hash_u64 = [](uint64_t h, uint64_t v) {
+        for (int shift = 0; shift < 64; shift += 8) {
+            h = (h ^ ((v >> shift) & 0xffU)) * UINT64_C(1099511628211);
+        }
+        return h;
+    };
+    uint64_t diag_mapping_hash = UINT64_C(1469598103934665603);
+    uint64_t diag_lru_hash = UINT64_C(1469598103934665603);
+    for (uint32_t il = 0; il < uma_stream->lru.size(); il++) {
+        if (!uma_stream->streams_layer((int) il)) { continue; }
+        const auto & L = uma_stream->lru[il];
+        diag_mapping_hash = hash_u64(diag_mapping_hash, il);
+        for (const int32_t e : L.expert_in_slot) { diag_mapping_hash = hash_u64(diag_mapping_hash, (uint32_t) e); }
+        for (const int32_t s : L.slot_of_expert) { diag_mapping_hash = hash_u64(diag_mapping_hash, (uint32_t) s); }
+        diag_lru_hash = hash_u64(diag_lru_hash, il);
+        for (const uint64_t x : L.last_used) { diag_lru_hash = hash_u64(diag_lru_hash, x); }
+        for (const uint64_t x : L.pinned) { diag_lru_hash = hash_u64(diag_lru_hash, x); }
+        for (const uint8_t x : L.pin_protected) { diag_lru_hash = hash_u64(diag_lru_hash, x); }
+        diag_lru_hash = hash_u64(diag_lru_hash, L.tick);
+        diag_lru_hash = hash_u64(diag_lru_hash, L.pass);
+    }
     fprintf(f,
             "s_active %u\ns_ceiling %u\nn_expert_used %u\nn_miss %llu\nn_read %llu\n"
             "n_h2d_miss %llu\nn_h2d_bytes %llu\n"
@@ -4453,6 +4529,8 @@ void llama_context::uma_write_telemetry() {
             "n_decode_late_fail %llu\ndecode_exact_after_resize %u\n"
             "n_distress %llu\nn_overflow %llu\nn_resizes %llu\nn_predecode_resumes %llu\n"
             "n_diag_graph_rebuilds %llu\nn_diag_hit_refresh_groups %llu\nn_diag_hit_refresh_bytes %llu\n"
+            "n_diag_resident_hit_groups %llu\nn_diag_resident_hit_bytes %llu\nn_diag_route_events %llu\n"
+            "diag_route_hash %llu\ndiag_slot_hash %llu\ndiag_mapping_hash %llu\ndiag_lru_hash %llu\n"
             "s_min_reached %u\ns_max_reached %u\nphys_footprint_mib %zu\n"
             "last_resize_free_ms %.3f\nlast_resize_alloc_ms %.3f\nlast_resize_reseed_ms %.3f\n"
             "last_resize_old_s %u\nlast_resize_new_s %u\nlast_resize_delta_s %u\nlast_resize_segments %u\n"
@@ -4492,6 +4570,13 @@ void llama_context::uma_write_telemetry() {
             (unsigned long long) uma_stream->n_diag_graph_rebuilds,
             (unsigned long long) uma_stream->n_diag_hit_refresh_groups,
             (unsigned long long) uma_stream->n_diag_hit_refresh_bytes,
+            (unsigned long long) uma_stream->n_diag_resident_hit_groups,
+            (unsigned long long) uma_stream->n_diag_resident_hit_bytes,
+            (unsigned long long) uma_stream->n_diag_route_events,
+            (unsigned long long) uma_stream->diag_route_hash,
+            (unsigned long long) uma_stream->diag_slot_hash,
+            (unsigned long long) diag_mapping_hash,
+            (unsigned long long) diag_lru_hash,
             uma_stream->s_min_active, uma_stream->s_max_active, llama_uma_phys_footprint_mib(),
             uma_stream->last_resize_free_us / 1000.0, uma_stream->last_resize_alloc_us / 1000.0,
             uma_stream->last_resize_reseed_us / 1000.0,
@@ -4828,6 +4913,49 @@ void llama_context::uma_stream_setup() {
         // seed the hot working set into the (now sole) resident slots + pin, preading
         // from the dup'd fd (the free above does not close it).
         uma_stream_warm_start(uma_stream.get(), model);
+
+        // Load the independently generated raw-GGUF expert oracle only for a
+        // resize audit.  It is keyed by runtime layer/kind/expert and is never
+        // produced through uma_stream_pread_expert(), the code under test.
+        if (uma_stream->diag_resize_audit) {
+            const char * oracle_path = getenv("LLAMA_UMA_STREAM_GGUF_ORACLE");
+            if (oracle_path == nullptr || oracle_path[0] == '\0') {
+                throw std::runtime_error("uma stream resize audit: independent GGUF oracle is required");
+            }
+            const size_t n_oracle = (size_t) n_layer * LLAMA_UMA_STREAM_N_KIND * n_expert;
+            uma_stream->diag_oracle_offsets.assign(n_oracle, UINT64_MAX);
+            uma_stream->diag_oracle_bytes.assign(n_oracle, 0);
+            FILE * of = fopen(oracle_path, "r");
+            if (of == nullptr) { throw std::runtime_error("uma stream resize audit: cannot open GGUF oracle"); }
+            uint32_t il = 0, kind = 0, e = 0;
+            unsigned long long offset = 0, slab = 0;
+            uint64_t loaded = 0;
+            while (fscanf(of, "%u\t%u\t%u\t%llu\t%llu", &il, &kind, &e, &offset, &slab) == 5) {
+                if (il >= n_layer || kind >= LLAMA_UMA_STREAM_N_KIND || e >= n_expert) {
+                    fclose(of); throw std::runtime_error("uma stream resize audit: GGUF oracle index out of range");
+                }
+                const size_t oi = ((size_t) il * LLAMA_UMA_STREAM_N_KIND + kind) * n_expert + e;
+                if (offset == 0 || slab == 0 || uma_stream->diag_oracle_offsets[oi] != UINT64_MAX) {
+                    fclose(of); throw std::runtime_error("uma stream resize audit: duplicate/invalid GGUF oracle row");
+                }
+                uma_stream->diag_oracle_offsets[oi] = (uint64_t) offset;
+                uma_stream->diag_oracle_bytes[oi] = (uint64_t) slab;
+                loaded++;
+            }
+            fclose(of);
+            uint64_t expected = 0;
+            for (uint32_t li = 0; li < n_layer; li++) {
+                for (int ki = 0; ki < LLAMA_UMA_STREAM_N_KIND; ki++) {
+                    if (uma_stream->streams((int) li, ki)) { expected += n_expert; }
+                }
+            }
+            if (loaded != expected) {
+                throw std::runtime_error(format("uma stream resize audit: GGUF oracle rows %llu != expected %llu",
+                    (unsigned long long) loaded, (unsigned long long) expected));
+            }
+            fprintf(stderr, "uma: independent raw-GGUF audit oracle loaded: %llu expert slabs\n",
+                    (unsigned long long) loaded);
+        }
 
         // M6 give-back controller config (parsed once). Armed by LLAMA_UMA_STREAM_SMIN
         // (the knee = a hard floor). Requires DECOUPLE (the GPU-gather routing that makes

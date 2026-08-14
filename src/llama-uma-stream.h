@@ -106,10 +106,17 @@ struct llama_uma_stream_state {
     uint64_t n_diag_graph_rebuilds = 0;
     uint64_t n_diag_hit_refresh_groups = 0;
     uint64_t n_diag_hit_refresh_bytes = 0;
+    uint64_t n_diag_resident_hit_groups = 0;
+    uint64_t n_diag_resident_hit_bytes = 0;
+    uint64_t n_diag_route_events = 0;
+    uint64_t diag_route_hash = 1469598103934665603ULL;
+    uint64_t diag_slot_hash = 1469598103934665603ULL;
     bool     diag_enabled = false;
     bool     diag_resize_audit = false;
     bool     diag_force_hit_refresh = false;
     std::string diag_audit_path;
+    std::vector<uint64_t> diag_oracle_offsets;
+    std::vector<uint64_t> diag_oracle_bytes;
     std::vector<llama_uma_stream_layer_lru> diag_pre_shrink_lru;
     uint32_t diag_pre_shrink_s = 0;
     uint64_t n_distress   = 0;  // times a shed target below the knee was clamped (M7 signal)
