@@ -3846,7 +3846,8 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
         // Diagnostic C freezes the exact no-resize counterfactual immediately
         // before shrink.  It is observational only: normal resize behavior below
         // is unchanged.
-        if (target < cur && uma_stream->diag_resize_audit) {
+        if (target < cur && (uma_stream->diag_resize_audit ||
+                            !uma_stream->diag_postgrow_action.empty())) {
             uma_stream->diag_pre_shrink_lru = uma_stream->lru;
             uma_stream->diag_pre_shrink_s = cur;
         }
@@ -4099,6 +4100,263 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
                     (unsigned long long) byte_mismatches, (unsigned long long) mapping_mismatches,
                     (unsigned long long) reverse_mismatches, (unsigned long long) table_mismatches,
                     (unsigned long long) lru_mismatches);
+            }
+
+            // Diagnostic C/E interventions run after the ordinary grow has
+            // fully synchronized but before the active size is published or
+            // the resumed request may execute.  They are generic over the
+            // runtime streamed tensor inventory.  "control" is observational,
+            // "refresh" rewrites each currently resident expert from the
+            // independent raw-offset GGUF oracle into the same physical slot,
+            // and "restore" reinstalls the exact pre-shrink residency/LRU
+            // counterfactual.  None touches KV/recurrent state or normal service
+            // counters, and all are diagnostic-only.
+            if (target > cur && !uma_stream->diag_postgrow_action.empty()) {
+                if (uma_stream->diag_pre_shrink_s != target ||
+                    uma_stream->diag_pre_shrink_lru.size() != uma_stream->lru.size()) {
+                    throw std::runtime_error("uma stream post-grow diagnostic: missing pre-shrink state");
+                }
+                const std::string action = uma_stream->diag_postgrow_action;
+                auto hash_u64 = [](uint64_t h, uint64_t v) {
+                    for (int shift = 0; shift < 64; shift += 8) {
+                        h = (h ^ ((v >> shift) & 0xffU)) * UINT64_C(1099511628211);
+                    }
+                    return h;
+                };
+                auto hash_bytes = [](uint64_t h, const uint8_t * p, size_t n) {
+                    for (size_t i = 0; i < n; i++) { h = (h ^ p[i]) * UINT64_C(1099511628211); }
+                    return h;
+                };
+                auto metadata_hash = [&]() {
+                    uint64_t h = UINT64_C(1469598103934665603);
+                    for (uint32_t il = 0; il < uma_stream->lru.size(); il++) {
+                        if (!uma_stream->streams_layer((int) il)) { continue; }
+                        const auto & L = uma_stream->lru[il];
+                        h = hash_u64(h, il); h = hash_u64(h, L.tick);
+                        h = hash_u64(h, L.pass); h = hash_u64(h, L.n_newly);
+                        for (uint32_t s = 0; s < uma_stream->n_slots; s++) {
+                            h = hash_u64(h, (uint32_t) L.expert_in_slot[s]);
+                            h = hash_u64(h, L.last_used[s]);
+                            h = hash_u64(h, L.pinned[s]);
+                            h = hash_u64(h, L.pin_protected[s]);
+                        }
+                        for (uint32_t e = 0; e < uma_stream->n_expert; e++) {
+                            h = hash_u64(h, (uint32_t) L.slot_of_expert[e]);
+                        }
+                        const int32_t * tbl = uma_stream->expert_table((int) il) ?
+                            (const int32_t *) uma_stream->expert_table((int) il)->data : nullptr;
+                        if (tbl == nullptr) { return UINT64_C(0); }
+                        for (uint32_t e = 0; e < uma_stream->n_expert; e++) {
+                            h = hash_u64(h, (uint32_t) tbl[e]);
+                        }
+                    }
+                    return h;
+                };
+                auto pre_shrink_metadata_hash = [&]() {
+                    uint64_t h = UINT64_C(1469598103934665603);
+                    for (uint32_t il = 0; il < uma_stream->diag_pre_shrink_lru.size(); il++) {
+                        if (!uma_stream->streams_layer((int) il)) { continue; }
+                        const auto & L = uma_stream->diag_pre_shrink_lru[il];
+                        h = hash_u64(h, il); h = hash_u64(h, L.tick);
+                        h = hash_u64(h, L.pass); h = hash_u64(h, L.n_newly);
+                        for (uint32_t s = 0; s < uma_stream->n_slots; s++) {
+                            h = hash_u64(h, (uint32_t) L.expert_in_slot[s]);
+                            h = hash_u64(h, L.last_used[s]);
+                            h = hash_u64(h, L.pinned[s]);
+                            h = hash_u64(h, L.pin_protected[s]);
+                        }
+                        for (uint32_t e = 0; e < uma_stream->n_expert; e++) {
+                            h = hash_u64(h, (uint32_t) L.slot_of_expert[e]);
+                        }
+                        for (uint32_t e = 0; e < uma_stream->n_expert; e++) {
+                            const int32_t s = L.slot_of_expert[e];
+                            h = hash_u64(h, (uint32_t) (s >= 0 && (uint32_t) s < target ? s : 0));
+                        }
+                    }
+                    return h;
+                };
+                auto normal_counter_hash = [&]() {
+                    uint64_t h = UINT64_C(1469598103934665603);
+                    const uint64_t values[] = {
+                        uma_stream->n_read, uma_stream->n_miss, uma_stream->n_h2d_miss,
+                        uma_stream->n_h2d_bytes,
+                        uma_stream->n_prefill_tiles, uma_stream->n_prefill_cold_miss,
+                        uma_stream->n_prefill_h2d_miss, uma_stream->n_prefill_h2d_bytes,
+                        uma_stream->n_prefill_service_fail,
+                        uma_stream->n_prefill_substitute, uma_stream->n_decode_service,
+                        uma_stream->n_decode_cold_miss, uma_stream->n_decode_h2d_miss,
+                        uma_stream->n_decode_h2d_bytes,
+                        uma_stream->n_decode_service_fail, uma_stream->n_decode_substitute,
+                        uma_stream->n_decode_late_calls, uma_stream->n_decode_late_cold_miss,
+                        uma_stream->n_decode_late_h2d_miss, uma_stream->n_decode_late_h2d_bytes,
+                        uma_stream->n_decode_late_fail,
+                        uma_stream->n_overflow, uma_stream->n_distress,
+                    };
+                    for (uint64_t v : values) { h = hash_u64(h, v); }
+                    return h;
+                };
+                auto vmm_hash = [&]() {
+                    uint64_t h = UINT64_C(1469598103934665603);
+                    for (const auto & owner : uma_stream->slot_buf) {
+                        if (!owner) { continue; }
+                        size_t active = 0, max = 0, mapped = 0, reserved = 0, granularity = 0;
+                        size_t stride = 0, pad = 0, logical = 0;
+                        uint64_t mo = 0, uo = 0, mb = 0, ub = 0; void * base = nullptr;
+                        if (!info_fn(owner.get(), &active, &max, &mapped, &reserved, &granularity,
+                                     &stride, &pad, &logical) ||
+                            !stats_fn(owner.get(), &mo, &uo, &mb, &ub, &base)) {
+                            return UINT64_C(0);
+                        }
+                        const uint64_t values[] = { active, max, mapped, reserved, granularity,
+                            stride, pad, logical, mo, uo, mb, ub, (uint64_t) (uintptr_t) base };
+                        for (uint64_t v : values) { h = hash_u64(h, v); }
+                    }
+                    return h;
+                };
+                const uint64_t metadata_before = metadata_hash();
+                const uint64_t normal_before = normal_counter_hash();
+                const uint64_t vmm_before = vmm_hash();
+                const uint64_t serving_state_before = hash_u64(
+                    hash_u64(UINT64_C(1469598103934665603), uma_stream->n_slots_active),
+                    uma_stream->parked ? 1 : 0);
+                if (metadata_before == 0 || vmm_before == 0) {
+                    throw std::runtime_error("uma stream post-grow diagnostic: incomplete boundary state");
+                }
+
+                uint64_t groups = 0, bytes = 0, source_hash = UINT64_C(1469598103934665603);
+                uint64_t expected_groups = 0, expected_bytes = 0, expected_syncs = 0, syncs = 0;
+                uint64_t restore_mismatches = 0, missing_tables = 0;
+                for (uint32_t il = 0; il < uma_stream->lru.size(); il++) {
+                    if (!uma_stream->streams_layer((int) il)) { continue; }
+                    expected_syncs += target;
+                    for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+                        if (!uma_stream->streams((int) il, kind)) { continue; }
+                        expected_groups += target;
+                        expected_bytes += target * model.uma_stream_slab_bytes((int) il, kind);
+                    }
+                }
+                int oracle_fd = -1;
+                if (action != "control") {
+                    const char * model_path = getenv("LLAMA_UMA_STREAM_GGUF_ORACLE_MODEL");
+                    if (model_path == nullptr || model_path[0] == '\0') {
+                        throw std::runtime_error("uma stream post-grow diagnostic: oracle model missing");
+                    }
+                    oracle_fd = open(model_path, O_RDONLY);
+                    if (oracle_fd < 0) { throw std::runtime_error("uma stream post-grow diagnostic: cannot open oracle model"); }
+                }
+                if (action == "refresh" || action == "restore") {
+                    for (uint32_t il = 0; il < uma_stream->lru.size(); il++) {
+                        if (!uma_stream->streams_layer((int) il)) { continue; }
+                        auto & L = uma_stream->lru[il];
+                        const auto & E = uma_stream->diag_pre_shrink_lru[il];
+                        for (uint32_t s = 0; s < target; s++) {
+                            const int32_t e = action == "restore" ? E.expert_in_slot[s] : L.expert_in_slot[s];
+                            if (e < 0 || (uint32_t) e >= uma_stream->n_expert) {
+                                close(oracle_fd); throw std::runtime_error("uma stream post-grow diagnostic: invalid resident expert");
+                            }
+                            uint64_t uploaded = 0;
+                            for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+                                if (!uma_stream->streams((int) il, kind)) { continue; }
+                                const size_t slab = model.uma_stream_slab_bytes((int) il, kind);
+                                const size_t oi = ((size_t) il * LLAMA_UMA_STREAM_N_KIND + (size_t) kind) *
+                                                  uma_stream->n_expert + (size_t) e;
+                                if (oi >= uma_stream->diag_oracle_offsets.size() ||
+                                    uma_stream->diag_oracle_offsets[oi] == UINT64_MAX ||
+                                    uma_stream->diag_oracle_bytes[oi] != slab ||
+                                    (size_t) kind >= uma_stream->device_stage_host.size() ||
+                                    uma_stream->device_stage_host[kind] == nullptr ||
+                                    uma_stream->device_stage_bytes[kind] < slab) {
+                                    close(oracle_fd); throw std::runtime_error("uma stream post-grow diagnostic: incomplete oracle tuple");
+                                }
+                                size_t got = 0;
+                                while (got < slab) {
+                                    const ssize_t nr = pread(oracle_fd,
+                                        (uint8_t *) uma_stream->device_stage_host[kind] + got, slab - got,
+                                        (off_t) (uma_stream->diag_oracle_offsets[oi] + got));
+                                    if (nr <= 0) { close(oracle_fd); throw std::runtime_error("uma stream post-grow diagnostic: oracle pread failed"); }
+                                    got += (size_t) nr;
+                                }
+                                source_hash = hash_bytes(source_hash,
+                                    (const uint8_t *) uma_stream->device_stage_host[kind], slab);
+                                ggml_backend_tensor_set_async(uma_stream_cuda_backend,
+                                    uma_stream->slot((int) il, kind), uma_stream->device_stage_host[kind],
+                                    (size_t) s * slab, slab);
+                                groups++; bytes += slab; uploaded += slab;
+                            }
+                            if (uploaded == 0) { close(oracle_fd); throw std::runtime_error("uma stream post-grow diagnostic: empty resident upload"); }
+                            ggml_backend_synchronize(uma_stream_cuda_backend); syncs++;
+                        }
+                    }
+                }
+                if (oracle_fd >= 0) { close(oracle_fd); }
+                if (action == "restore") {
+                    for (uint32_t il = 0; il < uma_stream->lru.size(); il++) {
+                        if (!uma_stream->streams_layer((int) il)) { continue; }
+                        uma_stream->lru[il] = uma_stream->diag_pre_shrink_lru[il];
+                        const auto & L = uma_stream->lru[il];
+                        int32_t * tbl = uma_stream->expert_table((int) il) ?
+                            (int32_t *) uma_stream->expert_table((int) il)->data : nullptr;
+                        if (tbl == nullptr) { missing_tables++; continue; }
+                        std::fill(tbl, tbl + uma_stream->n_expert, 0);
+                        for (uint32_t s = 0; s < target; s++) {
+                            const int32_t e = L.expert_in_slot[s];
+                            if (e < 0 || (uint32_t) e >= uma_stream->n_expert ||
+                                L.slot_of_expert[e] != (int32_t) s) { restore_mismatches++; continue; }
+                            tbl[e] = (int32_t) s;
+                        }
+                        for (uint32_t e = 0; e < uma_stream->n_expert; e++) {
+                            const int32_t s = L.slot_of_expert[e];
+                            const int32_t expected_tbl = s >= 0 && (uint32_t) s < target ? s : 0;
+                            if (tbl[e] != expected_tbl) { restore_mismatches++; }
+                        }
+                    }
+                }
+                const uint64_t metadata_after = metadata_hash();
+                const uint64_t restore_expected_metadata = pre_shrink_metadata_hash();
+                const uint64_t normal_after = normal_counter_hash();
+                const uint64_t vmm_after = vmm_hash();
+                const uint64_t serving_state_after = hash_u64(
+                    hash_u64(UINT64_C(1469598103934665603), uma_stream->n_slots_active),
+                    uma_stream->parked ? 1 : 0);
+                const bool pure = normal_before == normal_after && vmm_before == vmm_after &&
+                    serving_state_before == serving_state_after &&
+                    (action == "restore" ? restore_mismatches == 0 && missing_tables == 0 &&
+                                           metadata_after == restore_expected_metadata :
+                                           metadata_before == metadata_after);
+                const bool coverage = action == "control" ? groups == 0 && bytes == 0 && syncs == 0 :
+                    groups == expected_groups && bytes == expected_bytes && syncs == expected_syncs;
+                if (!pure || !coverage || metadata_after == 0 || vmm_after == 0) {
+                    throw std::runtime_error("uma stream post-grow diagnostic: purity or coverage invariant failed");
+                }
+                FILE * pf = fopen(uma_stream->diag_postgrow_evidence_path.c_str(), "a");
+                if (pf == nullptr) { throw std::runtime_error("uma stream post-grow diagnostic: cannot open evidence path"); }
+                fprintf(pf,
+                    "postgrow action=%s old=%u new=%u groups=%llu expected_groups=%llu bytes=%llu expected_bytes=%llu "
+                    "syncs=%llu source_hash=%016llx metadata_before=%016llx metadata_after=%016llx "
+                    "restore_expected_metadata=%016llx "
+                    "normal_before=%016llx normal_after=%016llx vmm_before=%016llx vmm_after=%016llx "
+                    "serving_state_before=%016llx serving_state_after=%016llx "
+                    "restore_mismatches=%llu missing_tables=%llu\n",
+                    action.c_str(), cur, target, (unsigned long long) groups,
+                    (unsigned long long) expected_groups, (unsigned long long) bytes,
+                    (unsigned long long) expected_bytes, (unsigned long long) syncs,
+                    (unsigned long long) source_hash, (unsigned long long) metadata_before,
+                    (unsigned long long) metadata_after, (unsigned long long) restore_expected_metadata,
+                    (unsigned long long) normal_before,
+                    (unsigned long long) normal_after, (unsigned long long) vmm_before,
+                    (unsigned long long) vmm_after, (unsigned long long) serving_state_before,
+                    (unsigned long long) serving_state_after, (unsigned long long) restore_mismatches,
+                    (unsigned long long) missing_tables);
+                fclose(pf);
+                uma_stream->n_diag_postgrow_events++;
+                uma_stream->n_diag_postgrow_groups += groups;
+                uma_stream->n_diag_postgrow_bytes += bytes;
+                uma_stream->n_diag_postgrow_syncs += syncs;
+                fprintf(stderr,
+                    "uma: post-grow diagnostic action=%s groups=%llu/%llu bytes=%llu/%llu syncs=%llu before first compute\n",
+                    action.c_str(), (unsigned long long) groups, (unsigned long long) expected_groups,
+                    (unsigned long long) bytes, (unsigned long long) expected_bytes,
+                    (unsigned long long) syncs);
             }
 
             uma_stream->n_slots_active = target;
@@ -4530,6 +4788,7 @@ void llama_context::uma_write_telemetry() {
             "n_distress %llu\nn_overflow %llu\nn_resizes %llu\nn_predecode_resumes %llu\n"
             "n_diag_graph_rebuilds %llu\nn_diag_hit_refresh_groups %llu\nn_diag_hit_refresh_bytes %llu\n"
             "n_diag_resident_hit_groups %llu\nn_diag_resident_hit_bytes %llu\nn_diag_route_events %llu\n"
+            "n_diag_postgrow_events %llu\nn_diag_postgrow_groups %llu\nn_diag_postgrow_bytes %llu\nn_diag_postgrow_syncs %llu\n"
             "diag_route_hash %llu\ndiag_slot_hash %llu\ndiag_mapping_hash %llu\ndiag_lru_hash %llu\n"
             "s_min_reached %u\ns_max_reached %u\nphys_footprint_mib %zu\n"
             "last_resize_free_ms %.3f\nlast_resize_alloc_ms %.3f\nlast_resize_reseed_ms %.3f\n"
@@ -4573,6 +4832,10 @@ void llama_context::uma_write_telemetry() {
             (unsigned long long) uma_stream->n_diag_resident_hit_groups,
             (unsigned long long) uma_stream->n_diag_resident_hit_bytes,
             (unsigned long long) uma_stream->n_diag_route_events,
+            (unsigned long long) uma_stream->n_diag_postgrow_events,
+            (unsigned long long) uma_stream->n_diag_postgrow_groups,
+            (unsigned long long) uma_stream->n_diag_postgrow_bytes,
+            (unsigned long long) uma_stream->n_diag_postgrow_syncs,
             (unsigned long long) uma_stream->diag_route_hash,
             (unsigned long long) uma_stream->diag_slot_hash,
             (unsigned long long) diag_mapping_hash,
@@ -4714,6 +4977,20 @@ void llama_context::uma_stream_setup() {
         uma_stream->diag_audit_path = uma_stream->diag_resize_audit ? diag_audit : "";
         uma_stream->diag_force_hit_refresh =
             getenv("LLAMA_UMA_STREAM_DIAG_FORCE_HIT_REFRESH") != nullptr;
+        const char * diag_postgrow_action = getenv("LLAMA_UMA_STREAM_DIAG_POSTGROW_ACTION");
+        const char * diag_postgrow_evidence = getenv("LLAMA_UMA_STREAM_DIAG_POSTGROW_EVIDENCE");
+        if (diag_postgrow_action != nullptr && diag_postgrow_action[0] != '\0') {
+            uma_stream->diag_postgrow_action = diag_postgrow_action;
+            if (uma_stream->diag_postgrow_action != "control" &&
+                uma_stream->diag_postgrow_action != "refresh" &&
+                uma_stream->diag_postgrow_action != "restore") {
+                throw std::runtime_error("uma stream diagnostic: invalid post-grow action");
+            }
+            if (!uma_stream->diag_enabled || diag_postgrow_evidence == nullptr || diag_postgrow_evidence[0] == '\0') {
+                throw std::runtime_error("uma stream diagnostic: post-grow action requires diagnostic mode and evidence path");
+            }
+            uma_stream->diag_postgrow_evidence_path = diag_postgrow_evidence;
+        }
         uma_stream->device_backend = device_slots_requested ? gpu_backend : nullptr;
         if (decouple && getenv("LLAMA_UMA_STREAM_HOTFREQ") == nullptr) {
             throw std::runtime_error("uma stream: LLAMA_UMA_STREAM_DECOUPLE/ADAPT requires LLAMA_UMA_STREAM_HOTFREQ (initial slot seed)");
@@ -4917,26 +5194,29 @@ void llama_context::uma_stream_setup() {
         // Load the independently generated raw-GGUF expert oracle only for a
         // resize audit.  It is keyed by runtime layer/kind/expert and is never
         // produced through uma_stream_pread_expert(), the code under test.
-        if (uma_stream->diag_resize_audit) {
+        const bool diag_postgrow_needs_oracle =
+            uma_stream->diag_postgrow_action == "refresh" ||
+            uma_stream->diag_postgrow_action == "restore";
+        if (uma_stream->diag_resize_audit || diag_postgrow_needs_oracle) {
             const char * oracle_path = getenv("LLAMA_UMA_STREAM_GGUF_ORACLE");
             if (oracle_path == nullptr || oracle_path[0] == '\0') {
-                throw std::runtime_error("uma stream resize audit: independent GGUF oracle is required");
+                throw std::runtime_error("uma stream diagnostic: independent GGUF oracle is required");
             }
             const size_t n_oracle = (size_t) n_layer * LLAMA_UMA_STREAM_N_KIND * n_expert;
             uma_stream->diag_oracle_offsets.assign(n_oracle, UINT64_MAX);
             uma_stream->diag_oracle_bytes.assign(n_oracle, 0);
             FILE * of = fopen(oracle_path, "r");
-            if (of == nullptr) { throw std::runtime_error("uma stream resize audit: cannot open GGUF oracle"); }
+            if (of == nullptr) { throw std::runtime_error("uma stream diagnostic: cannot open GGUF oracle"); }
             uint32_t il = 0, kind = 0, e = 0;
             unsigned long long offset = 0, slab = 0;
             uint64_t loaded = 0;
             while (fscanf(of, "%u\t%u\t%u\t%llu\t%llu", &il, &kind, &e, &offset, &slab) == 5) {
                 if (il >= n_layer || kind >= LLAMA_UMA_STREAM_N_KIND || e >= n_expert) {
-                    fclose(of); throw std::runtime_error("uma stream resize audit: GGUF oracle index out of range");
+                    fclose(of); throw std::runtime_error("uma stream diagnostic: GGUF oracle index out of range");
                 }
                 const size_t oi = ((size_t) il * LLAMA_UMA_STREAM_N_KIND + kind) * n_expert + e;
                 if (offset == 0 || slab == 0 || uma_stream->diag_oracle_offsets[oi] != UINT64_MAX) {
-                    fclose(of); throw std::runtime_error("uma stream resize audit: duplicate/invalid GGUF oracle row");
+                    fclose(of); throw std::runtime_error("uma stream diagnostic: duplicate/invalid GGUF oracle row");
                 }
                 uma_stream->diag_oracle_offsets[oi] = (uint64_t) offset;
                 uma_stream->diag_oracle_bytes[oi] = (uint64_t) slab;
@@ -4950,7 +5230,7 @@ void llama_context::uma_stream_setup() {
                 }
             }
             if (loaded != expected) {
-                throw std::runtime_error(format("uma stream resize audit: GGUF oracle rows %llu != expected %llu",
+                throw std::runtime_error(format("uma stream diagnostic: GGUF oracle rows %llu != expected %llu",
                     (unsigned long long) loaded, (unsigned long long) expected));
             }
             fprintf(stderr, "uma: independent raw-GGUF audit oracle loaded: %llu expert slabs\n",

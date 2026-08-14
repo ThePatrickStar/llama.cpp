@@ -114,6 +114,12 @@ struct llama_uma_stream_state {
     bool     diag_enabled = false;
     bool     diag_resize_audit = false;
     bool     diag_force_hit_refresh = false;
+    std::string diag_postgrow_action;
+    std::string diag_postgrow_evidence_path;
+    uint64_t n_diag_postgrow_events = 0;
+    uint64_t n_diag_postgrow_groups = 0;
+    uint64_t n_diag_postgrow_bytes = 0;
+    uint64_t n_diag_postgrow_syncs = 0;
     std::string diag_audit_path;
     std::vector<uint64_t> diag_oracle_offsets;
     std::vector<uint64_t> diag_oracle_bytes;
