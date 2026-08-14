@@ -100,6 +100,22 @@ struct llama_uma_stream_state {
     // M6 give-back controller telemetry + eager-grow support
     uint64_t n_resizes    = 0;  // runtime S-resize events over the context lifetime
     uint64_t n_predecode_resumes = 0; // parked requests restored before any graph executes
+    // A parked segmented shrink is a relocation, not a new residency decision.
+    // Preserve the expert<->physical-slot mapping from the first downward edge
+    // until the quiescent excursion resumes or reconstructs its high-water prefix.
+    // Ordinary serving resizes do not retain a frozen checkpoint across adaptive
+    // admissions. This state is derived
+    // entirely from the live stream inventory; it is independent of architecture,
+    // tensor geometry, and quant type.  LRU/pin clocks are intentionally excluded:
+    // the causal split proved mapping/table identity is sufficient and LRU rewind
+    // is not.
+    bool resize_mapping_checkpoint_valid = false;
+    uint32_t resize_mapping_checkpoint_s = 0;
+    std::vector<std::vector<int32_t>> resize_mapping_checkpoint_expert_in_slot;
+    std::vector<std::vector<int32_t>> resize_mapping_checkpoint_slot_of_expert;
+    uint64_t n_resize_mapping_checkpoint_capture = 0;
+    uint64_t n_resize_mapping_checkpoint_restore = 0;
+    uint64_t n_resize_mapping_checkpoint_prefix_fail = 0;
     // Diagnostic counters are inert unless LLAMA_UMA_STREAM_DIAGNOSTIC is set.
     // They support model/geometry/quant-agnostic causal probes; they never alter
     // the ordinary serving path or its admission accounting.

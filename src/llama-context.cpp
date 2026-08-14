@@ -697,6 +697,16 @@ llama_context::~llama_context() {
             fprintf(stderr, "uma: parked pre-decode resumes: %llu\n",
                     (unsigned long long) uma_stream->n_predecode_resumes);
         }
+        if (uma_stream->n_resize_mapping_checkpoint_capture > 0 ||
+            uma_stream->n_resize_mapping_checkpoint_prefix_fail > 0) {
+            fprintf(stderr,
+                    "uma: resize mapping checkpoints: capture %llu, restore %llu, prefix failures %llu, active %u at S=%u\n",
+                    (unsigned long long) uma_stream->n_resize_mapping_checkpoint_capture,
+                    (unsigned long long) uma_stream->n_resize_mapping_checkpoint_restore,
+                    (unsigned long long) uma_stream->n_resize_mapping_checkpoint_prefix_fail,
+                    (unsigned) uma_stream->resize_mapping_checkpoint_valid,
+                    uma_stream->resize_mapping_checkpoint_s);
+        }
     } else if (getenv("LLAMA_UMA_FOOTPRINT")) {
         // stock baseline footprint (no streaming), for the supply-curve comparison
         fprintf(stderr, "uma: teardown: phys_footprint %zu MiB (steady-state, stock)\n", llama_uma_phys_footprint_mib());
@@ -3755,6 +3765,20 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
     const bool parked_before = uma_stream->parked;
     const uint32_t cur = uma_stream->n_slots_active;
     if (target == cur) {
+        // A mapping checkpoint belongs only to a quiescent parked excursion.
+        // Unparking at the already-realized S ends that excursion before serving
+        // may legitimately mutate the adaptive resident map.
+        if (!park && uma_stream->resize_mapping_checkpoint_valid) {
+            const uint32_t checkpoint_s = uma_stream->resize_mapping_checkpoint_s;
+            uma_stream->n_resize_mapping_checkpoint_restore++;
+            uma_stream->resize_mapping_checkpoint_valid = false;
+            uma_stream->resize_mapping_checkpoint_s = 0;
+            uma_stream->resize_mapping_checkpoint_expert_in_slot.clear();
+            uma_stream->resize_mapping_checkpoint_slot_of_expert.clear();
+            fprintf(stderr,
+                    "uma: resize mapping checkpoint closed on unpark at S=%u (checkpoint S=%u) before compute\n",
+                    cur, checkpoint_s);
+        }
         uma_stream->parked = park; // a normal no-op target still unparks
         return;
     }
@@ -3827,6 +3851,118 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
             bases_before.push_back(base);
             mapped_before += mapped;
             n_buffers++;
+        }
+
+        // The active expert table is redundant state: expert_in_slot,
+        // slot_of_expert, and the GPU-visible table must describe one bijection.
+        // Validate that closed world before touching VMM state.  During a shrink /
+        // regrow excursion, also require the live prefix to remain the restriction
+        // of the first downward-edge checkpoint.  A mismatch is refused before
+        // allocation; ranked fallback would recreate the retained-KV corruption
+        // this invariant is designed to prevent.
+        auto mapping_fail = [&](const std::string & where, const std::string & detail) {
+            uma_stream->n_resize_mapping_checkpoint_prefix_fail++;
+            throw std::runtime_error(format(
+                "uma stream resize: mapping checkpoint invariant failed at %s: %s",
+                where.c_str(), detail.c_str()));
+        };
+        auto validate_live_mapping = [&](uint32_t active, const std::string & where) {
+            if (active > smax) {
+                mapping_fail(where, "active slots exceed ceiling");
+            }
+            for (uint32_t il = 0; il < uma_stream->lru.size(); il++) {
+                if (!uma_stream->streams_layer((int) il)) { continue; }
+                const llama_uma_stream_layer_lru & L = uma_stream->lru[il];
+                const int32_t * tbl = uma_stream->expert_table((int) il) ?
+                    (const int32_t *) uma_stream->expert_table((int) il)->data : nullptr;
+                if (tbl == nullptr || L.expert_in_slot.size() != smax ||
+                    L.slot_of_expert.size() != uma_stream->n_expert) {
+                    mapping_fail(where, format("incomplete mapping storage il=%u", il));
+                }
+                std::vector<int32_t> seen(uma_stream->n_expert, -1);
+                for (uint32_t s = 0; s < smax; s++) {
+                    const int32_t e = L.expert_in_slot[s];
+                    if (s >= active) {
+                        if (e != -1) {
+                            mapping_fail(where, format("published inactive tail il=%u slot=%u expert=%d", il, s, e));
+                        }
+                        continue;
+                    }
+                    if (e < 0 || (uint32_t) e >= uma_stream->n_expert || seen[e] >= 0) {
+                        mapping_fail(where, format("invalid/duplicate resident il=%u slot=%u expert=%d", il, s, e));
+                    }
+                    seen[e] = (int32_t) s;
+                }
+                for (uint32_t e = 0; e < uma_stream->n_expert; e++) {
+                    const int32_t expected = seen[e];
+                    if (L.slot_of_expert[e] != expected || tbl[e] != (expected >= 0 ? expected : 0)) {
+                        mapping_fail(where, format(
+                            "reverse/table mismatch il=%u expert=%u expected=%d reverse=%d table=%d",
+                            il, e, expected, L.slot_of_expert[e], tbl[e]));
+                    }
+                }
+            }
+        };
+        auto validate_checkpoint_prefix = [&](uint32_t active, const std::string & where) {
+            if (!uma_stream->resize_mapping_checkpoint_valid) { return; }
+            const uint32_t hi = uma_stream->resize_mapping_checkpoint_s;
+            const auto & cp_slots = uma_stream->resize_mapping_checkpoint_expert_in_slot;
+            const auto & cp_reverse = uma_stream->resize_mapping_checkpoint_slot_of_expert;
+            if (hi == 0 || hi > smax || cp_slots.size() != uma_stream->lru.size() ||
+                cp_reverse.size() != uma_stream->lru.size()) {
+                mapping_fail(where, "invalid checkpoint generation shape");
+            }
+            validate_live_mapping(active, where);
+            for (uint32_t il = 0; il < uma_stream->lru.size(); il++) {
+                if (!uma_stream->streams_layer((int) il)) { continue; }
+                const llama_uma_stream_layer_lru & L = uma_stream->lru[il];
+                const int32_t * tbl = (const int32_t *) uma_stream->expert_table((int) il)->data;
+                if (cp_slots[il].size() != smax || cp_reverse[il].size() != uma_stream->n_expert) {
+                    mapping_fail(where, format("invalid checkpoint layer shape il=%u", il));
+                }
+                const uint32_t prefix = std::min(active, hi);
+                for (uint32_t s = 0; s < prefix; s++) {
+                    if (L.expert_in_slot[s] != cp_slots[il][s]) {
+                        mapping_fail(where, format(
+                            "checkpoint prefix changed il=%u slot=%u expected=%d actual=%d",
+                            il, s, cp_slots[il][s], L.expert_in_slot[s]));
+                    }
+                }
+                for (uint32_t e = 0; e < uma_stream->n_expert; e++) {
+                    const int32_t cp_s = cp_reverse[il][e];
+                    if (cp_s < -1 || (cp_s >= 0 && (uint32_t) cp_s >= hi) ||
+                        (cp_s >= 0 && cp_slots[il][cp_s] != (int32_t) e)) {
+                        mapping_fail(where, format("invalid checkpoint reverse il=%u expert=%u slot=%d", il, e, cp_s));
+                    }
+                    if (cp_s >= 0 && (uint32_t) cp_s < active) {
+                        if (L.slot_of_expert[e] != cp_s || tbl[e] != cp_s) {
+                            mapping_fail(where, format("checkpoint resident missing il=%u expert=%u slot=%d", il, e, cp_s));
+                        }
+                    } else if (active <= hi && (L.slot_of_expert[e] != -1 || tbl[e] != 0)) {
+                        mapping_fail(where, format("checkpoint tail leaked il=%u expert=%u slot=%d", il, e, cp_s));
+                    }
+                }
+            }
+        };
+
+        validate_live_mapping(cur, "before-transition");
+        if (uma_stream->resize_mapping_checkpoint_valid) {
+            validate_checkpoint_prefix(cur, "before-transition");
+        } else if (target < cur && park) {
+            uma_stream->resize_mapping_checkpoint_s = cur;
+            uma_stream->resize_mapping_checkpoint_expert_in_slot.resize(uma_stream->lru.size());
+            uma_stream->resize_mapping_checkpoint_slot_of_expert.resize(uma_stream->lru.size());
+            uint32_t streamed_layers = 0;
+            for (uint32_t il = 0; il < uma_stream->lru.size(); il++) {
+                if (!uma_stream->streams_layer((int) il)) { continue; }
+                streamed_layers++;
+                uma_stream->resize_mapping_checkpoint_expert_in_slot[il] = uma_stream->lru[il].expert_in_slot;
+                uma_stream->resize_mapping_checkpoint_slot_of_expert[il] = uma_stream->lru[il].slot_of_expert;
+            }
+            uma_stream->resize_mapping_checkpoint_valid = true;
+            uma_stream->n_resize_mapping_checkpoint_capture++;
+            fprintf(stderr, "uma: resize mapping checkpoint captured S=%u streamed-layers=%u\n",
+                    cur, streamed_layers);
         }
 
         std::vector<llama_uma_stream_layer_lru> lru_before;
@@ -3928,9 +4064,11 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
             }
             uma_stream_force_rebuild = true;
 
-            // Grow fills only the newly mapped tail from the frozen ranking. Retained
-            // slots and their LRU ages are byte-for-byte untouched. An expert is
-            // published only after all three kinds have reached CUDA and synchronized.
+            // Grow fills only the newly mapped tail.  Slots below a live mapping
+            // checkpoint high-water mark recover the exact pre-shrink expert;
+            // slots beyond it use the ordinary frozen ranking. Retained slots and
+            // their LRU ages are untouched. An expert is published only after all
+            // streamed kinds have reached CUDA and synchronized.
             if (target > cur) {
             for (uint32_t il = 0; il < uma_stream->lru.size(); il++) {
                 if (!uma_stream->streams_layer((int) il)) { continue; }
@@ -3941,12 +4079,26 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
                 size_t ri = 0;
                 for (uint32_t s = cur; s < target; s++) {
                     int32_t e = -1;
-                    while (ri < rank.size()) {
-                        const int32_t candidate = rank[ri++];
-                        if (candidate >= 0 && (uint32_t) candidate < uma_stream->n_expert &&
-                            L.slot_of_expert[candidate] < 0) {
-                            e = candidate;
-                            break;
+                    if (uma_stream->resize_mapping_checkpoint_valid &&
+                        s < uma_stream->resize_mapping_checkpoint_s) {
+                        const auto & cp = uma_stream->resize_mapping_checkpoint_expert_in_slot;
+                        if (il >= cp.size() || s >= cp[il].size()) {
+                            mapping_fail("grow-select", format("checkpoint slot missing il=%u slot=%u", il, s));
+                        }
+                        e = cp[il][s];
+                        if (e < 0 || (uint32_t) e >= uma_stream->n_expert || L.slot_of_expert[e] >= 0) {
+                            mapping_fail("grow-select", format(
+                                "checkpoint expert unavailable il=%u slot=%u expert=%d reverse=%d",
+                                il, s, e, e >= 0 && (uint32_t) e < uma_stream->n_expert ? L.slot_of_expert[e] : -2));
+                        }
+                    } else {
+                        while (ri < rank.size()) {
+                            const int32_t candidate = rank[ri++];
+                            if (candidate >= 0 && (uint32_t) candidate < uma_stream->n_expert &&
+                                L.slot_of_expert[candidate] < 0) {
+                                e = candidate;
+                                break;
+                            }
                         }
                     }
                     if (e < 0) {
@@ -3986,6 +4138,9 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
                 L.n_newly = 0;
             }
             }
+
+            validate_live_mapping(target, "after-mapping-commit");
+            validate_checkpoint_prefix(target, "after-mapping-commit");
 
             // Diagnostics B/C: after every grow has synchronized and before the
             // active size is published, read every active slot slab back and
@@ -4621,6 +4776,18 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
         uma_stream->last_resize_foot_after_free = foot_after_free;
         uma_stream->last_resize_avail_after_free = avail_after_free;
         uma_stream->n_resizes++;
+        if (target > cur && uma_stream->resize_mapping_checkpoint_valid &&
+            (target >= uma_stream->resize_mapping_checkpoint_s || !park)) {
+            const uint32_t restored_s = uma_stream->resize_mapping_checkpoint_s;
+            uma_stream->n_resize_mapping_checkpoint_restore++;
+            uma_stream->resize_mapping_checkpoint_valid = false;
+            uma_stream->resize_mapping_checkpoint_s = 0;
+            uma_stream->resize_mapping_checkpoint_expert_in_slot.clear();
+            uma_stream->resize_mapping_checkpoint_slot_of_expert.clear();
+            fprintf(stderr,
+                    "uma: resize mapping checkpoint restored prefix through S=%u of checkpoint S=%u before compute\n",
+                    target, restored_s);
+        }
         if (uma_stream->s_min_active == 0 || target < uma_stream->s_min_active) { uma_stream->s_min_active = target; }
         if (target > uma_stream->s_max_active) { uma_stream->s_max_active = target; }
         const size_t foot_after = llama_uma_phys_footprint_mib();
@@ -4927,6 +5094,9 @@ void llama_context::uma_write_telemetry() {
             "n_decode_late_calls %llu\nn_decode_late_cold_miss %llu\nn_decode_late_h2d_miss %llu\nn_decode_late_h2d_bytes %llu\n"
             "n_decode_late_fail %llu\ndecode_exact_after_resize %u\n"
             "n_distress %llu\nn_overflow %llu\nn_resizes %llu\nn_predecode_resumes %llu\n"
+            "resize_mapping_checkpoint_active %u\nresize_mapping_checkpoint_s %u\n"
+            "n_resize_mapping_checkpoint_capture %llu\nn_resize_mapping_checkpoint_restore %llu\n"
+            "n_resize_mapping_checkpoint_prefix_fail %llu\n"
             "n_diag_graph_rebuilds %llu\nn_diag_hit_refresh_groups %llu\nn_diag_hit_refresh_bytes %llu\n"
             "n_diag_resident_hit_groups %llu\nn_diag_resident_hit_bytes %llu\nn_diag_route_events %llu\n"
             "n_diag_postgrow_events %llu\nn_diag_postgrow_groups %llu\nn_diag_postgrow_bytes %llu\nn_diag_postgrow_syncs %llu\n"
@@ -4967,6 +5137,11 @@ void llama_context::uma_write_telemetry() {
             (unsigned long long) uma_stream->n_overflow,
             (unsigned long long) uma_stream->n_resizes,
             (unsigned long long) uma_stream->n_predecode_resumes,
+            (unsigned) uma_stream->resize_mapping_checkpoint_valid,
+            uma_stream->resize_mapping_checkpoint_s,
+            (unsigned long long) uma_stream->n_resize_mapping_checkpoint_capture,
+            (unsigned long long) uma_stream->n_resize_mapping_checkpoint_restore,
+            (unsigned long long) uma_stream->n_resize_mapping_checkpoint_prefix_fail,
             (unsigned long long) uma_stream->n_diag_graph_rebuilds,
             (unsigned long long) uma_stream->n_diag_hit_refresh_groups,
             (unsigned long long) uma_stream->n_diag_hit_refresh_bytes,
