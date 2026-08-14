@@ -4331,13 +4331,14 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
                 FILE * pf = fopen(uma_stream->diag_postgrow_evidence_path.c_str(), "a");
                 if (pf == nullptr) { throw std::runtime_error("uma stream post-grow diagnostic: cannot open evidence path"); }
                 fprintf(pf,
-                    "postgrow action=%s old=%u new=%u groups=%llu expected_groups=%llu bytes=%llu expected_bytes=%llu "
+                    "postgrow action=%s old=%u new=%u groups=%llu same_slot_groups=%llu expected_groups=%llu bytes=%llu expected_bytes=%llu "
                     "syncs=%llu source_hash=%016llx metadata_before=%016llx metadata_after=%016llx "
                     "restore_expected_metadata=%016llx "
                     "normal_before=%016llx normal_after=%016llx vmm_before=%016llx vmm_after=%016llx "
                     "serving_state_before=%016llx serving_state_after=%016llx "
                     "restore_mismatches=%llu missing_tables=%llu\n",
                     action.c_str(), cur, target, (unsigned long long) groups,
+                    (unsigned long long) groups,
                     (unsigned long long) expected_groups, (unsigned long long) bytes,
                     (unsigned long long) expected_bytes, (unsigned long long) syncs,
                     (unsigned long long) source_hash, (unsigned long long) metadata_before,
