@@ -99,6 +99,7 @@ struct llama_uma_stream_state {
 
     // M6 give-back controller telemetry + eager-grow support
     uint64_t n_resizes    = 0;  // runtime S-resize events over the context lifetime
+    uint64_t n_predecode_resumes = 0; // parked requests restored before any graph executes
     uint64_t n_distress   = 0;  // times a shed target below the knee was clamped (M7 signal)
     uint64_t n_overflow   = 0;  // expert-reads routed to sentinel slot 0 because a batch (a prefill
                                 // ubatch) needed > S distinct experts - graceful miss, a raise-S signal

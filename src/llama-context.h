@@ -147,6 +147,7 @@ struct llama_context {
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+    bool uma_stream_prepare_parked_decode();
 
     //
     // state save/load

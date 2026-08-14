@@ -691,6 +691,10 @@ llama_context::~llama_context() {
                     (unsigned long long) uma_stream->n_resizes, (unsigned long long) uma_stream->n_distress,
                     uma_stream->s_min_active, uma_stream->s_max_active, uma_stream->n_slots);
         }
+        if (uma_stream->n_predecode_resumes > 0) {
+            fprintf(stderr, "uma: parked pre-decode resumes: %llu\n",
+                    (unsigned long long) uma_stream->n_predecode_resumes);
+        }
     } else if (getenv("LLAMA_UMA_FOOTPRINT")) {
         // stock baseline footprint (no streaming), for the supply-curve comparison
         fprintf(stderr, "uma: teardown: phys_footprint %zu MiB (steady-state, stock)\n", llama_uma_phys_footprint_mib());
@@ -2202,6 +2206,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
+    }
+
+    // Parked residency is intentionally below the coherence knee.  The external
+    // control used to be polled only by the post-compute tick, allowing the first
+    // resume batch to mutate KV/recurrent state before the grow.  Resume in this
+    // GPU-idle pre-decode window or fail closed without executing a graph.
+    if (!uma_stream_prepare_parked_decode()) {
+        LLAMA_LOG_ERROR("%s: refusing decode while UMA stream is parked below its coherence knee\n", __func__);
+        return -4;
     }
 
     const auto & vocab   = model.vocab;
@@ -4158,6 +4171,37 @@ bool llama_context::uma_stream_try_alloc_slots(uint32_t s_new) {
 // from -1 "hold"). The coordinator writes the token "park" to KV-only a not-decoding tenant.
 static constexpr int32_t UMA_CTRL_PARK = -2;
 
+// A parked context is below its registered coherence knee and therefore cannot
+// legally execute even a discarded maintenance token.  Resolve a normal external
+// target before decode while all backends are idle.  Returning false rejects the
+// batch without touching KV/recurrent state; this is deliberately model-agnostic.
+bool llama_context::uma_stream_prepare_parked_decode() {
+    if (!uma_stream || !uma_stream->parked) {
+        return true;
+    }
+    if (uma_control_path.empty()) {
+        return false;
+    }
+    const int32_t requested = uma_read_control();
+    const uint32_t knee = uma_resize_smin >= 0 ? (uint32_t) uma_resize_smin : uma_stream->n_slots;
+    if (requested < 0 || (uint32_t) requested < knee) {
+        // absent/invalid/park and admission-refused below-knee targets remain
+        // parked; never allocate outside the coordinator's granted envelope.
+        return false;
+    }
+    const uint32_t before = uma_stream->n_slots_active;
+    uma_stream_resize((uint32_t) requested);
+    if (uma_stream->parked || uma_stream->n_slots_active < knee) {
+        GGML_ABORT("uma stream: parked pre-decode resume failed coherence invariant");
+    }
+    uma_stream->n_predecode_resumes++;
+    fprintf(stderr,
+            "uma: parked pre-decode resume S %u -> %u (requested %d, knee %u) before compute\n",
+            before, uma_stream->n_slots_active, requested, knee);
+    uma_write_telemetry();
+    return true;
+}
+
 // uma-moe fork M6: rate-limited controller tick (decode-only, post-sync). Advances
 // the decode-token clock, then resolves a target S from the commanded schedule
 // (SCHED, fires at its exact token points) or the closed-loop budget signal (CTRL,
@@ -4255,7 +4299,7 @@ void llama_context::uma_write_telemetry() {
             "n_decode_service_fail %llu\nn_decode_substitute %llu\n"
             "n_decode_late_calls %llu\nn_decode_late_cold_miss %llu\nn_decode_late_h2d_miss %llu\nn_decode_late_h2d_bytes %llu\n"
             "n_decode_late_fail %llu\ndecode_exact_after_resize %u\n"
-            "n_distress %llu\nn_overflow %llu\nn_resizes %llu\ns_min_reached %u\ns_max_reached %u\nphys_footprint_mib %zu\n"
+            "n_distress %llu\nn_overflow %llu\nn_resizes %llu\nn_predecode_resumes %llu\ns_min_reached %u\ns_max_reached %u\nphys_footprint_mib %zu\n"
             "last_resize_free_ms %.3f\nlast_resize_alloc_ms %.3f\nlast_resize_reseed_ms %.3f\n"
             "last_resize_old_s %u\nlast_resize_new_s %u\nlast_resize_delta_s %u\nlast_resize_segments %u\n"
             "last_resize_seeded %u\nlast_resize_vmm_bytes %llu\nlast_resize_seed_bytes %llu\n"
@@ -4287,7 +4331,10 @@ void llama_context::uma_write_telemetry() {
             (unsigned long long) uma_stream->n_decode_late_h2d_bytes,
             (unsigned long long) uma_stream->n_decode_late_fail,
             (unsigned) uma_stream->decode_exact_after_resize,
-            (unsigned long long) uma_stream->n_distress, (unsigned long long) uma_stream->n_overflow, (unsigned long long) uma_stream->n_resizes,
+            (unsigned long long) uma_stream->n_distress,
+            (unsigned long long) uma_stream->n_overflow,
+            (unsigned long long) uma_stream->n_resizes,
+            (unsigned long long) uma_stream->n_predecode_resumes,
             uma_stream->s_min_active, uma_stream->s_max_active, llama_uma_phys_footprint_mib(),
             uma_stream->last_resize_free_us / 1000.0, uma_stream->last_resize_alloc_us / 1000.0,
             uma_stream->last_resize_reseed_us / 1000.0,
@@ -6606,6 +6653,10 @@ int32_t llama_decode(
     }
 
     return ret;
+}
+
+bool llama_uma_stream_prepare_parked_decode(llama_context * ctx) {
+    return ctx != nullptr && ctx->uma_stream_prepare_parked_decode();
 }
 
 //

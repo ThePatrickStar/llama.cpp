@@ -976,6 +976,12 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    // UMA give-back: if the context is parked below its coherence knee, apply
+    // an externally granted resume target before a server mutates prompt/KV
+    // state or constructs a decode batch. Returns false while no legal resume
+    // target is available; callers must leave the pending request untouched.
+    LLAMA_API bool llama_uma_stream_prepare_parked_decode(struct llama_context * ctx);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)

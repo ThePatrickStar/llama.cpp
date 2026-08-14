@@ -3074,6 +3074,16 @@ private:
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
+                        // A parked UMA context is intentionally below its coherence
+                        // knee. Resume before checkpoint restore, prompt rollback,
+                        // sequence truncation, or any other request-state mutation.
+                        // If no legal target has been granted yet, leave the request
+                        // pending and retry without touching its retained state.
+                        if (!llama_uma_stream_prepare_parked_decode(ctx_tgt)) {
+                            SLT_DBG(slot, "%s", "parked below coherence knee; waiting for an admitted resume target\n");
+                            return;
+                        }
+
                         slot.t_start_process_prompt = ggml_time_us();
                         slot.t_start_generation = 0;
 
