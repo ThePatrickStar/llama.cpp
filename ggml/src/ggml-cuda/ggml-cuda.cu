@@ -1081,7 +1081,8 @@ static bool ggml_backend_cuda_vmm_slot_buffer_resize(ggml_backend_buffer_t buffe
 
 static bool ggml_backend_cuda_vmm_slot_buffer_get_info(
         ggml_backend_buffer_t buffer, size_t * active_slots, size_t * max_slots,
-        size_t * mapped_size, size_t * reserved_size, size_t * granularity) {
+        size_t * mapped_size, size_t * reserved_size, size_t * granularity,
+        size_t * slot_stride, size_t * tail_pad, size_t * logical_size) {
 #if defined(GGML_USE_VMM)
     if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
         return false;
@@ -1095,6 +1096,9 @@ static bool ggml_backend_cuda_vmm_slot_buffer_get_info(
     if (mapped_size)   { *mapped_size   = ctx->vmm_mapped_size; }
     if (reserved_size) { *reserved_size = ctx->vmm_reserved_size; }
     if (granularity)   { *granularity   = ctx->vmm_granularity; }
+    if (slot_stride)   { *slot_stride   = ctx->vmm_slot_stride; }
+    if (tail_pad)      { *tail_pad      = ctx->vmm_tail_pad; }
+    if (logical_size)  { *logical_size  = buffer->size; }
     return true;
 #else
     GGML_UNUSED(buffer);
@@ -1103,6 +1107,9 @@ static bool ggml_backend_cuda_vmm_slot_buffer_get_info(
     GGML_UNUSED(mapped_size);
     GGML_UNUSED(reserved_size);
     GGML_UNUSED(granularity);
+    GGML_UNUSED(slot_stride);
+    GGML_UNUSED(tail_pad);
+    GGML_UNUSED(logical_size);
     return false;
 #endif
 }

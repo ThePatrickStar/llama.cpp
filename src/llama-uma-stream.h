@@ -116,6 +116,10 @@ struct llama_uma_stream_state {
     uint64_t last_resize_unmap_bytes = 0; // actual successful backend unmaps in this transition
     uint32_t last_resize_map_ops    = 0;
     uint32_t last_resize_unmap_ops  = 0;
+    uint32_t last_resize_expected_map_ops   = 0;
+    uint32_t last_resize_expected_unmap_ops = 0;
+    uint64_t last_resize_expected_map_bytes   = 0;
+    uint64_t last_resize_expected_unmap_bytes = 0;
     uint64_t last_resize_miss_delta = 0; // must stay zero: resize seeding is not a request miss
     uint64_t last_resize_h2d_delta  = 0; // must stay zero: resize H2D has its own seed counter
     bool     last_resize_base_stable = false;

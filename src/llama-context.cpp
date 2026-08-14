@@ -3691,7 +3691,7 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
 
     if (uma_stream->device_slots) {
         typedef bool (*vmm_resize_fn_t)(ggml_backend_buffer_t, size_t);
-        typedef bool (*vmm_info_fn_t)(ggml_backend_buffer_t, size_t *, size_t *, size_t *, size_t *, size_t *);
+        typedef bool (*vmm_info_fn_t)(ggml_backend_buffer_t, size_t *, size_t *, size_t *, size_t *, size_t *, size_t *, size_t *, size_t *);
         typedef bool (*vmm_stats_fn_t)(ggml_backend_buffer_t, uint64_t *, uint64_t *, uint64_t *, uint64_t *, void **);
         const vmm_resize_fn_t resize_fn = (vmm_resize_fn_t) uma_stream_vmm_resize_fn;
         const vmm_info_fn_t info_fn = (vmm_info_fn_t) uma_stream_vmm_info_fn;
@@ -3707,15 +3707,43 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
         uint64_t mapped_before = 0;
         uint64_t map_ops_before = 0, unmap_ops_before = 0;
         uint64_t map_bytes_before = 0, unmap_bytes_before = 0;
+        uint64_t expected_map_ops = 0, expected_unmap_ops = 0;
+        uint64_t expected_map_bytes = 0, expected_unmap_bytes = 0;
         const uint64_t miss_before = uma_stream->n_miss;
         const uint64_t h2d_before = uma_stream->n_h2d_miss;
         std::vector<void *> bases_before;
         uint32_t n_buffers = 0;
         for (const auto & owner : uma_stream->slot_buf) {
             if (!owner) { continue; }
-            size_t active = 0, max = 0, mapped = 0;
-            if (!info_fn(owner.get(), &active, &max, &mapped, nullptr, nullptr) || active != cur || max != smax) {
+            size_t active = 0, max = 0, mapped = 0, reserved = 0, granularity = 0;
+            size_t slot_stride = 0, tail_pad = 0, logical_size = 0;
+            if (!info_fn(owner.get(), &active, &max, &mapped, &reserved, &granularity,
+                         &slot_stride, &tail_pad, &logical_size) ||
+                active != cur || max != smax || granularity == 0 || slot_stride == 0) {
                 throw std::runtime_error("uma stream resize: inconsistent CUDA VMM slot buffer before resize");
+            }
+            const auto boundary = [granularity, slot_stride, tail_pad](size_t slots) {
+                if (slots == 0) { return (size_t) 0; }
+                const size_t bytes = slots*slot_stride + tail_pad;
+                return granularity*((bytes + granularity - 1)/granularity);
+            };
+            const size_t low = std::min((size_t) cur, (size_t) target);
+            const size_t high = std::max((size_t) cur, (size_t) target);
+            if (mapped != boundary(cur) || reserved != boundary(smax) ||
+                logical_size != (size_t) cur*slot_stride + tail_pad) {
+                throw std::runtime_error("uma stream resize: CUDA VMM layout mismatch before resize");
+            }
+            uint64_t expected_ops = 0;
+            for (size_t slot = low + 1; slot <= high; ++slot) {
+                expected_ops += boundary(slot) != boundary(slot - 1);
+            }
+            const uint64_t expected_bytes = boundary(high) - boundary(low);
+            if (target > cur) {
+                expected_map_ops += expected_ops;
+                expected_map_bytes += expected_bytes;
+            } else {
+                expected_unmap_ops += expected_ops;
+                expected_unmap_bytes += expected_bytes;
             }
             uint64_t map_ops = 0, unmap_ops = 0, map_bytes = 0, unmap_bytes = 0;
             void * base = nullptr;
@@ -3886,10 +3914,21 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
             size_t bi = 0;
             for (const auto & owner : uma_stream->slot_buf) {
                 if (!owner) { continue; }
-                size_t active = 0, max = 0, mapped = 0;
-                if (!info_fn(owner.get(), &active, &max, &mapped, nullptr, nullptr) ||
-                    active != target || max != smax) {
+                size_t active = 0, max = 0, mapped = 0, reserved = 0, granularity = 0;
+                size_t slot_stride = 0, tail_pad = 0, logical_size = 0;
+                if (!info_fn(owner.get(), &active, &max, &mapped, &reserved, &granularity,
+                             &slot_stride, &tail_pad, &logical_size) ||
+                    active != target || max != smax || granularity == 0 || slot_stride == 0) {
                     throw std::runtime_error("uma stream resize: inconsistent CUDA VMM slot buffer after resize");
+                }
+                const auto boundary = [granularity, slot_stride, tail_pad](size_t slots) {
+                    if (slots == 0) { return (size_t) 0; }
+                    const size_t bytes = slots*slot_stride + tail_pad;
+                    return granularity*((bytes + granularity - 1)/granularity);
+                };
+                if (mapped != boundary(target) || reserved != boundary(smax) ||
+                    logical_size != (size_t) target*slot_stride + tail_pad) {
+                    throw std::runtime_error("uma stream resize: CUDA VMM layout mismatch after resize");
                 }
                 uint64_t map_ops = 0, unmap_ops = 0, map_bytes = 0, unmap_bytes = 0;
                 void * base = nullptr;
@@ -3958,9 +3997,12 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
         const bool mapped_accounting_ok = target > cur ?
             (mapped_after >= mapped_before && mapped_after - mapped_before == map_bytes_delta && unmap_bytes_delta == 0) :
             (mapped_before >= mapped_after && mapped_before - mapped_after == unmap_bytes_delta && map_bytes_delta == 0);
+        const bool layout_accounting_ok =
+            map_ops_delta == expected_map_ops && unmap_ops_delta == expected_unmap_ops &&
+            map_bytes_delta == expected_map_bytes && unmap_bytes_delta == expected_unmap_bytes;
         const uint64_t miss_delta = uma_stream->n_miss - miss_before;
         const uint64_t h2d_delta = uma_stream->n_h2d_miss - h2d_before;
-        if (miss_delta != 0 || h2d_delta != 0 || !base_stable || !mapped_accounting_ok) {
+        if (miss_delta != 0 || h2d_delta != 0 || !base_stable || !mapped_accounting_ok || !layout_accounting_ok) {
             GGML_ABORT("uma stream resize: admission, stable-base, or VMM byte accounting invariant failed");
         }
         uma_stream->last_resize_free_us = (uint64_t) (t_free_us - t0_us);
@@ -3975,6 +4017,10 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
         uma_stream->last_resize_seed_bytes = seed_bytes;
         uma_stream->last_resize_map_ops = (uint32_t) map_ops_delta;
         uma_stream->last_resize_unmap_ops = (uint32_t) unmap_ops_delta;
+        uma_stream->last_resize_expected_map_ops = (uint32_t) expected_map_ops;
+        uma_stream->last_resize_expected_unmap_ops = (uint32_t) expected_unmap_ops;
+        uma_stream->last_resize_expected_map_bytes = expected_map_bytes;
+        uma_stream->last_resize_expected_unmap_bytes = expected_unmap_bytes;
         uma_stream->last_resize_map_bytes = map_bytes_delta;
         uma_stream->last_resize_unmap_bytes = unmap_bytes_delta;
         uma_stream->last_resize_miss_delta = miss_delta;
@@ -3987,12 +4033,15 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
         if (target > uma_stream->s_max_active) { uma_stream->s_max_active = target; }
         const size_t foot_after = llama_uma_phys_footprint_mib();
         fprintf(stderr,
-            "uma: segmented device resize S %u -> %u: logical delta %u, actual map/unmap %u/%u, VMM map/unmap %.1f/%.1f MiB, stable-base %u, "
+            "uma: segmented device resize S %u -> %u: logical delta %u, actual/expected map/unmap %u/%u/%u/%u, "
+            "VMM actual/expected map/unmap %.1f/%.1f/%.1f/%.1f MiB, stable-base %u, "
             "seeded %u experts / %.1f MiB (free %.3f + alloc %.3f + reseed %.3f = %.3f ms), "
             "request miss/H2D delta %llu/%llu, phys_footprint %zu -> %zu MiB, avail %zu -> %zu MiB\n",
             cur, target, uma_stream->last_resize_delta_s,
             uma_stream->last_resize_map_ops, uma_stream->last_resize_unmap_ops,
+            uma_stream->last_resize_expected_map_ops, uma_stream->last_resize_expected_unmap_ops,
             map_bytes_delta / (1024.0 * 1024.0), unmap_bytes_delta / (1024.0 * 1024.0),
+            expected_map_bytes / (1024.0 * 1024.0), expected_unmap_bytes / (1024.0 * 1024.0),
             (unsigned) base_stable, seeded, seed_bytes / (1024.0 * 1024.0),
             uma_stream->last_resize_free_us / 1000.0, uma_stream->last_resize_alloc_us / 1000.0,
             uma_stream->last_resize_reseed_us / 1000.0,
@@ -4211,6 +4260,8 @@ void llama_context::uma_write_telemetry() {
             "last_resize_old_s %u\nlast_resize_new_s %u\nlast_resize_delta_s %u\nlast_resize_segments %u\n"
             "last_resize_seeded %u\nlast_resize_vmm_bytes %llu\nlast_resize_seed_bytes %llu\n"
             "last_resize_map_ops %u\nlast_resize_unmap_ops %u\nlast_resize_map_bytes %llu\nlast_resize_unmap_bytes %llu\n"
+            "last_resize_expected_map_ops %u\nlast_resize_expected_unmap_ops %u\n"
+            "last_resize_expected_map_bytes %llu\nlast_resize_expected_unmap_bytes %llu\n"
             "last_resize_miss_delta %llu\nlast_resize_h2d_delta %llu\nlast_resize_base_stable %u\n"
             "last_resize_foot_after_free_mib %zu\nlast_resize_avail_after_free_mib %zu\n"
             "parked %u\n",
@@ -4248,6 +4299,10 @@ void llama_context::uma_write_telemetry() {
             uma_stream->last_resize_map_ops, uma_stream->last_resize_unmap_ops,
             (unsigned long long) uma_stream->last_resize_map_bytes,
             (unsigned long long) uma_stream->last_resize_unmap_bytes,
+            uma_stream->last_resize_expected_map_ops,
+            uma_stream->last_resize_expected_unmap_ops,
+            (unsigned long long) uma_stream->last_resize_expected_map_bytes,
+            (unsigned long long) uma_stream->last_resize_expected_unmap_bytes,
             (unsigned long long) uma_stream->last_resize_miss_delta,
             (unsigned long long) uma_stream->last_resize_h2d_delta,
             (unsigned) uma_stream->last_resize_base_stable,
@@ -4497,7 +4552,7 @@ void llama_context::uma_stream_setup() {
             }
         }
         if (device_slots_requested) {
-            typedef bool (*vmm_info_fn_t)(ggml_backend_buffer_t, size_t *, size_t *, size_t *, size_t *, size_t *);
+            typedef bool (*vmm_info_fn_t)(ggml_backend_buffer_t, size_t *, size_t *, size_t *, size_t *, size_t *, size_t *, size_t *, size_t *);
             typedef bool (*vmm_stats_fn_t)(ggml_backend_buffer_t, uint64_t *, uint64_t *, uint64_t *, uint64_t *, void **);
             const vmm_info_fn_t info_fn = (vmm_info_fn_t) uma_stream_vmm_info_fn;
             const vmm_stats_fn_t stats_fn = (vmm_stats_fn_t) uma_stream_vmm_stats_fn;
@@ -4507,7 +4562,7 @@ void llama_context::uma_stream_setup() {
             for (const auto & owner : uma_stream->slot_buf) {
                 if (!owner) { continue; }
                 size_t active = 0, max = 0, bytes = 0, reserve = 0, gran = 0;
-                if (!info_fn(owner.get(), &active, &max, &bytes, &reserve, &gran) ||
+                if (!info_fn(owner.get(), &active, &max, &bytes, &reserve, &gran, nullptr, nullptr, nullptr) ||
                     active != n_slots_initial || max != n_slots) {
                     throw std::runtime_error("uma stream: CUDA VMM slot-buffer invariant failed at setup");
                 }
