@@ -3284,6 +3284,34 @@ int llama_uma_stream_service_prefill_tile(
     for (const int32_t e : distinct) {
         int32_t slot = L.slot_of_expert[e];
         if (slot >= 0 && (uint32_t) slot < Sn) {
+            // Diagnostic E: refresh a resident hit into the SAME physical slot
+            // from the canonical GGUF bytes.  Mapping, LRU decisions, KV, route
+            // ids and normal miss/H2D accounting are deliberately untouched.
+            // Comparing this arm with the ordinary retained-KV arm isolates
+            // hit visibility/service equivalence without a model-specific path.
+            if (S->diag_force_hit_refresh && S->n_resizes > 0) {
+                uint64_t uploaded = 0;
+                for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+                    if (!S->streams(ud->il, kind)) { continue; }
+                    const size_t slab = S->model->uma_stream_slab_bytes(ud->il, kind);
+                    if ((size_t) kind >= S->device_stage_host.size() ||
+                        S->device_stage_host[kind] == nullptr || S->device_stage_bytes[kind] < slab ||
+                        !S->model->uma_stream_pread_expert(ud->il, kind, e, S->device_stage_host[kind])) {
+                        return -1;
+                    }
+                }
+                for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+                    if (!S->streams(ud->il, kind)) { continue; }
+                    const size_t slab = S->model->uma_stream_slab_bytes(ud->il, kind);
+                    ggml_backend_tensor_set_async(
+                        S->device_backend, S->slot(ud->il, kind), S->device_stage_host[kind],
+                        (size_t) slot * slab, slab);
+                    uploaded += slab;
+                }
+                ggml_backend_synchronize(S->device_backend);
+                S->n_diag_hit_refresh_groups++;
+                S->n_diag_hit_refresh_bytes += uploaded;
+            }
             L.pinned[slot] = L.pass;
             L.last_used[slot] = L.tick++;
         } else if (slot >= 0) {
@@ -3786,6 +3814,14 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
             }
         }
 
+        // Diagnostic C freezes the exact no-resize counterfactual immediately
+        // before shrink.  It is observational only: normal resize behavior below
+        // is unchanged.
+        if (target < cur && uma_stream->diag_resize_audit) {
+            uma_stream->diag_pre_shrink_lru = uma_stream->lru;
+            uma_stream->diag_pre_shrink_s = cur;
+        }
+
         // A shrink first unpublishes every tail resident while all backing remains
         // mapped. No graph can consume a tail id after this point; the GPU is idle.
         if (target < cur) {
@@ -3919,6 +3955,95 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
                 }
                 L.n_newly = 0;
             }
+            }
+
+            // Diagnostics B/C: after every grow has synchronized and before the
+            // active size is published, read every active slot slab back and
+            // compare it bit-for-bit with the GGUF expert bytes named by the
+            // post-grow mapping.  Also compare the complete redundant routing/LRU
+            // state with the pre-shrink no-resize counterfactual.  FNV hashes are
+            // evidence locators; the binding criterion is exact memcmp/mismatch=0.
+            if (target > cur && uma_stream->diag_resize_audit) {
+                uint64_t groups = 0, bytes = 0, byte_mismatches = 0;
+                uint64_t device_hash = UINT64_C(1469598103934665603);
+                uint64_t source_hash = UINT64_C(1469598103934665603);
+                uint64_t mapping_mismatches = 0, reverse_mismatches = 0;
+                uint64_t table_mismatches = 0, lru_mismatches = 0;
+                auto hash_bytes = [](uint64_t h, const uint8_t * p, size_t n) {
+                    for (size_t i = 0; i < n; i++) { h = (h ^ p[i]) * UINT64_C(1099511628211); }
+                    return h;
+                };
+                for (uint32_t il = 0; il < uma_stream->lru.size(); il++) {
+                    if (!uma_stream->streams_layer((int) il)) { continue; }
+                    const auto & L = uma_stream->lru[il];
+                    const int32_t * tbl = uma_stream->expert_table((int) il) ?
+                        (const int32_t *) uma_stream->expert_table((int) il)->data : nullptr;
+                    const bool have_expected =
+                        il < uma_stream->diag_pre_shrink_lru.size() &&
+                        uma_stream->diag_pre_shrink_s == target;
+                    const auto * E = have_expected ? &uma_stream->diag_pre_shrink_lru[il] : nullptr;
+                    for (uint32_t s = 0; s < target; s++) {
+                        const int32_t e = L.expert_in_slot[s];
+                        if (e < 0 || (uint32_t) e >= uma_stream->n_expert ||
+                            L.slot_of_expert[e] != (int32_t) s) {
+                            reverse_mismatches++;
+                            continue;
+                        }
+                        if (E != nullptr) {
+                            if (E->expert_in_slot[s] != e) { mapping_mismatches++; }
+                            if (E->last_used[s] != L.last_used[s] || E->pinned[s] != L.pinned[s] ||
+                                E->pin_protected[s] != L.pin_protected[s]) { lru_mismatches++; }
+                        }
+                        if (tbl != nullptr && tbl[e] != (int32_t) s) { table_mismatches++; }
+                        for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+                            if (!uma_stream->streams((int) il, kind)) { continue; }
+                            ggml_tensor * st = uma_stream->slot((int) il, kind);
+                            const size_t slab = model.uma_stream_slab_bytes((int) il, kind);
+                            std::vector<uint8_t> device(slab), source(slab);
+                            ggml_backend_tensor_get(st, device.data(), (size_t) s * slab, slab);
+                            if (!model.uma_stream_pread_expert((int) il, kind, e, source.data())) {
+                                throw std::runtime_error(format(
+                                    "uma stream resize audit: source read failed il=%u kind=%d slot=%u expert=%d",
+                                    il, kind, s, e));
+                            }
+                            device_hash = hash_bytes(device_hash, device.data(), slab);
+                            source_hash = hash_bytes(source_hash, source.data(), slab);
+                            if (memcmp(device.data(), source.data(), slab) != 0) { byte_mismatches++; }
+                            groups++;
+                            bytes += slab;
+                        }
+                    }
+                    for (uint32_t e = 0; e < uma_stream->n_expert; e++) {
+                        const int32_t s = L.slot_of_expert[e];
+                        const int32_t expected_tbl = s >= 0 && (uint32_t) s < target ? s : 0;
+                        if (tbl != nullptr && tbl[e] != expected_tbl) { table_mismatches++; }
+                    }
+                    if (E != nullptr && (E->tick != L.tick || E->pass != L.pass || E->n_newly != L.n_newly)) {
+                        lru_mismatches++;
+                    }
+                }
+                FILE * af = uma_stream->diag_audit_path.empty() ? nullptr :
+                    fopen(uma_stream->diag_audit_path.c_str(), "a");
+                if (af == nullptr) {
+                    throw std::runtime_error("uma stream resize audit: cannot open audit path");
+                }
+                fprintf(af,
+                    "grow old=%u new=%u groups=%llu bytes=%llu byte_mismatches=%llu "
+                    "device_hash=%016llx source_hash=%016llx mapping_mismatches=%llu "
+                    "reverse_mismatches=%llu table_mismatches=%llu lru_mismatches=%llu\n",
+                    cur, target, (unsigned long long) groups, (unsigned long long) bytes,
+                    (unsigned long long) byte_mismatches, (unsigned long long) device_hash,
+                    (unsigned long long) source_hash, (unsigned long long) mapping_mismatches,
+                    (unsigned long long) reverse_mismatches, (unsigned long long) table_mismatches,
+                    (unsigned long long) lru_mismatches);
+                fclose(af);
+                fprintf(stderr,
+                    "uma: resize audit grow %u -> %u groups=%llu bytes=%llu byte_mismatch=%llu "
+                    "mapping_mismatch=%llu reverse_mismatch=%llu table_mismatch=%llu lru_mismatch=%llu\n",
+                    cur, target, (unsigned long long) groups, (unsigned long long) bytes,
+                    (unsigned long long) byte_mismatches, (unsigned long long) mapping_mismatches,
+                    (unsigned long long) reverse_mismatches, (unsigned long long) table_mismatches,
+                    (unsigned long long) lru_mismatches);
             }
 
             uma_stream->n_slots_active = target;
@@ -4176,7 +4301,34 @@ static constexpr int32_t UMA_CTRL_PARK = -2;
 // target before decode while all backends are idle.  Returning false rejects the
 // batch without touching KV/recurrent state; this is deliberately model-agnostic.
 bool llama_context::uma_stream_prepare_parked_decode() {
-    if (!uma_stream || !uma_stream->parked) {
+    if (!uma_stream) {
+        return true;
+    }
+    // Diagnostic A: one-shot graph rebuild at fixed residency, consumed by the
+    // next process_ubatch.  The command is rewritten to the current numeric S
+    // before any request-state mutation, so it cannot repeat accidentally.
+    if (uma_stream->diag_enabled && !uma_control_path.empty()) {
+        FILE * f = fopen(uma_control_path.c_str(), "r");
+        char tok[32] = {0};
+        const bool rebuild = f != nullptr && fscanf(f, "%31s", tok) == 1 && strcmp(tok, "rebuild") == 0;
+        if (f != nullptr) { fclose(f); }
+        if (rebuild) {
+            uma_stream_force_rebuild = true;
+            uma_stream->n_diag_graph_rebuilds++;
+            FILE * w = fopen(uma_control_path.c_str(), "w");
+            if (w == nullptr) {
+                throw std::runtime_error("uma stream diagnostic rebuild: cannot consume control command");
+            }
+            const bool write_ok = fprintf(w, "%u\n", uma_stream->n_slots_active) >= 0;
+            const bool close_ok = fclose(w) == 0;
+            if (!write_ok || !close_ok) {
+                throw std::runtime_error("uma stream diagnostic rebuild: cannot consume control command");
+            }
+            fprintf(stderr, "uma: diagnostic one-shot graph rebuild armed at S=%u before request mutation\n",
+                    uma_stream->n_slots_active);
+        }
+    }
+    if (!uma_stream->parked) {
         return true;
     }
     if (uma_control_path.empty()) {
@@ -4299,7 +4451,9 @@ void llama_context::uma_write_telemetry() {
             "n_decode_service_fail %llu\nn_decode_substitute %llu\n"
             "n_decode_late_calls %llu\nn_decode_late_cold_miss %llu\nn_decode_late_h2d_miss %llu\nn_decode_late_h2d_bytes %llu\n"
             "n_decode_late_fail %llu\ndecode_exact_after_resize %u\n"
-            "n_distress %llu\nn_overflow %llu\nn_resizes %llu\nn_predecode_resumes %llu\ns_min_reached %u\ns_max_reached %u\nphys_footprint_mib %zu\n"
+            "n_distress %llu\nn_overflow %llu\nn_resizes %llu\nn_predecode_resumes %llu\n"
+            "n_diag_graph_rebuilds %llu\nn_diag_hit_refresh_groups %llu\nn_diag_hit_refresh_bytes %llu\n"
+            "s_min_reached %u\ns_max_reached %u\nphys_footprint_mib %zu\n"
             "last_resize_free_ms %.3f\nlast_resize_alloc_ms %.3f\nlast_resize_reseed_ms %.3f\n"
             "last_resize_old_s %u\nlast_resize_new_s %u\nlast_resize_delta_s %u\nlast_resize_segments %u\n"
             "last_resize_seeded %u\nlast_resize_vmm_bytes %llu\nlast_resize_seed_bytes %llu\n"
@@ -4335,6 +4489,9 @@ void llama_context::uma_write_telemetry() {
             (unsigned long long) uma_stream->n_overflow,
             (unsigned long long) uma_stream->n_resizes,
             (unsigned long long) uma_stream->n_predecode_resumes,
+            (unsigned long long) uma_stream->n_diag_graph_rebuilds,
+            (unsigned long long) uma_stream->n_diag_hit_refresh_groups,
+            (unsigned long long) uma_stream->n_diag_hit_refresh_bytes,
             uma_stream->s_min_active, uma_stream->s_max_active, llama_uma_phys_footprint_mib(),
             uma_stream->last_resize_free_us / 1000.0, uma_stream->last_resize_alloc_us / 1000.0,
             uma_stream->last_resize_reseed_us / 1000.0,
@@ -4466,6 +4623,12 @@ void llama_context::uma_stream_setup() {
         uma_stream->decode_exact_after_resize =
             getenv("LLAMA_UMA_STREAM_DECODE_EXACT") != nullptr;
         uma_stream->device_slots = device_slots_requested;
+        uma_stream->diag_enabled = getenv("LLAMA_UMA_STREAM_DIAGNOSTIC") != nullptr;
+        const char * diag_audit = getenv("LLAMA_UMA_STREAM_RESIZE_AUDIT");
+        uma_stream->diag_resize_audit = diag_audit != nullptr && diag_audit[0] != '\0';
+        uma_stream->diag_audit_path = uma_stream->diag_resize_audit ? diag_audit : "";
+        uma_stream->diag_force_hit_refresh =
+            getenv("LLAMA_UMA_STREAM_DIAG_FORCE_HIT_REFRESH") != nullptr;
         uma_stream->device_backend = device_slots_requested ? gpu_backend : nullptr;
         if (decouple && getenv("LLAMA_UMA_STREAM_HOTFREQ") == nullptr) {
             throw std::runtime_error("uma stream: LLAMA_UMA_STREAM_DECOUPLE/ADAPT requires LLAMA_UMA_STREAM_HOTFREQ (initial slot seed)");

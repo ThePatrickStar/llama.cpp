@@ -100,6 +100,18 @@ struct llama_uma_stream_state {
     // M6 give-back controller telemetry + eager-grow support
     uint64_t n_resizes    = 0;  // runtime S-resize events over the context lifetime
     uint64_t n_predecode_resumes = 0; // parked requests restored before any graph executes
+    // Diagnostic counters are inert unless LLAMA_UMA_STREAM_DIAGNOSTIC is set.
+    // They support model/geometry/quant-agnostic causal probes; they never alter
+    // the ordinary serving path or its admission accounting.
+    uint64_t n_diag_graph_rebuilds = 0;
+    uint64_t n_diag_hit_refresh_groups = 0;
+    uint64_t n_diag_hit_refresh_bytes = 0;
+    bool     diag_enabled = false;
+    bool     diag_resize_audit = false;
+    bool     diag_force_hit_refresh = false;
+    std::string diag_audit_path;
+    std::vector<llama_uma_stream_layer_lru> diag_pre_shrink_lru;
+    uint32_t diag_pre_shrink_s = 0;
     uint64_t n_distress   = 0;  // times a shed target below the knee was clamped (M7 signal)
     uint64_t n_overflow   = 0;  // expert-reads routed to sentinel slot 0 because a batch (a prefill
                                 // ubatch) needed > S distinct experts - graceful miss, a raise-S signal
