@@ -1060,11 +1060,17 @@ void llama_context::synchronize() {
                         continue;
                     }
                     uma_stream->n_read++;
+                    if (uma_stream->policy == LLAMA_UMA_STREAM_POLICY_LCP) {
+                        // M9 A1: decayed hotness feeds the LCP victim score. Maintained on
+                        // this single post-sync path only, so it can never double-count.
+                        uma_stream->expert_hot[(size_t) il * uma_stream->n_expert + e] += 1.0f;
+                    }
                     int32_t slot = L.slot_of_expert[e];
                     if (slot >= 0 && (uint32_t) slot < Sn) {
                         // hit: refresh recency (adapt LRU keeps the live working set resident)
                         L.pinned[slot]    = L.pass;
                         L.last_used[slot] = L.tick++;
+                        if (uma_stream->policy == LLAMA_UMA_STREAM_POLICY_SIEVE) { L.visited[slot] = 1; }
                         continue;
                     }
                     if (slot >= 0) {
@@ -1080,14 +1086,50 @@ void llama_context::synchronize() {
                     if (!adapt) {
                         continue; // static mode (Step 2): count only
                     }
-                    // online admit (pure LRU): evict the LRU-cold slot not pinned this token
-                    uint64_t best_lu = UINT64_MAX;
+                    // online admit: pick a victim among the active slots per the M9 policy.
+                    // Every policy shares the pre-M9 LRU eligibility (an empty slot wins
+                    // immediately; a slot pinned this pass is never a victim), so POLICY=lru
+                    // is byte-identical and only the victim SCORE differs across policies.
                     slot = -1;
-                    for (uint32_t s = 0; s < Sn; s++) {
-                        if (L.expert_in_slot[s] < 0) { slot = (int32_t) s; break; }
-                        if (L.pinned[s] != L.pass && L.last_used[s] < best_lu) {
-                            best_lu = L.last_used[s];
-                            slot    = (int32_t) s;
+                    if (uma_stream->policy == LLAMA_UMA_STREAM_POLICY_LRU) {
+                        uint64_t best_lu = UINT64_MAX;
+                        for (uint32_t s = 0; s < Sn; s++) {
+                            if (L.expert_in_slot[s] < 0) { slot = (int32_t) s; break; }
+                            if (L.pinned[s] != L.pass && L.last_used[s] < best_lu) {
+                                best_lu = L.last_used[s];
+                                slot    = (int32_t) s;
+                            }
+                        }
+                    } else if (uma_stream->policy == LLAMA_UMA_STREAM_POLICY_LCP) {
+                        // MoEpic LCP: victim = argmin P = hot[e] * rho^(idle/window). A never-
+                        // selected (hot==0) slot scores 0 = the global minimum, so cold experts
+                        // are shed first and the pow() is skipped for them.
+                        const float * hot = uma_stream->expert_hot.data() + (size_t) il * uma_stream->n_expert;
+                        const double rho  = (double) uma_stream->lcp_rho;
+                        const double invw = 1.0 / (double) uma_stream->hot_window;
+                        double best_p = INFINITY;
+                        for (uint32_t s = 0; s < Sn; s++) {
+                            if (L.expert_in_slot[s] < 0) { slot = (int32_t) s; break; }
+                            if (L.pinned[s] == L.pass) { continue; }
+                            const float    h    = hot[L.expert_in_slot[s]];
+                            // last_used can exceed tick right after a warm-start seed (before
+                            // that slot is first used); clamp so the idle age never underflows.
+                            const uint64_t idle = L.tick > L.last_used[s] ? L.tick - L.last_used[s] : 0;
+                            const double   p    = h == 0.0f ? 0.0 : (double) h * std::pow(rho, (double) idle * invw);
+                            if (p < best_p) { best_p = p; slot = (int32_t) s; }
+                        }
+                    } else { // LLAMA_UMA_STREAM_POLICY_SIEVE
+                        // SIEVE: an empty slot wins; otherwise advance a rotating hand, clearing
+                        // visited bits (lazy demotion), and evict the first unvisited eligible slot.
+                        for (uint32_t s = 0; s < Sn; s++) {
+                            if (L.expert_in_slot[s] < 0) { slot = (int32_t) s; break; }
+                        }
+                        for (uint32_t step = 0; slot < 0 && step < 2 * Sn; step++) {
+                            const uint32_t h = L.sieve_hand % Sn;
+                            L.sieve_hand = (h + 1) % Sn;
+                            if (L.pinned[h] == L.pass) { continue; } // selected this token: never a victim
+                            if (L.visited[h]) { L.visited[h] = 0; continue; } // second chance, demote
+                            slot = (int32_t) h;
                         }
                     }
                     if (slot < 0) {
@@ -1167,9 +1209,21 @@ void llama_context::synchronize() {
                     L.slot_of_expert[e]    = slot;
                     L.pinned[slot]         = L.pass;
                     L.last_used[slot]      = L.tick++;
+                    L.visited[slot]        = 0; // M9 SIEVE: a fresh admit starts unvisited
                     if (tbl) { tbl[e] = slot; } // publish AFTER the pread
                 }
               }
+            }
+        }
+
+        // M9 A1: age the decayed hotness once per decode token (LCP only). Cheap
+        // O(n_layer * n_expert) sweep every hot_window tokens; hot_decay == 0 = off.
+        if (uma_stream && uma_stream->policy == LLAMA_UMA_STREAM_POLICY_LCP &&
+            uma_stream->hot_decay > 0.0f && t_compute_start_us != 0) {
+            if (++uma_stream->hot_tick >= uma_stream->hot_window) {
+                uma_stream->hot_tick = 0;
+                const float d = uma_stream->hot_decay;
+                for (float & h : uma_stream->expert_hot) { h *= d; }
             }
         }
 
@@ -3603,6 +3657,8 @@ void llama_context::uma_stream_reseed_resident(uint32_t s_new) {
         std::fill(L.last_used.begin(), L.last_used.end(), 0);
         std::fill(L.pinned.begin(), L.pinned.end(), 0);
         std::fill(L.pin_protected.begin(), L.pin_protected.end(), 0);
+        std::fill(L.visited.begin(), L.visited.end(), 0); // M9 SIEVE state resets with residency
+        L.sieve_hand = 0;
         L.n_newly = 0;
         if (tbl) { std::fill(tbl, tbl + n_expert, 0); }
         // seed [0, s_new) with the top-s_new ranked experts; pin the top-H
@@ -5279,6 +5335,46 @@ void llama_context::uma_stream_setup() {
         }
         uma_stream->decouple = decouple;
         uma_stream->adapt    = adapt;
+        // M9 hot-set robustness: online ADAPT eviction policy + decaying-hotness knobs.
+        // All default to the pre-M9 LRU path, so a default-unset run is byte-identical.
+        if (const char * env_pol = getenv("LLAMA_UMA_STREAM_POLICY"); env_pol && env_pol[0] != '\0') {
+            if      (strcmp(env_pol, "lru")   == 0) { uma_stream->policy = LLAMA_UMA_STREAM_POLICY_LRU;   }
+            else if (strcmp(env_pol, "lcp")   == 0) { uma_stream->policy = LLAMA_UMA_STREAM_POLICY_LCP;   }
+            else if (strcmp(env_pol, "sieve") == 0) { uma_stream->policy = LLAMA_UMA_STREAM_POLICY_SIEVE; }
+            else {
+                throw std::runtime_error(format("invalid LLAMA_UMA_STREAM_POLICY '%s' (want lru|lcp|sieve)", env_pol));
+            }
+        }
+        if (const char * env_d = getenv("LLAMA_UMA_STREAM_HOT_DECAY"); env_d && env_d[0] != '\0') {
+            char * end = nullptr;
+            const double d = strtod(env_d, &end);
+            if (end == env_d || *end != '\0' || !std::isfinite(d) || d < 0.0 || d > 1.0) {
+                throw std::runtime_error(format("invalid LLAMA_UMA_STREAM_HOT_DECAY '%s' (want a float in [0,1]; 0 = off)", env_d));
+            }
+            uma_stream->hot_decay = (float) d;
+        }
+        if (const char * env_w = getenv("LLAMA_UMA_STREAM_HOT_WINDOW"); env_w && env_w[0] != '\0') {
+            char * end = nullptr;
+            const long w = strtol(env_w, &end, 10);
+            if (end == env_w || *end != '\0' || w < 1) {
+                throw std::runtime_error(format("invalid LLAMA_UMA_STREAM_HOT_WINDOW '%s' (want an integer >= 1)", env_w));
+            }
+            uma_stream->hot_window = (uint32_t) w;
+        }
+        if (const char * env_rho = getenv("LLAMA_UMA_STREAM_LCP_RHO"); env_rho && env_rho[0] != '\0') {
+            char * end = nullptr;
+            const double rho = strtod(env_rho, &end);
+            if (end == env_rho || *end != '\0' || !std::isfinite(rho) || rho <= 0.0 || rho >= 1.0) {
+                throw std::runtime_error(format("invalid LLAMA_UMA_STREAM_LCP_RHO '%s' (want a float in (0,1))", env_rho));
+            }
+            uma_stream->lcp_rho = (float) rho;
+        }
+        if (uma_stream->policy != LLAMA_UMA_STREAM_POLICY_LRU || uma_stream->hot_decay > 0.0f) {
+            const char * pol_str = uma_stream->policy == LLAMA_UMA_STREAM_POLICY_LCP   ? "lcp"   :
+                                   uma_stream->policy == LLAMA_UMA_STREAM_POLICY_SIEVE ? "sieve" : "lru";
+            fprintf(stderr, "uma: stream M9 policy=%s hot_decay=%.3f hot_window=%u lcp_rho=%.3f\n",
+                    pol_str, (double) uma_stream->hot_decay, uma_stream->hot_window, (double) uma_stream->lcp_rho);
+        }
         // Correctness/reference mode: service compressed decode routes before
         // the first expert matmul from the beginning of the context.  Live
         // resize commits arm the same mode permanently.  The opt-in keeps the
@@ -5326,6 +5422,7 @@ void llama_context::uma_stream_setup() {
         uma_stream->slot_of_expert.assign((size_t) n_layer, nullptr);
         uma_stream->topk.assign((size_t) n_layer, nullptr);
         uma_stream->ranked.assign((size_t) n_layer, {}); // M6: per-layer freq ranking for eager grow
+        uma_stream->expert_hot.assign((size_t) n_layer * n_expert, 0.0f); // M9: decayed selection score
         uma_stream->device_stage_buf.resize(LLAMA_UMA_STREAM_N_KIND);
         uma_stream->device_stage_host.assign(LLAMA_UMA_STREAM_N_KIND, nullptr);
         uma_stream->device_stage_bytes.assign(LLAMA_UMA_STREAM_N_KIND, 0);
@@ -5394,7 +5491,9 @@ void llama_context::uma_stream_setup() {
                 L.last_used.assign(n_slots, 0);
                 L.pinned.assign(n_slots, 0);
                 L.pin_protected.assign(n_slots, 0);
+                L.visited.assign(n_slots, 0);       // M9 SIEVE lazy-promotion bits
                 L.newly_admitted.assign(n_slots, 0);
+                L.sieve_hand = 0;
 
                 // decouple mode: per-layer expert->slot table (I32 [1,n_expert,1,1]) on a
                 // StorageModeShared no-rset wrap. The GPU gathers slot_ids from it via

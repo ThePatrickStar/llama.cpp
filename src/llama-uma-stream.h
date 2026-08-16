@@ -23,6 +23,15 @@
 struct llama_model;
 struct llama_uma_stream_state;
 
+// M9 hot-set robustness: online ADAPT eviction policy (LLAMA_UMA_STREAM_POLICY).
+// LRU is the default and byte-identical to the pre-M9 path. LCP fuses a decayed
+// selection score with a recency term (MoEpic); SIEVE is a one-hit-wonder filter.
+enum llama_uma_stream_policy {
+    LLAMA_UMA_STREAM_POLICY_LRU = 0,
+    LLAMA_UMA_STREAM_POLICY_LCP,
+    LLAMA_UMA_STREAM_POLICY_SIEVE,
+};
+
 // process phys_footprint in MiB (TASK_VM_INFO on Darwin, 0 elsewhere). Defined in
 // llama-model.cpp; read at context teardown for the supply-curve steady state.
 size_t llama_uma_phys_footprint_mib();
@@ -59,8 +68,10 @@ struct llama_uma_stream_layer_lru {
     std::vector<uint64_t> last_used;
     std::vector<uint64_t> pinned;         // == pass when pinned this pass
     std::vector<uint8_t>  pin_protected;  // 1 = hot/warm-start, never an eviction victim
+    std::vector<uint8_t>  visited;        // M9 SIEVE: 1 = referenced since admit (lazy-promotion bit), n_slots capacity
     std::vector<int32_t>  newly_admitted; // experts admitted this pass (<= active S)
     uint32_t n_newly = 0;
+    uint32_t sieve_hand = 0;              // M9 SIEVE: rotating eviction hand over the active slots
     uint64_t tick    = 0;                 // monotonic LRU clock
     uint64_t pass    = 0;                 // monotonic admit-pass counter
 };
@@ -96,6 +107,17 @@ struct llama_uma_stream_state {
     bool     decode_exact_after_resize = false; // exact per-layer service after live S change or explicit exact mode
     bool     decouple     = false; // LLAMA_UMA_STREAM_DECOUPLE: GPU-gather decode routing (Part 1)
     bool     adapt        = false; // LLAMA_UMA_STREAM_ADAPT: online resident-set maintenance (Part 2 Step 3)
+
+    // M9 hot-set robustness (env-gated; defaults preserve the pre-M9 LRU path).
+    // expert_hot is a per-(layer,expert) decayed selection score maintained ONLY
+    // in the post-sync ADAPT loop and read only by the LCP victim score; the LRU
+    // default never touches it, so a default-unset run is byte-identical.
+    llama_uma_stream_policy policy = LLAMA_UMA_STREAM_POLICY_LRU;
+    float    hot_decay  = 0.0f;   // per-window aging factor in (0,1]; 0 = off (no aging)
+    uint32_t hot_window = 256;    // apply the aging decay every hot_window decode tokens
+    float    lcp_rho    = 0.9f;   // LCP recency base in (0,1)
+    uint64_t hot_tick   = 0;      // decode tokens since the last aging sweep
+    std::vector<float> expert_hot; // n_layer x n_expert decayed selection score
 
     // M6 give-back controller telemetry + eager-grow support
     uint64_t n_resizes    = 0;  // runtime S-resize events over the context lifetime
