@@ -3402,12 +3402,37 @@ int llama_uma_stream_service_prefill_tile(
                 continue;
             }
             const size_t slab = S->model->uma_stream_slab_bytes(ud->il, kind);
-            ggml_backend_tensor_set_async(
-                S->device_backend, S->slot(ud->il, kind), S->device_stage_host[kind],
-                (size_t) slot * slab, slab);
+            static const bool sync_upload = [](){ const char * v = getenv("LLAMA_UMA_STREAM_SYNC_UPLOAD"); return v && v[0] && v[0] != '0'; }();
+            if (sync_upload) {
+                ggml_backend_tensor_set(S->slot(ud->il, kind), S->device_stage_host[kind], (size_t) slot * slab, slab);
+            } else {
+                ggml_backend_tensor_set_async(
+                    S->device_backend, S->slot(ud->il, kind), S->device_stage_host[kind],
+                    (size_t) slot * slab, slab);
+            }
             uploaded += slab;
         }
         ggml_backend_synchronize(S->device_backend);
+
+        {
+            static const bool diag_rb = [](){ const char * v = getenv("LLAMA_UMA_STREAM_DIAG_READBACK"); return v && v[0] && v[0] != '0'; }();
+            if (diag_rb) {
+                for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+                    if (!S->streams(ud->il, kind)) { continue; }
+                    const size_t slab = S->model->uma_stream_slab_bytes(ud->il, kind);
+                    std::vector<uint8_t> back(slab);
+                    ggml_backend_tensor_get(S->slot(ud->il, kind), back.data(), (size_t) slot * slab, slab);
+                    size_t nmis = 0;
+                    const uint8_t * src = (const uint8_t *) S->device_stage_host[kind];
+                    for (size_t b = 0; b < slab; b++) { if (back[b] != src[b]) { nmis++; } }
+                    if (nmis > 0) {
+                        if (S->n_decode_service <= 4) fprintf(stderr, "uma DIAG readback il=%d kind=%d e=%d slot=%d: %zu/%zu bytes DIFFER\n", ud->il, kind, e, slot, nmis, slab);
+                    } else if (S->n_decode_service <= 1) {
+                        fprintf(stderr, "uma DIAG readback il=%d kind=%d e=%d slot=%d: OK (%zu bytes match)\n", ud->il, kind, e, slot, slab);
+                    }
+                }
+            }
+        }
 
         const int32_t old = L.expert_in_slot[slot];
         if (old >= 0) {
@@ -3452,6 +3477,24 @@ int llama_uma_stream_service_prefill_tile(
             return -1;
         }
         slot_ids[i] = slot;
+        {
+            static const bool diag_verify = [](){ const char * v = getenv("LLAMA_UMA_STREAM_DIAG_VERIFY"); return v && v[0] && v[0] != '0'; }();
+            if (diag_verify) {
+                for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+                    if (!S->streams(ud->il, kind)) { continue; }
+                    const size_t slab = S->model->uma_stream_slab_bytes(ud->il, kind);
+                    std::vector<uint8_t> want(slab), got(slab);
+                    if (!S->model->uma_stream_pread_expert(ud->il, kind, e, want.data())) { continue; }
+                    ggml_backend_tensor_get(S->slot(ud->il, kind), got.data(), (size_t) slot * slab, slab);
+                    if (memcmp(want.data(), got.data(), slab) != 0) {
+                        size_t nmis = 0; for (size_t b = 0; b < slab; b++) if (want[b] != got[b]) nmis++;
+                        static int nlog = 0;
+                        if (nlog++ < 12) fprintf(stderr, "uma DIAG VERIFY STALE il=%d kind=%d e=%d slot=%d resident=%s: %zu/%zu bytes differ (expert_in_slot=%d)\n",
+                                ud->il, kind, e, slot, (L.expert_in_slot[slot]==e?"yes":"no"), nmis, slab, L.expert_in_slot[slot]);
+                    }
+                }
+            }
+        }
         if (S->diag_enabled && !prefill) {
             S->diag_slot_hash = diag_hash_u32(S->diag_slot_hash, (uint32_t) ud->il);
             S->diag_slot_hash = diag_hash_u32(S->diag_slot_hash, (uint32_t) e);
@@ -5343,9 +5386,10 @@ void llama_context::uma_stream_setup() {
         for (uint32_t il = 0; il < k; il++) {
             const auto & layer = model.layers[il];
             ggml_tensor * srcs[LLAMA_UMA_STREAM_N_KIND];
-            srcs[LLAMA_UMA_STREAM_GATE] = layer.ffn_gate_exps;
-            srcs[LLAMA_UMA_STREAM_UP]   = layer.ffn_up_exps;
-            srcs[LLAMA_UMA_STREAM_DOWN] = layer.ffn_down_exps;
+            srcs[LLAMA_UMA_STREAM_GATE]    = layer.ffn_gate_exps;
+            srcs[LLAMA_UMA_STREAM_UP]      = layer.ffn_up_exps;
+            srcs[LLAMA_UMA_STREAM_DOWN]    = layer.ffn_down_exps;
+            srcs[LLAMA_UMA_STREAM_GATE_UP] = layer.ffn_gate_up_exps; // fused gate+up (deepseek2, qwen35moe)
             bool layer_streams = false;
             for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
                 ggml_tensor * src = srcs[kind];

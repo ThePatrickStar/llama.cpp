@@ -2044,12 +2044,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // n_seq_tokens distinguishes prompt/prefill from continuous-batched
             // decode (several sequences can make total n_tokens > 1 while each
             // contributes exactly one decode token).
-            route_service_each_matmul = prefill_service;
+            route_service_each_matmul = true; // service up/gate/down each (separate slot pools)
             route_service_data = uma_stream->service_ud(il, route_service_each_matmul);
         }
         if (up_exps   && uma_stream->streams(il, LLAMA_UMA_STREAM_UP))   { up_exps   = uma_stream->slot(il, LLAMA_UMA_STREAM_UP); }
         if (gate_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_GATE)) { gate_exps = uma_stream->slot(il, LLAMA_UMA_STREAM_GATE); }
         if (down_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_DOWN)) { down_exps = uma_stream->slot(il, LLAMA_UMA_STREAM_DOWN); }
+        if (gate_up_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_GATE_UP)) { gate_up_exps = uma_stream->slot(il, LLAMA_UMA_STREAM_GATE_UP); }
     } else if (uma_stream && uma_stream->streams_layer(il) && !cparams.warmup) {
         ggml_tensor * slot_ids = ggml_custom_4d(ctx0, GGML_TYPE_I32,
                 selected_experts->ne[0], selected_experts->ne[1], 1, 1,
@@ -2071,14 +2072,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     &slot_ids, 1, llama_uma_stream_fill, 1, uma_stream->ud(il, LLAMA_UMA_STREAM_DOWN));
             cb(down_exps, "ffn_moe_stream_down", il);
         }
+        if (gate_up_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_GATE_UP)) {
+            gate_up_exps = ggml_custom_inplace(ctx0, uma_stream->slot(il, LLAMA_UMA_STREAM_GATE_UP),
+                    &slot_ids, 1, llama_uma_stream_fill, 1, uma_stream->ud(il, LLAMA_UMA_STREAM_GATE_UP));
+            cb(gate_up_exps, "ffn_moe_stream_gate_up", il);
+        }
     }
 
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
     if (gate_up_exps) {
-        // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+        // merged gate_up path: one mul_mat_id, then split into gate and up views.
+        // When streaming, route via slot ids + the exact-fetch service (mirrors the
+        // separate up/gate/down path); otherwise route_ids == selected_experts.
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, route_ids, up_exps_s, route_ids_may_alias,
+                route_service_ids, route_service_data); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {

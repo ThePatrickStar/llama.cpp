@@ -23,6 +23,18 @@
 struct llama_model;
 struct llama_uma_stream_state;
 
+// uma-moe fork: the per-expert weight tensors an MoE layer can stream. One
+// convention shared by the manifest (llama-model), the fill op (llama-context)
+// and the graph wrap (llama-graph). Separate-projection archs use GATE/UP/DOWN;
+// fused archs (deepseek2, qwen35moe, ...) use GATE_UP + DOWN. Sized by N_KIND.
+enum llama_uma_stream_kind {
+    LLAMA_UMA_STREAM_GATE    = 0,
+    LLAMA_UMA_STREAM_UP      = 1,
+    LLAMA_UMA_STREAM_DOWN    = 2,
+    LLAMA_UMA_STREAM_GATE_UP = 3, // fused gate+up expert tensor (deepseek2, qwen35moe, ...)
+    LLAMA_UMA_STREAM_N_KIND  = 4,
+};
+
 // process phys_footprint in MiB (TASK_VM_INFO on Darwin, 0 elsewhere). Defined in
 // llama-model.cpp; read at context teardown for the supply-curve steady state.
 size_t llama_uma_phys_footprint_mib();
@@ -233,18 +245,21 @@ struct llama_uma_stream_state {
     }
 
     bool streams(int il, int kind) const {
-        const size_t i = (size_t) il * 3 + (size_t) kind;
+        const size_t i = (size_t) il * LLAMA_UMA_STREAM_N_KIND + (size_t) kind;
         return i < slots.size() && slots[i] != nullptr;
     }
     // true if any kind of layer il streams (=> the layer has an admit op)
     bool streams_layer(int il) const {
-        return streams(il, 0) || streams(il, 1) || streams(il, 2);
+        for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
+            if (streams(il, kind)) { return true; }
+        }
+        return false;
     }
     ggml_tensor * slot(int il, int kind) const {
-        return slots[(size_t) il * 3 + (size_t) kind];
+        return slots[(size_t) il * LLAMA_UMA_STREAM_N_KIND + (size_t) kind];
     }
     void * ud(int il, int kind) const {
-        return (void *) &uds[(size_t) il * 3 + (size_t) kind];
+        return (void *) &uds[(size_t) il * LLAMA_UMA_STREAM_N_KIND + (size_t) kind];
     }
     void * admit_ud(int il) const {
         return (void *) &admit_uds[(size_t) il];

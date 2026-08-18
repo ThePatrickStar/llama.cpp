@@ -1255,6 +1255,43 @@ void ggml_cuda_mul_mat_vec_q(
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+
+    static const bool ref_check = [](){ const char * v = getenv("GGML_CUDA_MMVQ_REF_CHECK"); return v && v[0] && v[0] != '0'; }();
+    static int ref_calls = 0;
+    if (ref_check && ids && ref_calls < 6) {
+        ref_calls++;
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const int64_t nexp = ne02, ncols0 = ne00, nrows0 = ne01;
+        std::vector<char> h_w(ggml_nbytes(src0));
+        std::vector<int32_t> h_ids((size_t) ids->ne[0] * ids->ne[1]);
+        std::vector<float> h_x((size_t) src1->ne[0] * src1->ne[2]);
+        std::vector<float> h_dst((size_t) dst->ne[0] * dst->ne[1] * dst->ne[2]);
+        CUDA_CHECK(cudaMemcpy(h_w.data(), src0->data, h_w.size(), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_ids.data(), ids->data, h_ids.size()*4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_x.data(), src1->data, h_x.size()*4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_dst.data(), dst->data, h_dst.size()*4, cudaMemcpyDeviceToHost));
+        const auto * tt = ggml_get_type_traits(src0->type);
+        const int64_t nexp_used = ids->ne[0];         // experts for token 0
+        const int64_t s_dst_e   = dst->nb[1] / ts_dst; // dst expert stride (token 0)
+        std::vector<float> W((size_t) ncols0 * nrows0);
+        const int rows[6] = { 0, 1, (int)(nrows0/3), (int)(nrows0/2), (int)(2*nrows0/3), (int)(nrows0-1) };
+        for (int64_t e = 0; e < nexp_used; e++) {
+            const int32_t slot = h_ids[e];
+            tt->to_float((const char *) h_w.data() + (size_t) slot * (size_t)(s02) * ggml_type_size(src0->type), W.data(), ncols0 * nrows0);
+            double max_rel = 0.0; int max_r = -1; double mref = 0, mker = 0;
+            for (int ri = 0; ri < 6; ri++) {
+                const int r = rows[ri]; if (r < 0 || r >= nrows0) continue;
+                double ref = 0.0;
+                for (int64_t k = 0; k < ncols0; k++) ref += (double) W[(size_t) r * ncols0 + k] * (double) h_x[k];
+                const double kern = h_dst[(size_t) r + (size_t) e * s_dst_e];
+                const double rel = std::fabs(ref - kern) / (std::fabs(ref) + 1e-3);
+                if (rel > max_rel) { max_rel = rel; max_r = r; mref = ref; mker = kern; }
+            }
+            fprintf(stderr, "uma REFCHECK type=%s nexp=%lld e=%lld slot=%d max_rel=%.3f @r=%d (ref=%.5f ker=%.5f) %s\n",
+                    ggml_type_name(src0->type), (long long) nexp, (long long) e, slot, max_rel, max_r, mref, mker,
+                    max_rel > 0.05 ? "<<< MISMATCH" : "ok");
+        }
+    }
 }
 
 void ggml_cuda_op_mul_mat_vec_q(

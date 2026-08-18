@@ -6,6 +6,7 @@
 #include "llama-hparams.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
+#include "llama-uma-stream.h" // enum llama_uma_stream_kind (shared streaming convention)
 
 #include <map>
 #include <memory>
@@ -547,16 +548,8 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
-// uma-moe fork M5 S1: the three per-expert weight tensors an MoE layer streams.
-// One convention shared by the manifest (llama-model), the fill op (llama-context)
-// and the graph wrap (llama-graph). Merged gate_up architectures are out of scope
-// for S1.1.1 (Qwen3-30B uses the separate gate/up/down path).
-enum llama_uma_stream_kind {
-    LLAMA_UMA_STREAM_GATE   = 0,
-    LLAMA_UMA_STREAM_UP     = 1,
-    LLAMA_UMA_STREAM_DOWN   = 2,
-    LLAMA_UMA_STREAM_N_KIND = 3,
-};
+// enum llama_uma_stream_kind now lives in llama-uma-stream.h (included above) so
+// the streaming accessors that index by it are visible in every translation unit.
 
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;

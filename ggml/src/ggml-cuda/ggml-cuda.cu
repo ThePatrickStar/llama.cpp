@@ -1024,6 +1024,9 @@ static ggml_backend_buffer_t ggml_backend_cuda_vmm_slot_buffer_alloc(
         ctx->vmm_active_slots = slot;
     }
     ctx->vmm_mapped_size = ggml_backend_cuda_vmm_boundary(ctx, initial_slots);
+    // zero the mapped region incl. the tail_pad over-read area: MMQ/MMVQ k-quant kernels read
+    // slightly past the written slot data, and uninitialized bytes there corrupt the result.
+    CUDA_CHECK(cudaMemset(ctx->dev_ptr, 0, ctx->vmm_mapped_size));
     const size_t logical_size = initial_slots*slot_stride + tail_pad;
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, logical_size);
 #else
@@ -2051,6 +2054,13 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
         return false;
     }
 
+    // uma-moe: a MUL_MAT_ID carrying the device-slot exact-fetch service MUST run through
+    // ggml_cuda_mul_mat_id, where the service fetches cold experts and rewrites the slot ids.
+    // Fusing gate/up into the GLU mmv path bypasses that service -> cold experts read sentinel
+    // slot 0 (a wrong expert). Never fuse a service-armed node.
+    if (tensor->op == GGML_OP_MUL_MAT_ID && ggml_mul_mat_id_get_prefill_service(tensor, nullptr, nullptr)) {
+        return false;
+    }
 
     return use_mul_mat_vec_f;
 }
@@ -2078,6 +2088,13 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     }
 
     if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1) {
+        return false;
+    }
+
+    // uma-moe: never fuse a MUL_MAT_ID that carries the device-slot exact-fetch service (see
+    // ggml_cuda_should_fuse_mul_mat_vec_f) — the fused GLU mmv path skips the service and cold
+    // experts would read sentinel slot 0.
+    if (tensor->op == GGML_OP_MUL_MAT_ID && ggml_mul_mat_id_get_prefill_service(tensor, nullptr, nullptr)) {
         return false;
     }
 
@@ -2188,6 +2205,17 @@ static void ggml_cuda_mul_mat_id_mmvq_chunked(
         ids_chunk .data = (char *) ids ->data + first*ids ->nb[1];
         dst_chunk .data = (char *) dst ->data + first*dst ->nb[2];
 
+        {
+            static const bool route_trace = [](){ const char * v = getenv("GGML_CUDA_MMID_ROUTE_TRACE"); return v && v[0] && v[0] != '0'; }();
+            static int rt_calls = 0;
+            if (route_trace && first == 0 && rt_calls < 40) {
+                rt_calls++;
+                fprintf(stderr, "uma ROUTE ntok=%lld service=%d type=%s nexp=%lld\n",
+                        (long long) src1->ne[2], service != nullptr, ggml_type_name(src0->type), (long long) src0->ne[2]);
+            }
+        }
+
+        if (getenv("GGML_CUDA_MMID_FULLSYNC")) { CUDA_CHECK(cudaDeviceSynchronize()); } // TEST ordering hazard
         ggml_cuda_mul_mat_vec_q(ctx, src0, &src1_chunk, &ids_chunk, &dst_chunk);
         first += count;
     }

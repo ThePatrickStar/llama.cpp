@@ -2096,9 +2096,10 @@ void llama_model::uma_stream_build_manifest(const struct llama_model_loader & ml
     for (uint32_t il = 0; il < pimpl->uma_stream_k_val; il++) {
         const auto & layer = layers[il];
         ggml_tensor * kinds[LLAMA_UMA_STREAM_N_KIND];
-        kinds[LLAMA_UMA_STREAM_GATE] = layer.ffn_gate_exps;
-        kinds[LLAMA_UMA_STREAM_UP]   = layer.ffn_up_exps;
-        kinds[LLAMA_UMA_STREAM_DOWN] = layer.ffn_down_exps;
+        kinds[LLAMA_UMA_STREAM_GATE]    = layer.ffn_gate_exps;
+        kinds[LLAMA_UMA_STREAM_UP]      = layer.ffn_up_exps;
+        kinds[LLAMA_UMA_STREAM_DOWN]    = layer.ffn_down_exps;
+        kinds[LLAMA_UMA_STREAM_GATE_UP] = layer.ffn_gate_up_exps; // fused gate+up (deepseek2, qwen35moe)
         for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
             ggml_tensor * t = kinds[kind];
             if (t == nullptr) {
