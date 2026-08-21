@@ -25,6 +25,9 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <thread>
+#include <chrono>
+#include <cstdlib>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -3602,6 +3605,36 @@ private:
         const int ret = llama_decode(ctx_tgt, batch_view);
 
         metrics.on_decoded(slots);
+
+        // UMA decode-pacing (Fix 3.2): after a pure-decode step, optionally sleep to lower this
+        // server's decode step-rate, yielding shared UMA bandwidth to co-tenants. Only delays
+        // identical compute, so logits are unchanged. Default-off; never paces prefill/mixed steps.
+        if (ret == 0) {
+            static const long uma_pace_us = []() -> long {
+                const char * s = getenv("UMA_DECODE_PACE_US");
+                long v = (s && *s) ? strtol(s, nullptr, 10) : 0;
+                return v > 0 ? v : 0;
+            }();
+            if (uma_pace_us > 0) {
+                // pace only a PURE-decode step: every active slot must be generating. If any slot
+                // is processing a prompt this step, skip pacing entirely so a prefill ubatch (or a
+                // chunked prompt's trailing ubatch) is never delayed - that would distort TTFT.
+                bool any_prompt = false;
+                size_t n_generating = 0;
+                for (const auto & s : slots) {
+                    if (s.state == SLOT_STATE_GENERATING) { n_generating++; }
+                    else if (s.state != SLOT_STATE_IDLE) { any_prompt = true; }
+                }
+                if (!any_prompt && n_generating > 0) {
+                    // finish this tenant's in-flight decode first: Metal dispatches decode async,
+                    // so an un-synced sleep would overlap the GPU work and neither add latency nor
+                    // free the shared fabric. Syncing makes the sleep real idle time (the fabric
+                    // yield) and makes pace_us map linearly to the step-rate reduction.
+                    llama_synchronize(ctx_tgt);
+                    std::this_thread::sleep_for(std::chrono::microseconds(uma_pace_us));
+                }
+            }
+        }
 
         if (ret != 0) {
             {
