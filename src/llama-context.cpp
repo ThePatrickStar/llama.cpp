@@ -321,8 +321,17 @@ llama_context::llama_context(
                                             s_floor, nu, s_cfg.initial));
         }
         const bool device_slots = llama_uma_stream_device_slots_enabled();
-        if (s_floor > 0 && !device_slots) {
-            const uint32_t ub_cap = std::max<uint32_t>(1, (uint32_t) (s_floor / (long) nu));
+        // [OPTION B / Metal] When the resident floor already covers ALL experts (s_floor >= n_expert), a
+        // prefill ubatch can never route to more distinct experts than resident slots, so the mmq-scatter
+        // overflow guard is unnecessary — keep the full ubatch (else Metal prefill is capped to s_floor/topk
+        // tokens, ~6-19x slower). With PREFILL_FULL the phase policy grows to n_expert for prefill, so the cap
+        // should be sized by the prefill residency (SMAX), not the decode floor (SMIN).
+        long s_prefill = s_floor;
+        if (getenv("LLAMA_UMA_STREAM_PREFILL_FULL") != nullptr) {
+            s_prefill = llama_uma_stream_env_long("LLAMA_UMA_STREAM_SMAX", s_cfg.initial);
+        }
+        if (s_prefill > 0 && !device_slots && s_prefill < (long) model.hparams.n_expert) {
+            const uint32_t ub_cap = std::max<uint32_t>(1, (uint32_t) (s_prefill / (long) nu));
             if (cparams.n_ubatch > ub_cap) {
                 fprintf(stderr, "uma: give-back capping n_ubatch %u -> %u (S_floor=%ld / n_expert_used=%u) "
                         "so a prefill ubatch never overflows the resident slots (mmq-scatter overflow guard)\n",
@@ -1800,6 +1809,19 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // [OPTION B / phase-residency, env LLAMA_UMA_STREAM_PREFILL_FULL] Grow to full residency for a PREFILL
+    // ubatch so it runs uncapped/batched (on Metal the ubatch cap lifts at s>=n_expert; on CUDA route_ids
+    // stop aliasing). Decode sheds back to the give-back floor via the controller tick. Resize reallocs the
+    // slot tensors, so force a graph rebuild. Grows once per request (no-op once already full).
+    {
+        static const bool phase_full = getenv("LLAMA_UMA_STREAM_PREFILL_FULL") != nullptr;
+        if (phase_full && uma_stream && uma_stream->decouple && uma_resize_smin >= 0
+                && ubatch.n_tokens > 1 && uma_stream->n_slots_active < uma_stream->n_slots) {
+            if (cparams.pipeline_parallel) { ggml_backend_sched_synchronize(sched.get()); }
+            uma_stream_resize(uma_stream->n_slots, /*park=*/false);
+            uma_stream_force_rebuild = true;
+        }
+    }
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -5024,6 +5046,12 @@ bool llama_context::uma_stream_prepare_parked_decode() {
 // polled every period tokens) and calls uma_stream_resize().
 void llama_context::uma_stream_controller_tick() {
     uma_resize_dtoken++;
+    {   // [OPTION B / phase-residency] shed to the give-back floor on decode (paired with the prefill grow)
+        static const bool phase_full = getenv("LLAMA_UMA_STREAM_PREFILL_FULL") != nullptr;
+        if (phase_full && uma_resize_smin >= 0 && uma_stream->n_slots_active > (uint32_t) uma_resize_smin) {
+            uma_stream_resize((uint32_t) uma_resize_smin, /*park=*/false);
+        }
+    }
     while (uma_resize_sched_i < uma_resize_sched.size() &&
            uma_resize_sched[uma_resize_sched_i].first <= uma_resize_dtoken) {
         const int32_t target = uma_resize_sched[uma_resize_sched_i].second;
