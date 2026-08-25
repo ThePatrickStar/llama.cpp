@@ -2151,8 +2151,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 static void ggml_cuda_mul_mat_id_mmvq_chunked(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         const ggml_tensor * ids, const ggml_tensor * logical_ids, ggml_tensor * dst, int64_t chunk_size,
+        int mmvq_max_batch, bool allow_mmq,
         ggml_mul_mat_id_prefill_service_t service, void * service_data) {
-    GGML_ASSERT(chunk_size > 0 && chunk_size <= MMVQ_MAX_BATCH_SIZE);
+    GGML_ASSERT(chunk_size > 0);
+    GGML_ASSERT(allow_mmq || chunk_size <= MMVQ_MAX_BATCH_SIZE);
+    GGML_ASSERT(mmvq_max_batch > 0 && mmvq_max_batch <= MMVQ_MAX_BATCH_SIZE);
     GGML_ASSERT(src1->ne[2] == dst->ne[2]);
     GGML_ASSERT(ids->ne[1] == src1->ne[2]);
     GGML_ASSERT((logical_ids == nullptr) == (service == nullptr));
@@ -2162,8 +2165,9 @@ static void ggml_cuda_mul_mat_id_mmvq_chunked(
         GGML_ASSERT(logical_ids->nb[0] == sizeof(int32_t) && ids->nb[0] == sizeof(int32_t));
     }
 
+    int64_t proposal = chunk_size;
     for (int64_t first = 0; first < src1->ne[2]; ) {
-        int64_t count = std::min(chunk_size, src1->ne[2] - first);
+        int64_t count = std::min(proposal, src1->ne[2] - first);
 
         if (service != nullptr) {
             const size_t row_bytes = (size_t) logical_ids->ne[0] * sizeof(int32_t);
@@ -2191,6 +2195,7 @@ static void ggml_cuda_mul_mat_id_mmvq_chunked(
                 (char *) ids->data + first * ids->nb[1], ids->nb[1],
                 slot_host.data(), row_bytes, row_bytes, count,
                 cudaMemcpyHostToDevice, ctx.stream()));
+            proposal = count;
         }
 
         ggml_tensor src1_chunk = *src1;
@@ -2216,7 +2221,14 @@ static void ggml_cuda_mul_mat_id_mmvq_chunked(
         }
 
         if (getenv("GGML_CUDA_MMID_FULLSYNC")) { CUDA_CHECK(cudaDeviceSynchronize()); } // TEST ordering hazard
-        ggml_cuda_mul_mat_vec_q(ctx, src0, &src1_chunk, &ids_chunk, &dst_chunk);
+        // MMQ is exact here: the service rewrote ids into resident slots in [0, ne02), and a
+        // service-armed node always carries allow_duplicate_ids, so MMQ takes the duplicate-safe
+        // id helper (identical math to the MMVQ tiling for these distinct slot ids).
+        if (allow_mmq && count > mmvq_max_batch) {
+            ggml_cuda_mul_mat_q(ctx, src0, &src1_chunk, &ids_chunk, &dst_chunk);
+        } else {
+            ggml_cuda_mul_mat_vec_q(ctx, src0, &src1_chunk, &ids_chunk, &dst_chunk);
+        }
         first += count;
     }
 }
@@ -2250,16 +2262,23 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         const bool service_prefill = ggml_mul_mat_id_get_prefill_service(dst, &service, &service_data);
         if (service_prefill) {
             GGML_ASSERT(marked && ggml_is_quantized(src0->type));
-            const int chunk_size = get_mmvq_mmid_max_batch(src0->type, cc);
-            GGML_ASSERT(chunk_size > 0 && chunk_size <= MMVQ_MAX_BATCH_SIZE);
+            const int mmvq_max = get_mmvq_mmid_max_batch(src0->type, cc);
+            GGML_ASSERT(mmvq_max > 0 && mmvq_max <= MMVQ_MAX_BATCH_SIZE);
+            // Batched MMQ over the resident slot pool once the service has fetched the
+            // tile's experts: the same kernel stock uses for MoE prefill, dispatched per
+            // serviced tile instead of MMVQ@<=8. Opt-in; the service still bounds the tile
+            // to the active slot count.
+            static const bool prefill_mmq = ggml_cuda_mmvq_mul_mat_id_env("LLAMA_UMA_STREAM_PREFILL_MMQ");
+            const bool allow_mmq = prefill_mmq && ggml_cuda_should_use_mmq(src0->type, cc, ne2, ne02);
+            const int64_t service_chunk = allow_mmq ? ne2 : (int64_t) mmvq_max;
             if (trace_mmvq && ne2 > MMVQ_MAX_BATCH_SIZE) {
                 fprintf(stderr,
-                        "ggml_cuda_mul_mat_id: MMVQ tiled dispatch marked=1 forced=%d type=%s "
-                        "ne2=%" PRId64 " chunk=%d\n",
-                        force_mmvq ? 1 : 0, ggml_type_name(src0->type), ne2, chunk_size);
+                        "ggml_cuda_mul_mat_id: service dispatch marked=1 forced=%d mmq=%d type=%s "
+                        "ne2=%" PRId64 " chunk=%" PRId64 "\n",
+                        force_mmvq ? 1 : 0, allow_mmq ? 1 : 0, ggml_type_name(src0->type), ne2, service_chunk);
             }
             ggml_cuda_mul_mat_id_mmvq_chunked(
-                ctx, src0, src1, ids, dst->src[3], dst, chunk_size, service, service_data);
+                ctx, src0, src1, ids, dst->src[3], dst, service_chunk, mmvq_max, allow_mmq, service, service_data);
             return;
         }
         if ((marked || force_mmvq) && ggml_is_quantized(src0->type) && ne2 > MMVQ_MAX_BATCH_SIZE) {
@@ -2272,7 +2291,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                         marked ? 1 : 0, force_mmvq ? 1 : 0, ggml_type_name(src0->type), ne2, chunk_size);
             }
             ggml_cuda_mul_mat_id_mmvq_chunked(
-                ctx, src0, src1, ids, nullptr, dst, chunk_size, nullptr, nullptr);
+                ctx, src0, src1, ids, nullptr, dst, chunk_size, chunk_size, /*allow_mmq=*/false, nullptr, nullptr);
             return;
         }
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
