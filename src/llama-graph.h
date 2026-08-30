@@ -712,8 +712,16 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
-    // uma-moe fork M5 S1.1.1: expert streaming slot pool (nullptr = off). Constant
-    // per context, so it does not participate in allow_reuse (topology-invariant).
+    // uma-moe fork M5 S1.1.1: expert streaming slot pool (nullptr = off). The
+    // pointer is constant per context, so uma_stream does not participate in
+    // allow_reuse below. NOTE: this is NOT because the emitted topology is
+    // uma_stream-invariant -- build_moe_ffn branches on runtime fields
+    // (n_slots_active, decode_exact_after_resize, decouple, device_slots) and
+    // can change graph topology (route_ids_may_alias, mul_mat_id service src[3]).
+    // Reuse safety is instead upheld in llama-context.cpp, which forces a graph
+    // rebuild (uma_stream_force_rebuild) whenever any of those fields change and
+    // clears the cached topk pointers only on that rebuild. Any new uma_stream
+    // field that build_moe_ffn branches on MUST likewise trigger force_rebuild.
     const llama_uma_stream_state * uma_stream = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
@@ -972,7 +980,8 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr,
                       bool   allow_duplicate_ids = false,
               ggml_tensor * service_ids = nullptr,
-                      void * service_data = nullptr) const;
+                      void * service_data = nullptr,
+              ggml_tensor * scale_ids = nullptr) const; // expert-id gather for w_s (differs from ids under give-back streaming)
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,

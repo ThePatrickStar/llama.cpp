@@ -486,6 +486,11 @@ private:
 
     mutable int64_t t_compute_start_us = 0;
     mutable int64_t n_queued_tokens    = 0;
+    // uma-moe (review 2026-08-31): true if any ubatch queued since the last sync was a
+    // prefill chunk (a sequence with >1 token). Mirrors n_queued_tokens' lifecycle
+    // (accumulated in decode, reset in synchronize) and gates the batched give-back
+    // controller tick so a shed cannot land on an all-output multi-token prefill.
+    mutable bool    uma_decode_saw_prefill = false;
 
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls

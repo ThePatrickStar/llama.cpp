@@ -315,7 +315,13 @@ llama_uma_plan llama_uma_plan_compute(const llama_uma_profile & prof, int64_t wi
             // non-decreasing in k past the first feasible point
             break;
         }
-        excluded_bytes += prof.expert_bytes_layers[k];
+        // Bug-fix (review 2026-08-31): guard the last iteration. The loop runs
+        // k in [0, n_layer]; on the final k == n_layer (only reached when the
+        // model is infeasible even fully excluded) the unguarded index would
+        // read expert_bytes_layers[n_layer], one past the end.
+        if (k < prof.n_layer) {
+            excluded_bytes += prof.expert_bytes_layers[k];
+        }
     }
     if (best_j < 0.0) {
         best.k = prof.n_layer + 1;   // sentinel: infeasible even fully excluded
@@ -452,11 +458,18 @@ bool llama_uma_inject_load_overrides(const char * path_model, llama_model_params
         // these excluded expert tensors are never computed here. (Slot pool buft is set separately in
         // the context via uma_stream_cuda_host_buft and is unaffected by no_host.)
         params.no_host = true;
+        const char * lz = getenv("LLAMA_UMA_STREAM_LAZYLOAD");
+        const bool lazy = lz != nullptr && lz[0] != '\0' && lz[0] != '0';
         if (params.load_mode == LLAMA_LOAD_MODE_MMAP || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
             params.load_mode = params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ? LLAMA_LOAD_MODE_MLOCK : LLAMA_LOAD_MODE_NONE;
         }
-        const char * lz = getenv("LLAMA_UMA_STREAM_LAZYLOAD");
-        const bool lazy = lz != nullptr && lz[0] != '\0' && lz[0] != '0';
+        // Bug-fix (review 2026-08-31): under LAZYLOAD the streamed experts are never
+        // read into RAM; an mlock load mode would fault+pin every lazy-skipped page
+        // (llama-model grow_to), defeating the 0-resident invariant and able to wedge
+        // a 36GB Mac. Strip mlock so lazy stays truly 0-resident.
+        if (lazy && params.load_mode == LLAMA_LOAD_MODE_MLOCK) {
+            params.load_mode = LLAMA_LOAD_MODE_NONE;
+        }
         fprintf(stderr, "uma: stream K=%ld: front-layer experts -> CPU buffer (freeable) + load-mode %s%s\n",
                 k, llama_load_mode_name(params.load_mode),
                 lazy ? " + LAZYLOAD (experts not read into RAM; slot pool is the sole copy - load transient ~= slot-pool size)" : "");

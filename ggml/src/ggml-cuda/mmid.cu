@@ -133,6 +133,10 @@ static __global__ void mm_ids_helper_duplicate_safe(
         const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
     const int expert = blockIdx.x;
+    // Single-threaded per expert block: only thread 0 does the two sequential scans below.
+    // Unlike the warp-parallel stock mm_ids_helper this is de-optimized on purpose (simplicity
+    // of the occurrence-preserving compaction). It only runs on the service/compression path
+    // (allow_duplicate_ids); parallelize across the warp if it ever shows up in the profile.
     if (threadIdx.x != 0) {
         return;
     }
@@ -176,6 +180,10 @@ static void launch_mm_ids_helper(
         const int sis1, const bool write_inverse, const bool allow_duplicate_ids, cudaStream_t stream) {
     GGML_ASSERT(n_tokens          < (1 << 22) && "too few bits in mm_ids_helper_store");
     GGML_ASSERT(n_expert_used_var < (1 << 10) && "too few bits in mm_ids_helper_store");
+    // Always-on guard on the int-typed route arithmetic below (ir = it*n_expert_used + iex).
+    // Runs for both the duplicate-safe and stock branches; realistic MoE ubatches
+    // (n_tokens*n_expert_used well under 2^31) never reach it, but the two bounds above
+    // formally allow a product up to 2^32, so fail loud rather than overflow int silently.
     GGML_ASSERT((int64_t) n_tokens*n_expert_used_var <= INT_MAX && "too many mul_mat_id routes");
 
     const int id = ggml_cuda_get_device();

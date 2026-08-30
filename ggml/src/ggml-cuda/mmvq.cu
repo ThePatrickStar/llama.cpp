@@ -1259,6 +1259,17 @@ void ggml_cuda_mul_mat_vec_q(
     static const bool ref_check = [](){ const char * v = getenv("GGML_CUDA_MMVQ_REF_CHECK"); return v && v[0] && v[0] != '0'; }();
     static int ref_calls = 0;
     if (ref_check && ids && ref_calls < 6) {
+        // Diagnostic aid only (default OFF). WARNING: when active it forces a stream
+        // sync + full-tensor D->H copies below, so it MUST NOT be left set during any
+        // decode/prefill timing run or latency numbers are corrupted. The reference is
+        // a plain matmul (W*x) and does NOT model the fused bias/gate/GLU path, so a
+        // MISMATCH on a fused node is a tool artifact, not a give-back correctness bug.
+        static bool warned = false;
+        if (!warned) { warned = true; fprintf(stderr, "uma REFCHECK ACTIVE: matmul-only reference, forces sync+D->H copies -- do NOT leave set during timing runs\n"); }
+        // Detect whether fusion (bias/gate/GLU) was folded into dst; if so the plain
+        // W*x reference legitimately differs from the kernel output.
+        const bool fused = fusion_local.x_bias || fusion_local.gate || fusion_local.gate_bias ||
+                           fusion_local.x_scale || fusion_local.gate_scale;
         ref_calls++;
         CUDA_CHECK(cudaStreamSynchronize(stream));
         const int64_t nexp = ne02, ncols0 = ne00, nrows0 = ne01;
@@ -1287,9 +1298,13 @@ void ggml_cuda_mul_mat_vec_q(
                 const double rel = std::fabs(ref - kern) / (std::fabs(ref) + 1e-3);
                 if (rel > max_rel) { max_rel = rel; max_r = r; mref = ref; mker = kern; }
             }
+            // Under fusion the ref is W*x only (excludes bias/gate/GLU), so a large
+            // rel-error is expected -- label it as such instead of flagging MISMATCH.
+            const char * verdict = fused ? "(fused: matmul-only ref, mismatch expected)"
+                                         : (max_rel > 0.05 ? "<<< MISMATCH" : "ok");
             fprintf(stderr, "uma REFCHECK type=%s nexp=%lld e=%lld slot=%d max_rel=%.3f @r=%d (ref=%.5f ker=%.5f) %s\n",
                     ggml_type_name(src0->type), (long long) nexp, (long long) e, slot, max_rel, max_r, mref, mker,
-                    max_rel > 0.05 ? "<<< MISMATCH" : "ok");
+                    verdict);
         }
     }
 }

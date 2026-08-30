@@ -1419,7 +1419,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w_s,
                   bool   allow_duplicate_ids,
           ggml_tensor * service_ids,
-                  void * service_data) const {
+                  void * service_data,
+          ggml_tensor * scale_ids) const {
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
     ggml_mul_mat_id_set_allow_duplicate_ids(res, allow_duplicate_ids);
     if (service_ids != nullptr) {
@@ -1432,7 +1433,12 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const int64_t n_tokens = cur->ne[2];
         ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
         s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
-        s = ggml_get_rows(ctx0, s, ids);
+        // Bug-fix (review 2026-08-31): w_s is indexed by true EXPERT id, but under
+        // give-back streaming `ids` are SLOT ids (the scale tensor is not slot-
+        // remapped), so gathering the scale by `ids` picks the wrong expert's
+        // scale. Gather by scale_ids (the true selected_experts) when provided;
+        // it equals `ids` on the non-streaming path, so behaviour is unchanged there.
+        s = ggml_get_rows(ctx0, s, scale_ids ? scale_ids : ids);
         res = ggml_mul(ctx0, res, s);
     }
     for (const auto & lora : *loras) {
@@ -2045,7 +2051,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // decode (several sequences can make total n_tokens > 1 while each
             // contributes exactly one decode token).
             route_service_each_matmul = true; // service up/gate/down each (separate slot pools)
-            route_service_data = uma_stream->service_ud(il, route_service_each_matmul);
+            // Bug-fix (review 2026-08-31): the service_ud second arg selects the
+            // prefill-vs-decode telemetry bucket; it must be the real prompt/decode
+            // discriminator (prefill_service = n_seq_tokens>1), NOT
+            // route_service_each_matmul (which is unconditionally true here and
+            // encodes an unrelated per-matmul concept). Passing the latter credited
+            // every give-back DECODE service to the prefill counters.
+            route_service_data = uma_stream->service_ud(il, prefill_service);
         }
         if (up_exps   && uma_stream->streams(il, LLAMA_UMA_STREAM_UP))   { up_exps   = uma_stream->slot(il, LLAMA_UMA_STREAM_UP); }
         if (gate_exps && uma_stream->streams(il, LLAMA_UMA_STREAM_GATE)) { gate_exps = uma_stream->slot(il, LLAMA_UMA_STREAM_GATE); }
@@ -2087,7 +2099,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // When streaming, route via slot ids + the exact-fetch service (mirrors the
         // separate up/gate/down path); otherwise route_ids == selected_experts.
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, route_ids, up_exps_s, route_ids_may_alias,
-                route_service_ids, route_service_data); // [n_ff*2, n_expert_used, n_tokens]
+                route_service_ids, route_service_data, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2112,12 +2124,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // tiles can evict slots named by earlier route ids. Re-service every
         // separate expert matmul so gate, up, and down each consume weights that
         // are resident for their own tile, rather than reusing stale physical ids.
+        // NB: route_service_each_matmul is unconditionally true whenever the
+        // service arms (see above), so today the `gate_exps == nullptr` disjunct
+        // is redundant; it is kept as defensive intent (service the sole up
+        // projection even if per-matmul re-service were ever disabled).
         ggml_tensor * up_service_ids =
             (gate_exps == nullptr || route_service_each_matmul) ? route_service_ids : nullptr;
         void * up_service_data =
             (gate_exps == nullptr || route_service_each_matmul) ? route_service_data : nullptr;
         up = build_lora_mm_id(up_exps, cur, route_ids, up_exps_s, route_ids_may_alias,
-            up_service_ids, up_service_data); // [n_ff, n_expert_used, n_tokens]
+            up_service_ids, up_service_data, selected_experts); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2130,7 +2146,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, route_ids, gate_exps_s, route_ids_may_alias, route_service_ids, route_service_data); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, route_ids, gate_exps_s, route_ids_may_alias, route_service_ids, route_service_data, selected_experts); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2226,7 +2242,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, route_ids, down_exps_s, route_ids_may_alias, route_service_ids, route_service_data); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, route_ids, down_exps_s, route_ids_may_alias, route_service_ids, route_service_data, selected_experts); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {

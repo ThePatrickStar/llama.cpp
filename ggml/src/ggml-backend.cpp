@@ -761,6 +761,14 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
+// uma-moe fork: the weights-buft registry stores DISTINCT (backend, buft) pairs,
+// not one entry per backend, so it must be sized by #backends * #buft-kinds, not
+// GGML_SCHED_MAX_BACKENDS. Give it generous headroom so an unusual config degrades
+// to the copy path (warn + skip) instead of aborting.
+#ifndef GGML_SCHED_MAX_WEIGHTS_BUFTS
+#define GGML_SCHED_MAX_WEIGHTS_BUFTS (GGML_SCHED_MAX_BACKENDS * GGML_SCHED_MAX_BACKENDS)
+#endif
+
 struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
@@ -819,9 +827,11 @@ struct ggml_backend_sched {
     bool op_offload;
 
     // uma-moe fork: (backend, buft) pairs whose WEIGHTS-usage tensors the backend may use in place
+    // NOTE: these hold DISTINCT (backend, buft) pairs, so they are sized by
+    // GGML_SCHED_MAX_WEIGHTS_BUFTS (not GGML_SCHED_MAX_BACKENDS).
     int n_weights_bufts;
-    int weights_buft_backend_ids[GGML_SCHED_MAX_BACKENDS];
-    ggml_backend_buffer_type_t weights_bufts[GGML_SCHED_MAX_BACKENDS];
+    int weights_buft_backend_ids[GGML_SCHED_MAX_WEIGHTS_BUFTS];
+    ggml_backend_buffer_type_t weights_bufts[GGML_SCHED_MAX_WEIGHTS_BUFTS];
 
     int debug;
 
@@ -1999,7 +2009,13 @@ void ggml_backend_sched_allow_weights_buft(ggml_backend_sched_t sched, ggml_back
             return;
         }
     }
-    GGML_ASSERT(sched->n_weights_bufts < GGML_SCHED_MAX_BACKENDS);
+    if (sched->n_weights_bufts >= GGML_SCHED_MAX_WEIGHTS_BUFTS) {
+        // uma-moe fork: registry full — degrade gracefully to the copy path
+        // (skip in-place registration) instead of aborting the process.
+        GGML_LOG_WARN("%s: weights-buft registry full (%d entries), skipping in-place registration; falling back to copy path\n",
+                __func__, sched->n_weights_bufts);
+        return;
+    }
     sched->weights_bufts[sched->n_weights_bufts] = buft;
     sched->weights_buft_backend_ids[sched->n_weights_bufts] = backend_index;
     sched->n_weights_bufts++;

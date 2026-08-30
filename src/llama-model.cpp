@@ -1869,6 +1869,11 @@ bool llama_model::uma_stream_pread_expert(int il, int kind, int e, void * dst) c
     }
     char * out = (char *) dst;
     size_t remaining = slab.slab_bytes;
+    // slab.offs is an absolute file offset into a multi-GB GGUF and e*slab_bytes
+    // adds several GB more, so this routinely exceeds 2^31. A 32-bit off_t build
+    // (no large-file support) would truncate the cast and pread the wrong region
+    // silently. Both target platforms use 64-bit off_t; guard the assumption.
+    static_assert(sizeof(off_t) >= 8, "uma stream pread needs 64-bit off_t (large-file support)");
     off_t  off = (off_t) (slab.offs + (size_t) e * slab.slab_bytes);
     while (remaining > 0) {
         const ssize_t n = pread(fd, out, remaining, off);
@@ -1893,7 +1898,10 @@ bool llama_model::uma_stream_selfcheck() const {
     // bytes: the GGUF mmap if retained, else the loaded expert tensor's data (the
     // no-mmap streaming footprint path loads the experts into a CPU buffer, which
     // is validated here before uma_stream_free_excluded() frees it). Any
-    // offset/stride/fd error surfaces as a mismatch.
+    // pread-loop/stride/fd error surfaces as a mismatch. Note: in the no-mmap
+    // reference case, both the pread and the loaded tensor derive from the same
+    // slab.offs, so a shared upstream offs error is symmetric across both and
+    // NOT caught here (the mmap-retained case reads from an independent mapping).
     const bool have_mmap = !pimpl->mappings.empty();
     std::vector<char> buf;
     bool     checked_stride = false;

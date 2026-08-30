@@ -1040,6 +1040,12 @@ void llama_context::synchronize() {
                 // recency will be rebuilt if a later resize compresses the window. Avoid
                 // one synchronous tiny D2H tensor_get per streaming layer per token while
                 // retaining exact read/miss telemetry.
+                // Consistency note (review 2026-08-31): the compressed branch below credits
+                // n_read only for in-range ids (guarding padding/-1). This fast path is only
+                // reached on SINGLE-TOKEN decode (guarded by n_queued_tokens == 1 above),
+                // whose topk carries exactly n_used real, in-range experts with no padding
+                // slot - so `+= n_used` equals the compressed branch's per-valid-id tally and
+                // the miss-rate denominator (n_read) has one definition across both regimes.
                 for (uint32_t il = 0; il < uma_stream->topk.size(); il++) {
                     if (uma_stream->topk[il] != nullptr && uma_stream->streams_layer((int) il)) {
                         uma_stream->n_read += n_used;
@@ -1207,8 +1213,13 @@ void llama_context::synchronize() {
     // commanded shed never lands mid-prefill (which would violate "a prefill ubatch needs
     // S >= its distinct experts"). The tick reseeds the slot table on resize, so no per-decode
     // decouple maintenance is required here.
+    // Bug-fix (review 2026-08-31): `n_outputs == n_queued_tokens` is ALSO true for an
+    // all-output multi-token prefill (perplexity/embeddings), not only a batched decode.
+    // Additionally require that no prefill ubatch was queued this window, so a commanded
+    // shed can never land on a non-decode step.
     if (uma_stream && uma_stream->decouple && uma_resize_smin >= 0 && t_compute_start_us != 0
-            && n_queued_tokens > 1 && (int64_t) n_outputs == n_queued_tokens) {
+            && n_queued_tokens > 1 && (int64_t) n_outputs == n_queued_tokens
+            && !uma_decode_saw_prefill) {
         uma_stream_controller_tick();
     }
 
@@ -1219,6 +1230,7 @@ void llama_context::synchronize() {
     }
 
     n_queued_tokens = 0;
+    uma_decode_saw_prefill = false;
     t_compute_start_us = 0;
 }
 
@@ -2380,6 +2392,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     do {
         const auto & ubatch = mctx->get_ubatch();
+
+        // uma-moe (review 2026-08-31): a ubatch with more tokens than unique sequences
+        // has at least one sequence contributing >1 token = a prefill chunk. Remember it
+        // so the batched give-back controller tick (in synchronize()) only fires on a
+        // genuine pure-decode step, never on an all-output multi-token prefill.
+        if (ubatch.n_tokens != ubatch.n_seqs_unq) {
+            uma_decode_saw_prefill = true;
+        }
 
         // count the outputs in this ubatch
         {
@@ -3646,6 +3666,11 @@ static void uma_stream_warm_start(llama_uma_stream_state * S, const llama_model 
 // republishing the LRU + expert->slot table. Clears any prior residency first, so
 // this is the single "rebuild the resident set at size s_new" primitive shared by
 // warm-start's runtime equivalent and every resize.
+// NB (review 2026-08-31): this Metal/pinned-host reseed rebuilds the resident set from the
+// FROZEN hotness rank (ranked[il]), discarding the adaptive LRU working set on every resize -
+// unlike the device_slots path, which preserves retained slots across a shrink/grow via the
+// resize-mapping checkpoint. So on Metal a resize resets recency; the RQ4 generality numbers
+// should account for this (Metal give-back re-warms from the static rank, not the live LRU).
 void llama_context::uma_stream_reseed_resident(uint32_t s_new) {
     if (uma_stream && uma_stream->device_slots) {
         throw std::runtime_error("uma stream reseed: fixed CUDA device slots do not support live resize");
@@ -4165,9 +4190,21 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
                                 break;
                             }
                         }
+                        // Bug-fix (review 2026-08-31): the frozen hotness ranking (ranked[il])
+                        // is EMPTY on a cold start (no LLAMA_UMA_STREAM_HOTFREQ dump). Rather than
+                        // throw out of decode on an elastic device-slot GROW, fall back to id-order:
+                        // fill the new slot with the lowest-id expert not yet resident. slot_of_expert
+                        // is updated below per slot, so consecutive fills pick distinct experts.
+                        if (e < 0) {
+                            for (uint32_t cand = 0; cand < uma_stream->n_expert; cand++) {
+                                if (L.slot_of_expert[cand] < 0) { e = (int32_t) cand; break; }
+                            }
+                        }
                     }
                     if (e < 0) {
-                        throw std::runtime_error(format("uma stream resize: no ranked expert for grow il=%u slot=%u", il, s));
+                        throw std::runtime_error(format(
+                            "uma stream resize: no free expert for grow il=%u slot=%u (target=%u n_expert=%u)",
+                            il, s, target, uma_stream->n_expert));
                     }
                     for (int kind = 0; kind < LLAMA_UMA_STREAM_N_KIND; kind++) {
                         if (!uma_stream->streams((int) il, kind)) { continue; }
@@ -4881,6 +4918,12 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
     const int64_t  t0_us       = ggml_time_us();
     const uint32_t n_layer     = model.hparams.n_layer();
 
+    // Bug-fix (review 2026-08-31): drain any in-flight GPU work before freeing/munmapping
+    // the slot buffers it may still be reading. graph_compute is async and this non-device
+    // (Metal/pinned-host) path has no dedicated backend sync like the device_slots path
+    // (which syncs uma_stream_cuda_backend); the PREFILL_FULL grow caller only synced under
+    // pipeline_parallel (always false on single-device Metal). Make the primitive self-safe.
+    ggml_backend_sched_synchronize(sched.get());
     // 1. free ALL slot buffers first (Metal: release wrap + munmap -> pages to the OS;
     //    CUDA: cudaFreeHost the pinned host), dropping phys_footprint/VmRSS to the non-expert
     //    baseline before any new alloc.
@@ -4911,7 +4954,12 @@ void llama_context::uma_stream_resize(uint32_t s_new, bool park) {
         if (!uma_stream_try_alloc_slots(eff)) {
             eff = floor; // only PARK may fall below the coherence knee
             if (!uma_stream_try_alloc_slots(eff)) {
-                throw std::runtime_error("uma stream resize: cannot reallocate the slot pool (OOM)");
+                // Bug-fix (review 2026-08-31): this free-first path has already released
+                // the old pool, so on terminal OOM there is NO valid continuation - the
+                // slot tensors are null and a caught-and-continued decode would deref them.
+                // Fail-STOP rather than throw a catchable exception into that null-deref.
+                // (Near-impossible: the S=cur rung just re-requests exactly what step 1 freed.)
+                GGML_ABORT("uma stream resize: cannot reallocate the slot pool (OOM) - no recoverable state");
             }
         }
     }
@@ -4993,6 +5041,10 @@ bool llama_context::uma_stream_prepare_parked_decode() {
     // Diagnostic A: one-shot graph rebuild at fixed residency, consumed by the
     // next process_ubatch.  The command is rewritten to the current numeric S
     // before any request-state mutation, so it cannot repeat accidentally.
+    // NB (review 2026-08-31): this diagnostic path and the M7.1 external controller
+    // (uma_stream_read_control below) share uma_control_path with NO cross-coordination,
+    // so diag_enabled and an external arbiter must NOT drive the same control file at
+    // once (diag is a manual single-owner harness knob; keep them on separate files).
     if (uma_stream->diag_enabled && !uma_control_path.empty()) {
         FILE * f = fopen(uma_control_path.c_str(), "r");
         char tok[32] = {0};

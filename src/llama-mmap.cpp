@@ -788,6 +788,17 @@ size_t llama_uma_madvise_dontneed(void * addr, size_t len) {
     first = (first + page - 1) & ~(page - 1);
     last  = last & ~(page - 1);
     if (last <= first) {
+        // A non-empty request that aligned to an empty range (slab < ~2 pages
+        // after a non-page-aligned start): nothing advisable, but this 0 must
+        // not be read as a madvise() failure. Warn once so a future small-expert
+        // geometry does not silently report zero eviction. (F8)
+        if (len > 0) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LLAMA_LOG_WARN("warning: madvise(MADV_DONTNEED) skipped: len=%zu too small to page-align (evicts 0)\n", len);
+            }
+        }
         return 0;
     }
     // MADV_DONTNEED on a MAP_SHARED PROT_READ mapping deactivates/frees the
@@ -812,6 +823,16 @@ size_t llama_uma_madvise_discard_anon(void * addr, size_t len) {
     first = (first + page - 1) & ~(page - 1); // inward align (destructive advice)
     last  = last & ~(page - 1);
     if (last <= first) {
+        // Non-empty request aligned to empty range: 0 here is "too small", not a
+        // failure. Warn once so a small-expert geometry cannot silently report
+        // zero eviction. (F8)
+        if (len > 0) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LLAMA_LOG_WARN("warning: madvise(anon discard) skipped: len=%zu too small to page-align (evicts 0)\n", len);
+            }
+        }
         return 0;
     }
 #if defined(__APPLE__) && defined(MADV_FREE_REUSABLE)

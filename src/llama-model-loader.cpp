@@ -1444,11 +1444,13 @@ static bool uma_stream_lazyload_k(long & k_out) {
 }
 
 // true if `name` is a front-K streamed expert WEIGHT tensor - exactly the set
-// uma_stream_build_manifest streams (kinds gate/up/down over layer.ffn_*_exps), so
-// skipping its read is safe: build_moe_ffn routes the matmul through the slot pool,
-// never this tensor. Deliberately excludes biases (.bias), scales (.scale), the
-// merged gate_up_exps (out of streaming scope) and channel _chexps variants - those
-// stay in the graph and must load.
+// uma_stream_build_manifest streams (kinds gate/up/down AND the fused gate_up over
+// layer.ffn_*_exps), so skipping its read is safe: build_moe_ffn routes the matmul
+// through the slot pool, never this tensor. Bug-fix (review 2026-08-31): the merged
+// gate_up_exps (deepseek2/qwen35moe) IS a streamed slot kind (LLAMA_UMA_STREAM_GATE_UP),
+// so it must be lazy-skipped too - omitting it kept the multi-GB fused slab fully
+// resident under LAZYLOAD, defeating the footprint give-back. Still excludes biases
+// (.bias), scales (.scale) and channel _chexps variants - those stay in the graph.
 static bool uma_stream_is_lazy_expert(const char * name, long k) {
     if (strncmp(name, "blk.", 4) != 0) {
         return false;
@@ -1463,9 +1465,10 @@ static bool uma_stream_is_lazy_expert(const char * name, long k) {
     if (len < 7 || strcmp(rest + len - 7, ".weight") != 0) {
         return false; // biases/scales keep loading
     }
-    return strstr(rest, ".ffn_up_exps.")   != nullptr
-        || strstr(rest, ".ffn_down_exps.") != nullptr
-        || strstr(rest, ".ffn_gate_exps.") != nullptr;
+    return strstr(rest, ".ffn_up_exps.")      != nullptr
+        || strstr(rest, ".ffn_down_exps.")    != nullptr
+        || strstr(rest, ".ffn_gate_exps.")    != nullptr
+        || strstr(rest, ".ffn_gate_up_exps.") != nullptr;
 }
 
 bool llama_model_loader::load_all_data(

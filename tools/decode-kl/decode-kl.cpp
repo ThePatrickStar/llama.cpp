@@ -333,7 +333,7 @@ int main(int argc, char ** argv) {
         std::vector<uint16_t> base(nv);
         std::vector<double> kl_vals;
         std::vector<double> pdiff2_vals;
-        size_t n_same = 0, n_tot = 0;
+        size_t n_same = 0, n_tot = 0, n_bad = 0;
 
         for (int pi = 0; pi < ref_prompts; ++pi) {
             int32_t n_ptok = 0, n_steps = 0;
@@ -341,6 +341,13 @@ int main(int argc, char ** argv) {
             in.read((char *)&n_steps, sizeof(int32_t));
             if (!in || n_ptok < 0 || n_steps < 0 || n_ptok > a.n_ctx) {
                 fprintf(stderr, "error: truncated/invalid ref at prompt %d (n_ptok=%d n_steps=%d)\n", pi, n_ptok, n_steps);
+                return 1;
+            }
+            // mirror the teacher-side bound: prompt + decode must fit the student context or the KV
+            // overflows mid-decode (no ctx-shift here). Fail up front with a clear message.
+            if (n_ptok + n_steps > a.n_ctx) {
+                fprintf(stderr, "error: ref prompt %d needs n_ptok+n_steps=%d > n_ctx=%d; rerun student with --n-ctx >= %d\n",
+                        pi, n_ptok + n_steps, a.n_ctx, n_ptok + n_steps);
                 return 1;
             }
             std::vector<llama_token> ptoks(n_ptok);
@@ -363,14 +370,24 @@ int main(int argc, char ** argv) {
                 if (llama_decode(ctx, batch)) { fprintf(stderr, "  decode failed\n"); return 1; }
                 const float * logits = llama_get_logits_ith(ctx, -1);
                 kl_step_out r = kl_step(n_vocab, logits, base.data(), tok);
+
+                // teacher forcing: the reference token was consumed this step regardless of KL
+                // validity, so keep feeding it even when the KL is dropped below.
+                feed = tok;
+                have_feed = true;
+
+                // Faithfulness gate: a non-finite KL (NaN/Inf from a numerical blowup) must not
+                // poison kl_mean or the sort/percentiles. Exclude it, warn loudly, count it.
+                if (!std::isfinite(r.kl)) {
+                    fprintf(stderr, "warning: non-finite KL at prompt %d step %d (excluded)\n", pi, s);
+                    ++n_bad;
+                    continue;
+                }
                 kl_vals.push_back(r.kl);
                 pdiff2_vals.push_back(r.p_diff*r.p_diff);
                 if (r.same_top) ++n_same;
                 ++n_tot;
                 if (csv.is_open()) csv << pi << "," << s << "," << r.kl << "," << r.p_diff << "," << (r.same_top?1:0) << "\n";
-
-                feed = tok;
-                have_feed = true;
             }
             if ((pi+1) % 8 == 0) fprintf(stderr, "  student: %d/%d prompts\n", pi+1, ref_prompts);
         }
@@ -383,11 +400,22 @@ int main(int argc, char ** argv) {
         double same_top_pct = n_tot ? 100.0*n_same/n_tot : 0.0;
         std::vector<double> sorted = kl_vals;
         std::sort(sorted.begin(), sorted.end());
-        double kl_median = sorted.empty() ? 0.0 : sorted[sorted.size()/2];
-        double kl_p99 = sorted.empty() ? 0.0 : sorted[std::min(sorted.size()-1, (size_t)(0.99*sorted.size()))];
+        double kl_median = 0.0;
+        if (!sorted.empty()) {
+            // even count: average the two central values; odd: the middle element
+            kl_median = (sorted.size() % 2) ? sorted[sorted.size()/2]
+                                            : 0.5*(sorted[sorted.size()/2 - 1] + sorted[sorted.size()/2]);
+        }
+        // nearest-rank 99th percentile (ceil-based, 0-indexed) so it cannot collapse to the max
+        double kl_p99 = 0.0;
+        if (!sorted.empty()) {
+            size_t idx = (size_t)std::ceil(0.99*sorted.size());
+            idx = idx ? idx - 1 : 0;
+            kl_p99 = sorted[std::min(sorted.size()-1, idx)];
+        }
 
-        printf("RESULT tag=%s kl_mean=%.6f kl_median=%.6f kl_p99=%.6f rms_pdiff=%.6f same_top_pct=%.4f count=%zu n_prompts=%d\n",
-               a.tag.c_str(), kl_mean, kl_median, kl_p99, rms_pdiff, same_top_pct, n_tot, ref_prompts);
+        printf("RESULT tag=%s kl_mean=%.6f kl_median=%.6f kl_p99=%.6f rms_pdiff=%.6f same_top_pct=%.4f count=%zu n_bad=%zu n_prompts=%d\n",
+               a.tag.c_str(), kl_mean, kl_median, kl_p99, rms_pdiff, same_top_pct, n_tot, n_bad, ref_prompts);
     }
 
     llama_free(ctx);

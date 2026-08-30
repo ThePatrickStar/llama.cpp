@@ -739,6 +739,10 @@ struct ggml_backend_cuda_buffer_context {
     uint64_t vmm_unmap_ops = 0;
     uint64_t vmm_map_bytes = 0;
     uint64_t vmm_unmap_bytes = 0;
+    // uma-moe (review 2026-08-31): peer-access grants are identical for every slot (fixed
+    // topology for the buffer's life), so enumerate cudaDeviceCanAccessPeer ONCE and reuse -
+    // avoids re-querying per slot on each resize-grow.
+    std::vector<CUmemAccessDesc> vmm_access_descs;
 #endif
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
@@ -806,25 +810,27 @@ static bool ggml_backend_cuda_vmm_map_slot(ggml_backend_cuda_buffer_context * ct
 
     // Preserve ordinary CUDA-buffer peer-copy semantics: grant every distinct
     // backing physical device that can access this allocation, including self.
-    std::vector<CUmemAccessDesc> access_descs;
-    bool physical_seen[GGML_CUDA_MAX_DEVICES] = {};
-    for (int id = 0; id < ggml_cuda_info().device_count; ++id) {
-        const int peer = ggml_cuda_get_physical_device(id);
-        if (physical_seen[peer]) { continue; }
-        if (peer != ctx->physical_device) {
-            int can_access = 0;
-            CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, peer, ctx->physical_device));
-            if (!can_access) { continue; }
+    // Cached across slot maps (fixed topology) - see vmm_access_descs.
+    if (ctx->vmm_access_descs.empty()) {
+        bool physical_seen[GGML_CUDA_MAX_DEVICES] = {};
+        for (int id = 0; id < ggml_cuda_info().device_count; ++id) {
+            const int peer = ggml_cuda_get_physical_device(id);
+            if (physical_seen[peer]) { continue; }
+            if (peer != ctx->physical_device) {
+                int can_access = 0;
+                CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, peer, ctx->physical_device));
+                if (!can_access) { continue; }
+            }
+            physical_seen[peer] = true;
+            CUmemAccessDesc access = {};
+            access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            access.location.id = peer;
+            access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            ctx->vmm_access_descs.push_back(access);
         }
-        physical_seen[peer] = true;
-        CUmemAccessDesc access = {};
-        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        access.location.id = peer;
-        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        access_descs.push_back(access);
     }
     result = cuMemSetAccess((CUdeviceptr) ctx->dev_ptr + begin, end - begin,
-        access_descs.data(), access_descs.size());
+        ctx->vmm_access_descs.data(), ctx->vmm_access_descs.size());
     if (result != CUDA_SUCCESS) {
         CU_CHECK(cuMemUnmap((CUdeviceptr) ctx->dev_ptr + begin, end - begin));
         return false;
@@ -1074,6 +1080,15 @@ static bool ggml_backend_cuda_vmm_slot_buffer_resize(ggml_backend_buffer_t buffe
     }
     ctx->vmm_mapped_size = ggml_backend_cuda_vmm_boundary(ctx, new_slots);
     buffer->size = new_slots*ctx->vmm_slot_stride + ctx->vmm_tail_pad;
+    if (new_slots > old_slots) {
+        // uma-moe (review 2026-08-31): zero the freshly-mapped region incl. the quant
+        // over-read tail_pad, mirroring the initial alloc's memset above. MMQ/MMVQ k-quant
+        // kernels read slightly past the written slot data; uninitialized physical pages
+        // there would corrupt results. Makes the resize primitive self-contained instead of
+        // relying on the caller re-running init_tensor. (Data region is re-uploaded anyway.)
+        const size_t old_data_end = old_slots*ctx->vmm_slot_stride;
+        CUDA_CHECK(cudaMemset((char *) ctx->dev_ptr + old_data_end, 0, ctx->vmm_mapped_size - old_data_end));
+    }
     return true;
 #else
     GGML_UNUSED(buffer);
@@ -1963,6 +1978,16 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
+    // uma-moe (review 2026-08-31): never fuse a MUL_MAT_ID that carries the device-slot
+    // exact-fetch service - the fused GLU path bypasses ggml_cuda_mul_mat_id and the shed
+    // cold experts read sentinel slot 0. This centralizes the refusal that the _vec_f/_vec_q
+    // siblings enforce at dispatch (see ggml_cuda_should_fuse_mul_mat_vec_{f,q}); keeping it
+    // here too closes the door for any future GLU-fuse path gated only on this predicate.
+    if ((ffn_up->op   == GGML_OP_MUL_MAT_ID && ggml_mul_mat_id_get_prefill_service(ffn_up,   nullptr, nullptr)) ||
+        (ffn_gate->op == GGML_OP_MUL_MAT_ID && ggml_mul_mat_id_get_prefill_service(ffn_gate, nullptr, nullptr))) {
+        return false;
+    }
+
     const ggml_op expected_bias_op = is_mul_mat ? GGML_OP_ADD : GGML_OP_ADD_ID;
     const ggml_tensor * ffn_up_bias_src   = has_scale ? ffn_up_scale   : ffn_up;
     const ggml_tensor * ffn_gate_bias_src = has_scale ? ffn_gate_scale : ffn_gate;
@@ -2191,6 +2216,12 @@ static void ggml_cuda_mul_mat_id_mmvq_chunked(
                 logical_host.resize((size_t) logical_ids->ne[0] * (size_t) count);
                 slot_host.resize(logical_host.size());
             }
+            // NB (review 2026-08-31): slot_host is a PAGEABLE std::vector that is freed at
+            // the end of this scope. cudaMemcpy2DAsync from pageable host memory is
+            // synchronous w.r.t. the host (it stages through an internal pinned buffer before
+            // returning), so the copy has fully consumed slot_host before the free - safe, but
+            // it relies on slot_host staying pageable. Do NOT pin it without adding an explicit
+            // stream sync before the scope exit.
             CUDA_CHECK(cudaMemcpy2DAsync(
                 (char *) ids->data + first * ids->nb[1], ids->nb[1],
                 slot_host.data(), row_bytes, row_bytes, count,

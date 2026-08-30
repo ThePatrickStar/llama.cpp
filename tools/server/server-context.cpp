@@ -3085,6 +3085,9 @@ private:
                         // pending and retry without touching its retained state.
                         if (!llama_uma_stream_prepare_parked_decode(ctx_tgt)) {
                             SLT_DBG(slot, "%s", "parked below coherence knee; waiting for an admitted resume target\n");
+                            // uma-moe (review 2026-08-31): bounded backoff so the update loop
+                            // does not busy-spin at 100% CPU while awaiting the arbiter's grant.
+                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
                             return;
                         }
 
@@ -3624,6 +3627,11 @@ private:
                 // pace only a PURE-decode step: every active slot must be generating. If any slot
                 // is processing a prompt this step, skip pacing entirely so a prefill ubatch (or a
                 // chunked prompt's trailing ubatch) is never delayed - that would distort TTFT.
+                // NB (review 2026-08-31): the first decode step right after a prompt finishes
+                // sees the slot in DONE_PROMPT (not yet GENERATING), so that one step is not
+                // paced. This is intentional/negligible (one step per request) and keeps the
+                // gate strictly pure-decode; do not fold DONE_PROMPT in here or a prompt-tail
+                // step could be delayed.
                 bool any_prompt = false;
                 size_t n_generating = 0;
                 for (const auto & s : slots) {
@@ -3653,6 +3661,16 @@ private:
         }
 
         if (ret != 0) {
+            // uma-moe (review 2026-08-31): ret == -4 is a UMA park HOLD, not a compute error.
+            // The context is below its coherence knee and could not resume this step (no
+            // admitted target granted yet); decode already attempted the resume internally.
+            // Do NOT send_error/release the in-flight (GENERATING) requests - back off briefly
+            // and retry unchanged; the arbiter grants a resume target asynchronously. This
+            // fixes both the mid-generation request-kill and the busy-spin on the decode path.
+            if (ret == -4) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                return false; // retry the batch unchanged next loop
+            }
             {
                 std::string err;
 
