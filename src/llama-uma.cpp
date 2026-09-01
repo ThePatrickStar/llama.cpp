@@ -698,24 +698,19 @@ void llama_uma_router::observe_experts_distinct_read() {
         ggml_tensor * t = topk_tensors[il];
         if (t == nullptr) { continue; }
         if (t->type != GGML_TYPE_I32 || t->ne[0] < (int64_t) n_expert_used) { continue; }
-        const int64_t ne0 = t->ne[0];             // >= n_expert_used
-        const int64_t ne1 = t->ne[1];             // n_tokens in this decode batch
-        if (obs_distinct_step == 0 && il == 0 && getenv("LLAMA_UMA_DISTINCT_DEBUG")) {
-            std::vector<int32_t> dbg((size_t) t->ne[0]*t->ne[1]*std::max<int64_t>(1,t->ne[2]));
-            ggml_backend_tensor_get(t, dbg.data(), 0, dbg.size()*sizeof(int32_t));
-            fprintf(stderr, "DISTINCT_DEBUG name=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] first24:",
-                    t->name, (long long)t->ne[0],(long long)t->ne[1],(long long)t->ne[2],(long long)t->ne[3],
-                    t->nb[0],t->nb[1],t->nb[2],t->nb[3]);
-            for (size_t j = 0; j < dbg.size() && j < 24; j++) fprintf(stderr, " %d", dbg[j]);
-            fprintf(stderr, "\n");
-        }
+        const int64_t ne1        = t->ne[1];       // n_tokens in this decode batch
+        const size_t  col_stride = t->nb[1];        // bytes between token columns. CRITICAL: this is
+                                                    // NOT n_expert_used*4 — ffn_moe_topk is a view whose
+                                                    // row stride spans the full top-k buffer (nb[1]=512
+                                                    // for a 128-expert model), so a contiguous read would
+                                                    // pick up padding, not the next token. Read per column.
         n_tok_batch = ne1;
-        full.resize((size_t) ne0 * ne1);
-        ggml_backend_tensor_get(t, full.data(), 0, full.size() * sizeof(int32_t));
+        full.resize(n_expert_used);
         std::fill(uni.begin(), uni.end(), 0ull);
         for (int64_t c = 0; c < ne1; c++) {
+            ggml_backend_tensor_get(t, full.data(), (size_t) c * col_stride, n_expert_used * sizeof(int32_t));
             for (uint32_t e = 0; e < n_expert_used; e++) {
-                const int32_t id = full[(size_t) c * ne0 + e];
+                const int32_t id = full[e];
                 if (id >= 0 && (uint32_t) id < n_expert) {   // skip any padding id
                     uni[id / 64] |= 1ull << (id % 64);
                 }
