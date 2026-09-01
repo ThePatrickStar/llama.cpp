@@ -411,6 +411,19 @@ llama_context::llama_context(
             uma_router->observe_experts = true;
             fprintf(stderr, "uma: observe experts channel on\n");
         }
+        // Exp B (2026-09-02): per-step distinct-expert-union dump (env LLAMA_UMA_DUMP_DISTINCT).
+        // Records, per decode step per layer, the count of DISTINCT experts across the whole
+        // in-flight batch's topk selections (the union that must be resident for zero-miss
+        // exact-fetch). Needs the topk observe channel.
+        const char * LLAMA_UMA_DUMP_DISTINCT = getenv("LLAMA_UMA_DUMP_DISTINCT");
+        if (LLAMA_UMA_DUMP_DISTINCT && LLAMA_UMA_DUMP_DISTINCT[0] != '\0') {
+            if (!uma_router) {
+                throw std::runtime_error("LLAMA_UMA_DUMP_DISTINCT requires an active LLAMA_UMA_POLICY router");
+            }
+            uma_router->obs_distinct_path = LLAMA_UMA_DUMP_DISTINCT;
+            uma_router->observe_experts = true;
+            fprintf(stderr, "uma: observe distinct-union dump -> %s\n", LLAMA_UMA_DUMP_DISTINCT);
+        }
         const char * LLAMA_UMA_LAYOUT = getenv("LLAMA_UMA_LAYOUT");
         if (LLAMA_UMA_LAYOUT && LLAMA_UMA_LAYOUT[0] != '\0') {
             llama_uma_layout uma_layout = LLAMA_UMA_LAYOUT_DEFAULT;
@@ -988,6 +1001,13 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+
+    // Exp B (2026-09-02): batch-agnostic per-step distinct-expert-union dump. observe_experts_read
+    // (below) is single-token-gated, so it misses batched (concurrency>1) decode; this fires for
+    // ANY n_queued_tokens after the compute has synced. No-op unless LLAMA_UMA_DUMP_DISTINCT is set.
+    if (uma_router && !uma_router->obs_distinct_path.empty() && t_compute_start_us != 0) {
+        uma_router->observe_experts_distinct_read();
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats

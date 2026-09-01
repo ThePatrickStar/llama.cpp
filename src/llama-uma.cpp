@@ -682,6 +682,55 @@ void llama_uma_router::observe_experts_read() {
     n_expert_obs++;
 }
 
+// Exp B (2026-09-02): per-decode-step distinct-expert-UNION dump across the WHOLE in-flight
+// batch. observe_experts_read() above is single-token-gated (n_queued_tokens==1) and reads only
+// token 0; this one is called UNCONDITIONALLY post-sync so it captures batched (concurrency>1)
+// decode. Reads the full topk tensor [n_expert_used, n_tokens] and unions across all token
+// columns per layer -> the distinct set the batch needs resident for zero-miss exact-fetch.
+void llama_uma_router::observe_experts_distinct_read() {
+    if (obs_distinct_path.empty()) { return; }
+    const uint32_t words = (n_expert + 63) / 64;
+    std::vector<uint64_t> uni(words, 0);
+    std::vector<int32_t>  full;
+    std::string rows;
+    int64_t n_tok_batch = 0;
+    for (uint32_t il = 0; il < n_layer; il++) {
+        ggml_tensor * t = topk_tensors[il];
+        if (t == nullptr) { continue; }
+        if (t->type != GGML_TYPE_I32 || t->ne[0] < (int64_t) n_expert_used) { continue; }
+        const int64_t ne0 = t->ne[0];             // >= n_expert_used
+        const int64_t ne1 = t->ne[1];             // n_tokens in this decode batch
+        n_tok_batch = ne1;
+        full.resize((size_t) ne0 * ne1);
+        ggml_backend_tensor_get(t, full.data(), 0, full.size() * sizeof(int32_t));
+        std::fill(uni.begin(), uni.end(), 0ull);
+        for (int64_t c = 0; c < ne1; c++) {
+            for (uint32_t e = 0; e < n_expert_used; e++) {
+                const int32_t id = full[(size_t) c * ne0 + e];
+                if (id >= 0 && (uint32_t) id < n_expert) {   // skip any padding id
+                    uni[id / 64] |= 1ull << (id % 64);
+                }
+            }
+        }
+        uint32_t distinct = 0;
+        for (uint32_t w = 0; w < words; w++) { distinct += (uint32_t) __builtin_popcountll(uni[w]); }
+        rows += std::to_string(obs_distinct_step) + "," + std::to_string(il) + "," +
+                std::to_string((long long) n_tok_batch) + "," + std::to_string(distinct) + "\n";
+    }
+    if (rows.empty()) { return; }  // no topk cached this pass (e.g. reused graph) -> skip
+    FILE * f = fopen(obs_distinct_path.c_str(), obs_distinct_step == 0 ? "w" : "a");
+    if (f) {
+        if (obs_distinct_step == 0) {
+            fprintf(f, "# distinct-expert union per decode step per layer; n_expert=%u n_expert_used=%u n_layer=%u\n",
+                    n_expert, n_expert_used, n_layer);
+            fprintf(f, "step,layer,n_tokens,distinct\n");
+        }
+        fputs(rows.c_str(), f);
+        fclose(f);
+    }
+    obs_distinct_step++;
+}
+
 bool llama_uma_router::layer_on_cpu(int il, uint32_t n_tokens) const {
     // single-token decode only: batches (prefill) stay all-GPU, which is the
     // per-pass freedom a load-time split cannot express

@@ -63,6 +63,7 @@ struct llama_uma_router {
     // (re)build, so reads never scan the graph by name.
     void observe_experts_cache(int il, ggml_tensor * topk);
     void observe_experts_read();
+    void observe_experts_distinct_read();   // Exp B: batch-agnostic per-step distinct-union dump
 
     // pure function of (policy, il, n_tokens): true when layer il's expert
     // matmuls run on the CPU backend for a batch of n_tokens. Also consulted
@@ -114,6 +115,10 @@ struct llama_uma_router {
     int64_t n_rebuild    = 0;
 
     bool observe_experts = false;
+    // Exp B (2026-09-02): per-decode-step distinct-expert UNION dump across the whole
+    // in-flight batch (env LLAMA_UMA_DUMP_DISTINCT). Empty = off. Rows: step,layer,n_tokens,distinct.
+    std::string obs_distinct_path;
+    int64_t     obs_distinct_step = 0;
 
     std::vector<ggml_tensor *> topk_tensors;   // per layer, refreshed by the cb
     std::vector<uint32_t>      expert_freq;    // n_layer x n_expert counts
