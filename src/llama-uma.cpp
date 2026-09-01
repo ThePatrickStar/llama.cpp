@@ -700,6 +700,15 @@ void llama_uma_router::observe_experts_distinct_read() {
         if (t->type != GGML_TYPE_I32 || t->ne[0] < (int64_t) n_expert_used) { continue; }
         const int64_t ne0 = t->ne[0];             // >= n_expert_used
         const int64_t ne1 = t->ne[1];             // n_tokens in this decode batch
+        if (obs_distinct_step == 0 && il == 0 && getenv("LLAMA_UMA_DISTINCT_DEBUG")) {
+            std::vector<int32_t> dbg((size_t) t->ne[0]*t->ne[1]*std::max<int64_t>(1,t->ne[2]));
+            ggml_backend_tensor_get(t, dbg.data(), 0, dbg.size()*sizeof(int32_t));
+            fprintf(stderr, "DISTINCT_DEBUG name=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] first24:",
+                    t->name, (long long)t->ne[0],(long long)t->ne[1],(long long)t->ne[2],(long long)t->ne[3],
+                    t->nb[0],t->nb[1],t->nb[2],t->nb[3]);
+            for (size_t j = 0; j < dbg.size() && j < 24; j++) fprintf(stderr, " %d", dbg[j]);
+            fprintf(stderr, "\n");
+        }
         n_tok_batch = ne1;
         full.resize((size_t) ne0 * ne1);
         ggml_backend_tensor_get(t, full.data(), 0, full.size() * sizeof(int32_t));
